@@ -824,9 +824,18 @@ def main():
                                 log("   图上读到币种: %s %s" % (coin, dirc))
                         t_chart = time.time()
                         stamps = {"found": t_found, "img": t_img, "parse": t_parse, "chart": t_chart}
-                        # 博主管理指令：立即处理
-                        if info.get("type") == "manage" or (info.get("manage_action") and info.get("manage_action") != "other"):
-                            notify("【博主指令】%s\n群：%s  时间：%s\n动作：%s\n原文：%s" % (coin or "?", g, when, info.get("manage_action"), txt[:200]))
+                        # 博主管理指令：立即处理（带确定性护栏，避免把"止盈达成"误判成"全部平仓"）
+                        _act = info.get("manage_action")
+                        if _act and _act != "other":
+                            INFO_ONLY = r"(TP\s?\d?\s*(hit|nailed|done|reached|filled)|take[- ]?profit\s*(hit|reached)|breakeven\s*hit|止盈.{0,6}(达成|到了|命中|触发|已到)|保本.{0,4}(止损|离场))"
+                            CLOSE_REQ = r"(\bout of\b|\bclosed?\b|closing\b|exit(ing)?\b|stopped out|stop(ped)? (me )?out|fully closed|平仓|清仓|全部走|先走|离场|走人)"
+                            if re.search(INFO_ONLY, txt, re.I) and not re.search(CLOSE_REQ, txt, re.I):
+                                log("   ⚠️ 判定为『通报』而非指令（含止盈达成字样，无平仓字样）→ 不动作：%s" % _act)
+                                _act = None
+                        if info.get("type") == "manage" and not _act:
+                            continue
+                        if _act:
+                            notify("【博主指令】%s\n群：%s  时间：%s\n动作：%s\n原文：%s" % (coin or "?", g, when, _act, txt[:200]))
                             continue
                         if coin and dirc in ("LONG", "SHORT"):
                             # 开单信号 -> 进待确认池，等同一条信号的后续消息（卡片/图）补齐
