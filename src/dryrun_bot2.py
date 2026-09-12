@@ -37,12 +37,13 @@ DS_API = "https://api.deepseek.com/chat/completions"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
 GROUPS = ["开单记录", "暴富龙", "UA-nurseneil2", "医生DrProfit2群", "颜驰2群"]
-POLL_SEC = 1
+POLL_SEC = 0.5
 MARGIN = 300.0
 LEV = 3
 NOTIONAL = MARGIN * LEV
-MAX_OPEN = 3
+MAX_OPEN = 5           # 1500U 分 5 份，每份 300U
 TP_TIERS = 3
+TEST_MODE = True       # 测试阶段：抓到的一切信号都要出单（不受持仓上限拦截）
 MSG_URL = "https://www.feishu.cn/messenger"
 SEARCH_TERM = {"颜驰2群": "颜驰"}
 
@@ -456,7 +457,8 @@ def finalize_pending(open_pos):
             notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
-        if len(open_pos) >= MAX_OPEN and coin not in open_pos:
+        over_cap = (len(open_pos) >= MAX_OPEN and coin not in open_pos)
+        if over_cap and not TEST_MODE:
             notify("【信号·跳过】%s 同时持仓已满 %d 笔" % (coin, MAX_OPEN))
             PENDING.pop(coin, None); continue
         dirc = dirc0
@@ -477,7 +479,8 @@ def finalize_pending(open_pos):
         d0 = 1 if dirc == "LONG" else -1
         crossed = any(((t - entry) * d0 <= 0) for t in tps)   # 止盈价是否已被现价越过（真实下单必须处理）
         notify(fmt_plan(coin, dirc, entry, p["stop"], tps, p["group"], tr["t_open"],
-                        note=("止损来自%s，共合并 %d 条消息（文案/卡片/图）" % (p.get("stop_src") or "-", len(p["texts"]) + (1 if p["imgs"] else 0))),
+                        note=("止损来自%s，共合并 %d 条消息（文案/卡片/图）" % (p.get("stop_src") or "-", len(p["texts"]) + (1 if p["imgs"] else 0))
+                              + ("｜⚠️ 测试阶段：当前已持 %d 笔（上限 %d）" % (len(open_pos), MAX_OPEN) if over_cap else "")),
                         add=p["add"], timing=timing, signal_entry=signal_entry,
                         signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode,
                         entry_orders=entry_orders, entry_note=entry_note))
@@ -526,6 +529,34 @@ def read_chart_meta(path):
     except Exception as e:
         log("   图元信息读取失败: " + str(e)[:80])
         return {}
+
+# ---------------- 持仓状态汇报（博主转发收益时用）----------------
+def pos_report(coin, tr):
+    px = price_of(coin)
+    d = 1 if tr["dir"] == "LONG" else -1
+    entry = tr.get("entry")
+    remaining = tr.get("remaining", 1.0)
+    L = ["【你的持仓】%s/USDT %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"),
+         "仓位剩余：%.0f%%（已减仓 %.0f%%）" % (remaining * 100, (1 - remaining) * 100)]
+    if px and entry:
+        gross = (px - entry) / entry * 100 * d
+        pnl = (px - entry) / entry * NOTIONAL * d * remaining
+        L.append("当前价：%.8g    开仓均价：%.8g" % (px, entry))
+        L.append("当前收益率：%+.2f%%（含 %d 倍杠杆）" % (gross * LEV, LEV))
+        L.append("浮动盈亏：约 %+.1fU（保证金 %.0fU）" % (pnl, MARGIN))
+    L.append("止损：%s" % (("%.8g" % tr["sl"]) if tr.get("sl") else "未设"))
+    tps = tr.get("tps") or []
+    filled = tr.get("filled", [])
+    nxt = next((tps[j] for j in range(len(tps)) if j not in filled), None)
+    if nxt and px:
+        L.append("下一个止盈：%.8g（还差 %.2f%%，不含杠杆）" % (nxt, (nxt - px) / px * 100 * d))
+    elif nxt:
+        L.append("下一个止盈：%.8g" % nxt)
+    else:
+        L.append("止盈：已全部成交")
+    if tr.get("realized"):
+        L.append("已实现盈亏：%+.1fU" % tr["realized"])
+    notify("\n".join(L))
 
 # ---------------- 页面 JS ----------------
 SCAN_JS = """() => {
@@ -732,7 +763,7 @@ def main():
                 to_scan = list(GROUPS)
             else:
                 to_scan = list(changed)
-                if missing:                                 # 列表里看不到的群：每轮轮换兜底扫 1 个
+                if missing and safety % 3 == 0:              # 列表里看不到的群：每 3 轮轮换兜底扫 1 个
                     to_scan.append(missing[safety % len(missing)])
             if changed:
                 log("🔔 会话列表显示有新消息：%s" % "、".join(changed))
@@ -805,13 +836,13 @@ def main():
                             log("   ⏩ 文字/卡片已够（止损+3档止盈），跳过读图")
                         if info is None:
                             info = parse_text(txt)
+                        t_parse = time.time()                 # 文本解析耗时（不含读图）
                         if _th is not None:
                             _th.join(timeout=120)
                         info = info or {}
                         chart = _res.get("chart")
                         if chart and chart.get("ok"):
                             log("   读图: 止损 %s 开仓 %s 止盈 %s" % (chart["sl"], chart["entry"], chart["tps"]))
-                        t_parse = time.time()
                         coin = (info.get("coin") or "").upper() or None
                         dirc = (info.get("direction") or "").upper() or None
                         # 只有图、文字里没有币种 -> 从图上读币种
@@ -832,6 +863,11 @@ def main():
                             if re.search(INFO_ONLY, txt, re.I) and not re.search(CLOSE_REQ, txt, re.I):
                                 log("   ⚠️ 判定为『通报』而非指令（含止盈达成字样，无平仓字样）→ 不动作：%s" % _act)
                                 _act = None
+                                if coin and coin in open_pos:
+                                    try:
+                                        pos_report(coin, open_pos[coin])
+                                    except Exception as _e:
+                                        log("   持仓汇报失败 " + str(_e)[:80])
                         if info.get("type") == "manage" and not _act:
                             continue
                         if _act:
@@ -868,22 +904,60 @@ def main():
                 finalize_pending(open_pos)
             except Exception as e:
                 log("待确认池处理异常 " + str(e)[:100])
-            # 纸面持仓监控
+            # 纸面持仓监控：分批止盈（每档平 1/3）+ TP1 后止损移保本
             try:
                 for coin, tr in list(open_pos.items()):
                     px = price_of(coin)
-                    if px is None: continue
+                    if px is None:
+                        continue
                     d = 1 if tr["dir"] == "LONG" else -1
-                    hit = None
-                    if tr.get("sl") and ((px - tr["sl"]) * d <= 0): hit = ("止损", tr["sl"])
-                    elif tr.get("tps") and ((px - tr["tps"][0]) * d >= 0): hit = ("止盈1", tr["tps"][0])
-                    if hit:
-                        pnl = (hit[1] - tr["entry"]) * d / tr["entry"] * NOTIONAL
-                        tr.update({"status": "CLOSED", "exit": hit[1], "exit_why": hit[0], "pnl": pnl})
+                    tps = tr.get("tps") or []
+                    filled = tr.setdefault("filled", [])
+                    remaining = tr.get("remaining", 1.0)
+                    stop = tr.get("sl")
+                    # ① 止损优先
+                    if stop is not None and (px - stop) * d <= 0:
+                        pnl = (stop - tr["entry"]) * d / tr["entry"] * NOTIONAL * remaining
+                        tr["realized"] = tr.get("realized", 0.0) + pnl
+                        tr.update({"status": "CLOSED", "exit": stop,
+                                   "exit_why": ("止损" if not filled else "保本止损(TP1后)"),
+                                   "pnl": tr["realized"], "remaining": 0.0})
                         with open(TRADES, "a", encoding="utf-8") as f:
                             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
-                        notify("【已结单·纸面】%s %s\n结果：%s @%.8g\n盈亏：%+.1fU（保证金 %.0fU）" % (coin, tr["dir"], hit[0], hit[1], pnl, MARGIN))
+                        notify("【已结单·纸面】%s %s\n结果：%s @%.8g（剩余 %.0f%%）\n累计盈亏：%+.1fU（保证金 %.0fU）"
+                               % (coin, tr["dir"], tr["exit_why"], stop, remaining * 100, tr["realized"], MARGIN))
                         open_pos.pop(coin, None)
+                        continue
+                    # ② 依次检查各档止盈
+                    hit_i = None
+                    for i, tp in enumerate(tps):
+                        if i in filled:
+                            continue
+                        if (px - tp) * d >= 0:
+                            hit_i = i
+                            break
+                    if hit_i is not None:
+                        part = 1.0 / max(len(tps), 1)
+                        tp = tps[hit_i]
+                        pnl = (tp - tr["entry"]) * d / tr["entry"] * NOTIONAL * part
+                        tr["realized"] = tr.get("realized", 0.0) + pnl
+                        filled.append(hit_i)
+                        remaining = max(0.0, remaining - part)
+                        tr["remaining"] = remaining
+                        if hit_i == 0 and tr["entry"]:            # TP1 后止损移保本
+                            tr["sl"] = tr["entry"]
+                            stop = tr["entry"]
+                        with open(TRADES, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(tr, ensure_ascii=False) + "\n")
+                        nxt = next((tps[j] for j in range(len(tps)) if j not in filled), None)
+                        notify("【止盈成交·纸面】%s %s\nTP%d 成交 @%.8g（平%.0f%%）\n该档盈亏：%+.1fU · 累计：%+.1fU\n剩余仓位：%.0f%%%s"
+                               % (coin, tr["dir"], hit_i + 1, tp, part * 100, pnl, tr["realized"], remaining * 100,
+                                  ("\n止损已移到开仓价 %.8g（保本损）" % stop) if hit_i == 0 else ""))
+                        if remaining <= 0.001:
+                            tr.update({"status": "CLOSED", "exit": tp, "exit_why": "全部止盈",
+                                       "pnl": tr["realized"]})
+                            notify("【已结单·纸面】%s %s\n全部止盈完成，累计盈亏：%+.1fU" % (coin, tr["dir"], tr["realized"]))
+                            open_pos.pop(coin, None)
             except Exception as e:
                 log("持仓监控异常 " + str(e)[:100])
             hb += 1
