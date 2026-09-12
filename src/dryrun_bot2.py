@@ -1038,7 +1038,8 @@ def main():
                         txt = r["text"]
                         log("[%s] 发现新消息 | 发出=%s | %s" % (g, when, txt[:110]))
                         low = txt.lower()
-                        if "通过webhook" in txt or "【跟单机器人】" in txt or "invited" in low or "test notification" in low:
+                        SELF_MARKS = ["【跟单机器人】", "【机器人指令】", "【已开单·纸面】", "【已结单·纸面】", "【止盈成交·纸面】", "【你的持仓】", "【指令】", "【博主指令】", "【信号·"]
+                        if any(_m in txt for _m in SELF_MARKS) or "通过webhook" in txt or "invited" in low or "test notification" in low:
                             continue
                         # 指令优先：只有在指定指令群里、由你发的短消息才会被当成指令
                         if g in CMD_GROUPS:
