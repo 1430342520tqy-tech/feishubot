@@ -26,7 +26,7 @@ DS_API = "https://api.deepseek.com/chat/completions"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
 GROUPS = ["开单记录", "暴富龙", "UA-nurseneil2", "医生DrProfit2群", "颜驰2群"]
-POLL_SEC = 5
+POLL_SEC = 2
 MARGIN = 300.0
 LEV = 3
 NOTIONAL = MARGIN * LEV
@@ -195,7 +195,7 @@ def parse_text(text):
         return {}
 
 # ---------------- 通知格式 ----------------
-def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timing=None):
+def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timing=None, signal_entry=None):
     d = 1 if (direction or "LONG").upper() == "LONG" else -1
     L = []
     L.append("【已开单·纸面】%s/USDT 永续 · %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
@@ -203,24 +203,207 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
     L.append("金额：保证金 %.0fU × %d倍 = 名义 %.0fU" % (MARGIN, LEV, NOTIONAL))
     if isinstance(entry, (int, float)):
         if add:
-            L.append("入场：头仓 1/3 市价 %.8g ＋ 加仓 2/3 挂 %.8g" % (entry, add))
+            L.append("开仓：市价成交 %.8g（头仓 1/3）＋ 加仓 2/3 挂单 %.8g" % (entry, add))
         else:
-            L.append("入场：市价 %.8g" % entry)
-    if isinstance(sl, (int, float)) and isinstance(entry, (int, float)) and entry:
-        L.append("止损：%.8g → %.2f%%（不含杠杆）· 约 %+.1fU" % (sl, (sl - entry) / entry * 100 * d, (sl - entry) * d / entry * NOTIONAL))
+            L.append("开仓：市价成交 %.8g（全仓）" % entry)
+        if isinstance(signal_entry, (int, float)) and abs(signal_entry - entry) / entry > 0.0005:
+            L.append("　　　博主信号开仓价：%.8g（图上/卡片读到，仅作参考）" % signal_entry)
     else:
-        L.append("止损：需人工确认")
+        L.append("开仓：市价")
+    ref = signal_entry if isinstance(signal_entry, (int, float)) and signal_entry else entry
+    if isinstance(sl, (int, float)) and isinstance(entry, (int, float)) and entry:
+        L.append("止损（挂单）：%.8g" % sl)
+        L.append("　　→ 按实际成交 %.2f%%（不含杠杆）· 约 %+.1fU" % ((sl - entry) / entry * 100 * d, (sl - entry) * d / entry * NOTIONAL))
+        if ref and abs(ref - entry) / entry > 0.0005:
+            L.append("　　→ 按博主信号价 %.2f%%（博主口径）" % ((sl - ref) / ref * 100 * d))
+    else:
+        L.append("止损：图上/卡片都没读到，等你确认（暂不挂）")
     if tps:
         for i, t in enumerate(tps[:TP_TIERS], 1):
             if isinstance(entry, (int, float)) and entry:
-                L.append("止盈%d：%.8g → %+.2f%%（不含杠杆）· 平1/3 · 约 %+.1fU" % (
+                L.append("止盈%d（挂单）：%.8g → 按实际成交 %+.2f%%（不含杠杆）· 平1/3 · 约 %+.1fU" % (
                     i, t, (t - entry) / entry * 100 * d, (t - entry) * d / entry * NOTIONAL / len(tps[:TP_TIERS])))
         L.append("规则：TP1 成交后止损移到开仓价（保本）")
     else:
-        L.append("止盈：图上未读到，暂不挂（等你确认）")
+        L.append("止盈：图上/卡片都没读到，等你确认（暂不挂）")
     if note: L.append("备注：" + note)
     if timing: L.append(timing)
     return "\n".join(L)
+
+# ---------------- 快速解析（常见模板秒出结果，避免每次等 AI）----------------
+_SYMS = set()
+try:
+    _s = json.load(open(BASE + "/fapi_symbols.json", encoding="utf-8"))
+    if isinstance(_s, dict): _s = list(_s.keys())
+    for x in _s:
+        x = str(x).upper()
+        if x.endswith("USDT"): _SYMS.add(x[:-4])
+except Exception:
+    pass
+
+def fast_parse(txt):
+    """只匹配博主常用模板；命中即返回，未命中返回 None（交给 AI 解析）"""
+    m = re.search(r"(?:Going|Market|Longing|Buying)\s+(long|short)\s+\$?([A-Za-z0-9]{2,12})", txt, re.I)
+    if m:
+        dirc = "LONG" if m.group(1).lower() == "long" else "SHORT"
+        coin = m.group(2).upper()
+    else:
+        m = re.search(r"([A-Za-z0-9]{2,12})\s*(?:/USDT)?\s*[—\-–]\s*(LONG|SHORT)\b", txt, re.I)
+        if not m:
+            return None
+        coin, dirc = m.group(1).upper(), m.group(2).upper()
+    if _SYMS and coin not in _SYMS:
+        return None                       # 币种不在币安合约清单里 → 交给 AI 判断
+    stop = None
+    for pat in (r"close under\s*\$?([0-9]*\.?[0-9]+)", r"SL[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)",
+                r"stop[ -]?loss[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)", r"止损[^0-9]{0,14}([0-9]*\.?[0-9]+)"):
+        mm = re.search(pat, txt, re.I)
+        if mm:
+            try:
+                stop = float(mm.group(1)); break
+            except Exception:
+                pass
+    add = None
+    mm = re.search(r"(?:DCA|Dca|dca|加仓)[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)", txt)
+    if mm:
+        try: add = float(mm.group(1))
+        except Exception: pass
+    entry = None
+    mm = re.search(r"(?:Entry|入场|进场)[:：]?\s*\$?([0-9]*\.?[0-9]+)", txt, re.I)
+    if mm:
+        try: entry = float(mm.group(1))
+        except Exception: pass
+    tps = []
+    for x in re.findall(r"TP\s?\d?\s*[:：]?\s*\$?([0-9]*\.?[0-9]+)", txt, re.I):
+        try: tps.append(float(x))
+        except Exception: pass
+    if not (stop or add or entry or tps):
+        return None
+    return {"is_signal": True, "coin": coin, "direction": dirc, "entry": entry,
+            "entry_is_cmp": bool(re.search(r"\bCMP\b|市价|现价", txt, re.I)),
+            "add_price": add, "stop": stop, "targets": tps,
+            "tp_on_chart": bool(re.search(r"TPs?\s+above|止盈在?上方|止盈位在上方", txt, re.I)),
+            "type": "open", "manage_action": None, "_fast": True}
+
+# ---------------- 待确认池：把同一条信号的多条消息合并（文案 + 卡片 + K线图）----------------
+PENDING = {}
+PENDING_WAIT = 8           # 秒：等同一条信号的后续消息（文案/卡片/图 一般 5 秒内到齐）
+
+def merge_pending(coin, group, info=None, chart=None, imgs=None, t_sig=0, txt="", stamps=None):
+    p = PENDING.get(coin)
+    if p is None:
+        p = {"group": group, "entry": None, "entry_src": None, "add": None, "stop": None, "stop_src": None,
+             "tps": [], "imgs": [], "texts": [], "first_ts": t_sig or int(time.time()),
+             "t_found": (stamps or {}).get("found", time.time()), "t_img": (stamps or {}).get("img", 0.0),
+             "t_parse": (stamps or {}).get("parse", 0.0), "t_chart": (stamps or {}).get("chart", 0.0),
+             "deadline": time.time() + PENDING_WAIT}
+        PENDING[coin] = p
+    elif stamps and stamps.get("chart", 0) > p.get("t_chart", 0):
+        p.update({k: stamps[k] for k in ("t_img", "t_parse", "t_chart") if k in stamps})
+    p["deadline"] = time.time() + PENDING_WAIT
+    if info:
+        e = info.get("entry")
+        if isinstance(e, (int, float)) and p["entry"] is None:
+            p["entry"] = float(e); p["entry_src"] = "消息文字"
+        a = info.get("add_price")
+        if isinstance(a, (int, float)) and p["add"] is None:
+            p["add"] = float(a)
+        s = info.get("stop")
+        if isinstance(s, (int, float)) and p["stop"] is None:
+            p["stop"] = float(s); p["stop_src"] = "消息文字"
+        for t in (info.get("targets") or []):
+            try:
+                tv = float(t)
+                if tv not in p["tps"]: p["tps"].append(tv)
+            except Exception:
+                pass
+        if txt:
+            head = txt[:60]
+            if head not in [x[:60] for x in p["texts"]] and len(p["texts"]) < 6:
+                p["texts"].append(txt[:400])
+    if chart:
+        # 图上画的线最准（KOL 实际挂单用的就是图上的点位）→ 图优先覆盖文字/卡片
+        if chart.get("sl"):
+            p["stop"] = chart["sl"]; p["stop_src"] = "K线图"
+        if chart.get("entry"):
+            p["entry"] = chart["entry"]; p["entry_src"] = "K线图"
+        if chart.get("tps"):
+            p["tps"] = list(chart["tps"])
+    for f in (imgs or []):
+        if f not in p["imgs"]: p["imgs"].append(f)
+    return p
+
+def pending_complete(p):
+    tps = sorted(set(p["tps"]))
+    return p["entry"] is not None and p["stop"] is not None and len(tps) >= TP_TIERS
+
+def finalize_pending(open_pos):
+    """到点或信息齐全 -> 出单；信息不足 -> 只发提醒，绝不猜价"""
+    now = time.time()
+    for coin in list(PENDING):
+        p = PENDING[coin]
+        tps = sorted(set(p["tps"]))[:TP_TIERS]
+        if not pending_complete(p) and now < p["deadline"]:
+            continue                                  # 继续等同一条信号的后续消息（最多 8 秒）
+        signal_entry = p["entry"]                     # 博主信号里的开仓价（图上/卡片读到，仅作参考）
+        age = now - p["first_ts"]
+        # 开仓一律走市价
+        entry = price_of(coin)
+        esrc = "市价成交"
+        if entry is None:
+            notify("【信号·待确认】%s\n拿不到币安实时价，无法市价开仓\n原文：%s"
+                   % (coin, (p["texts"][0][:180] if p["texts"] else "")))
+            PENDING.pop(coin, None); continue
+        if p["stop"] is None and not tps:
+            notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片都没读到），等你确认后我再挂单\n原文：%s"
+                   % (coin, (p["texts"][0][:180] if p["texts"] else "")))
+            PENDING.pop(coin, None); continue
+        if len(open_pos) >= MAX_OPEN and coin not in open_pos:
+            notify("【信号·跳过】%s 同时持仓已满 %d 笔" % (coin, MAX_OPEN))
+            PENDING.pop(coin, None); continue
+        dirc = p.get("dir") or "LONG"
+        tm = {"detect": p["t_found"] - p["first_ts"], "img": max(0.0, p["t_img"] - p["t_found"]),
+              "parse": max(0.0, p["t_parse"] - p["t_img"]), "chart": max(0.0, p["t_chart"] - p["t_parse"]),
+              "order": 0.0, "push": 0.0, "wait": age, "messages": len(p["texts"])}
+        t_order = time.time()
+        tr = {"coin": coin, "dir": dirc, "entry": entry, "signal_entry": signal_entry, "add": p["add"],
+              "sl": p["stop"], "tps": tps, "entry_src": esrc, "stop_src": p.get("stop_src"),
+              "t_open": datetime.datetime.fromtimestamp(p["first_ts"], CST).strftime("%m-%d %H:%M:%S"),
+              "group": p["group"], "text": (p["texts"][0] if p["texts"] else "")[:300], "status": "OPEN",
+              "chart_imgs": p["imgs"], "timer": tm}
+        tm["order"] = time.time() - t_order
+        open_pos[coin] = tr
+        timing = ("⏱ 从信号发出到推送 共 %.1fs（其中：发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 等同一条信号后续消息 %.1fs）"
+                  % (age, tm["detect"], tm["img"], tm["parse"], tm["chart"], tm["wait"]))
+        t_push0 = time.time()
+        notify(fmt_plan(coin, dirc, entry, p["stop"], tps, p["group"], tr["t_open"],
+                        note=("止损来自%s，共合并 %d 条消息（文案/卡片/图）" % (p.get("stop_src") or "-", len(p["texts"]) + (1 if p["imgs"] else 0))),
+                        add=p["add"], timing=timing, signal_entry=signal_entry))
+        tm["push"] = time.time() - t_push0
+        with open(TRADES, "a", encoding="utf-8") as f:
+            f.write(json.dumps(tr, ensure_ascii=False) + "\n")
+        log("⏱ [%s] %s 出单 | 总=%.1fs | 发现=%.1fs 抓图=%.1fs 解析=%.1fs 读图=%.1fs 等待=%.1fs 推送=%.1fs | 市价开仓=%s 信号价=%s 止损=%s 止盈=%s"
+            % (p["group"], coin, age, tm["detect"], tm["img"], tm["parse"], tm["chart"], tm["wait"], tm["push"],
+               entry, signal_entry, p["stop"], tps))
+        PENDING.pop(coin, None)
+
+def read_chart_meta(path):
+    """从图上读出币种/方向，用于"只有一张图"的信号（币种印在图左上角）"""
+    try:
+        b64 = base64.b64encode(open(path, "rb").read()).decode()
+        body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+                "messages": [{"role": "system", "content": "You read TradingView chart screenshots. STRICT JSON only."},
+                             {"role": "user", "content": [
+                                 {"type": "text", "text": "This image was posted with a crypto trade signal. Return "
+                                  "{\"is_chart\":bool,\"coin\":\"uppercase base asset or null\",\"direction\":\"LONG|SHORT|null\"}. "
+                                  "The symbol is printed in the top-left corner of the chart (e.g. 'INIT / TetherUS PERPETUAL CONTRACT')."},
+                                 {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}
+        r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY, "Content-Type": "application/json"}, json=body, timeout=120)
+        m = re.search(r"\{[\s\S]*\}", r.json()["choices"][0]["message"]["content"])
+        return json.loads(m.group(0))
+    except Exception as e:
+        log("   图元信息读取失败: " + str(e)[:80])
+        return {}
 
 # ---------------- 页面 JS ----------------
 SCAN_JS = """() => {
@@ -245,11 +428,13 @@ SCAN_JS = """() => {
   return out;
 }"""
 
-FETCH_IMG_JS = """async (mid) => {
+FETCH_IMG_JS = """async (arg) => {
+  const mid = (typeof arg === 'object') ? arg.mid : arg;
+  const budget = (typeof arg === 'object' && arg.waitMs) ? arg.waitMs : 6000;
   const it = document.querySelector('.js-message-item[id="' + mid + '"]');
   if (!it) return [];
   const t0 = Date.now();
-  while (Date.now() - t0 < 6000) {
+  while (Date.now() - t0 < budget) {
     const l = Array.from(it.querySelectorAll('img')).filter(i => i.naturalWidth >= 150);
     if (l.length) break;
     await new Promise(r => setTimeout(r, 250));
@@ -345,6 +530,9 @@ def main():
             sv = json.load(open(STATE, encoding="utf-8"))
             for k, v in (sv.get("last") or {}).items():
                 last_id[k] = int(v)
+            _op = sv.get("open")
+            if isinstance(_op, dict):
+                open_pos.update(_op)
             if last_id:
                 log("已载入上次进度：" + ", ".join("%s→%s" % (k, datetime.datetime.fromtimestamp(last_id[k] >> 32, CST).strftime("%m-%d %H:%M")) for k in last_id))
         except Exception:
@@ -390,7 +578,7 @@ def main():
                         pages[g] = None
                     continue
                 try:
-                    page.mouse.move(900, 400); page.mouse.wheel(0, 2600); time.sleep(0.8)
+                    page.mouse.move(900, 400); page.mouse.wheel(0, 2600); time.sleep(0.35)
                     rows = page.evaluate(SCAN_JS)
                     if not rows: continue
                     base = last_id.get(g, 0)
@@ -410,13 +598,16 @@ def main():
                             continue
                         SIG_KW = ["long", "Long", "LONG", "short", "Short", "SHORT", "Entry", "CMP",
                                   "做多", "做空", "止损", "止盈", "平仓", "减仓", "close", "Closed", "TP", "SL"]
-                        if not any(k in txt for k in SIG_KW):
+                        has_img = r.get("loaded", 0) > 0 or r.get("nimg", 0) >= 2
+                        if not any(k in txt for k in SIG_KW) and not has_img:
                             log("   ↳ 闲聊/无关，跳过")
                             continue
                         t_found = time.time()
+                        # 抓图：只要消息里有图片元素就尝试（等它真正加载）
                         imgs = []
-                        if r.get("loaded", 0) > 0:
-                            data = page.evaluate(FETCH_IMG_JS, mid)
+                        if r.get("nimg", 0) > 0:
+                            wait_ms = 6000 if r.get("nimg", 0) >= 2 else 1200
+                            data = page.evaluate(FETCH_IMG_JS, {"mid": mid, "waitMs": wait_ms})
                             for i, d in enumerate(data or []):
                                 if isinstance(d, str) and d.startswith("data:image"):
                                     fn = IMGDIR + "/" + mid + "_" + str(i) + ".png"
@@ -424,10 +615,17 @@ def main():
                                         open(fn, "wb").write(base64.b64decode(d.split(",", 1)[1])); imgs.append(fn)
                                     except Exception:
                                         pass
+                            if r.get("loaded", 0) > 0 or imgs:
+                                log("   媒体: 元素=%d 已加载=%d 抓到图=%d" % (r.get("nimg", 0), r.get("loaded", 0), len(imgs)))
                         t_img = time.time()
-                        info = parse_text(txt)
+                        info = fast_parse(txt)
+                        if info is None:
+                            info = parse_text(txt)
+                        else:
+                            log("   ⚡ 快速解析命中（本地正则，0 AI 调用）")
                         t_parse = time.time()
                         coin = (info.get("coin") or "").upper() or None
+                        dirc = (info.get("direction") or "").upper() or None
                         chart = None
                         for f in imgs:
                             try:
@@ -438,47 +636,31 @@ def main():
                                     break
                             except Exception as e:
                                 log("   读图失败: " + str(e)[:90])
+                        # 只有图、文字里没有币种 -> 从图上读币种
+                        if coin is None and imgs:
+                            meta = read_chart_meta(imgs[-1])
+                            mc = (meta.get("coin") or "").upper()
+                            if meta.get("is_chart") and mc and (not _SYMS or mc in _SYMS):
+                                coin = mc
+                                dirc = dirc or ((meta.get("direction") or "").upper() or "LONG")
+                                log("   图上读到币种: %s %s" % (coin, dirc))
                         t_chart = time.time()
+                        stamps = {"found": t_found, "img": t_img, "parse": t_parse, "chart": t_chart}
+                        # 博主管理指令：立即处理
                         if info.get("type") == "manage" or (info.get("manage_action") and info.get("manage_action") != "other"):
                             notify("【博主指令】%s\n群：%s  时间：%s\n动作：%s\n原文：%s" % (coin or "?", g, when, info.get("manage_action"), txt[:200]))
                             continue
-                        dirc = (info.get("direction") or "").upper() or None
-                        has_hint = bool(info.get("entry_is_cmp")) or isinstance(info.get("entry"), (int, float)) or (chart and chart.get("entry"))
-                        if not (coin and dirc in ("LONG", "SHORT") and (info.get("is_signal") or chart) and (has_hint or (chart and chart.get("sl")))):
-                            log("   ↳ 不是开单信号（币种=%s 方向=%s 图=%s），跳过" % (coin, dirc, bool(chart)))
-                            continue
-                        entry = None
-                        if isinstance(info.get("entry"), (int, float)): entry = float(info["entry"])
-                        elif chart and chart.get("entry"): entry = chart["entry"]
-                        else: entry = price_of(coin)
-                        add = info.get("add_price") if isinstance(info.get("add_price"), (int, float)) else None
-                        sl = info.get("stop") if isinstance(info.get("stop"), (int, float)) else (chart.get("sl") if chart else None)
-                        tps = [float(x) for x in (info.get("targets") or [])][:TP_TIERS]
-                        if not tps and chart: tps = chart.get("tps") or []
-                        t_order = time.time()
-                        if entry is None:
-                            notify("【信号·待确认】%s 无法确定入场价\n原文：%s" % (coin, txt[:200])); continue
-                        if sl is None and not tps:
-                            notify("【信号·待确认】%s %s 只读到入场 %s，止损/止盈没读准\n原文：%s" % (coin, dirc, entry, txt[:200])); continue
-                        if len(open_pos) >= MAX_OPEN and coin not in open_pos:
-                            notify("【信号·跳过】%s 同时持仓已满 %d 笔" % (coin, MAX_OPEN)); continue
-                        tm = {"detect": t_found - t_sig, "img": t_img - t_found, "parse": t_parse - t_img,
-                              "chart": t_chart - t_parse, "order": t_order - t_chart, "push": 0.0}
-                        tm["total"] = time.time() - t_sig
-                        tr = {"coin": coin, "dir": dirc, "entry": entry, "add": add, "sl": sl, "tps": tps,
-                              "t_open": when, "group": g, "text": txt[:300], "status": "OPEN", "chart_imgs": imgs, "timer": tm}
-                        open_pos[coin] = tr
-                        timing = "⏱ 信号→推送 共 %.1fs（发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 下单 %.1fs）" % (
-                            time.time() - t_sig, tm["detect"], tm["img"], tm["parse"], tm["chart"], tm["order"])
-                        t_push0 = time.time()
-                        notify(fmt_plan(coin, dirc, entry, sl, tps, g, when,
-                                        note=("图上读到止损/止盈" if chart else "文字解析"), add=add, timing=timing))
-                        t_push = time.time()
-                        tm["push"] = t_push - t_push0; tm["total"] = t_push - t_sig
-                        with open(TRADES, "a", encoding="utf-8") as f:
-                            f.write(json.dumps(tr, ensure_ascii=False) + "\n")
-                        log("⏱ [%s] %s 发出=%s | 发现=%.1fs | 抓图=%.1fs | 解析=%.1fs | 读图=%.1fs | 下单=%.1fs | 推送=%.1fs | 总=%.1fs" % (
-                            g, coin, when, tm["detect"], tm["img"], tm["parse"], tm["chart"], tm["order"], tm["push"], tm["total"]))
+                        if coin and dirc in ("LONG", "SHORT"):
+                            # 开单信号 -> 进待确认池，等同一条信号的后续消息（卡片/图）补齐
+                            p = merge_pending(coin, g, info=info, chart=chart, imgs=imgs, t_sig=t_sig, txt=txt, stamps=stamps)
+                            if dirc: p["dir"] = dirc
+                            log("   待确认池 %s：开仓=%s(%s) 加仓=%s 止损=%s 止盈=%s 图=%d 已合并%d条消息" % (
+                                coin, p["entry"], p.get("entry_src") or "-", p["add"], p["stop"],
+                                sorted(set(p["tps"])), len(p["imgs"]), len(p["texts"])))
+                        elif coin and coin in PENDING and (chart or imgs or any(isinstance(info.get(k), (int, float)) for k in ("entry", "stop", "add_price"))):
+                            # 后续消息（卡片/带图）补进同一条信号
+                            merge_pending(coin, g, info=info, chart=chart, imgs=imgs, t_sig=t_sig, txt=txt, stamps=stamps)
+                            log("   并入 %s 的待确认池（补充信息，图=%d）" % (coin, len(imgs)))
                 except Exception as e:
                     msg = str(e)[:120]
                     log("[%s] 轮询异常 %s" % (g, msg))
@@ -492,6 +674,11 @@ def main():
                             pages[g] = open_group_page(ctx, g)[0]
                         except Exception:
                             pages[g] = None
+            # 待确认池：信息齐全就出单，到点还没齐也只发提醒（绝不猜价）
+            try:
+                finalize_pending(open_pos)
+            except Exception as e:
+                log("待确认池处理异常 " + str(e)[:100])
             # 纸面持仓监控
             try:
                 for coin, tr in list(open_pos.items()):
@@ -511,7 +698,7 @@ def main():
             except Exception as e:
                 log("持仓监控异常 " + str(e)[:100])
             hb += 1
-            json.dump({"open": list(open_pos.keys()), "last": last_id, "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
+            json.dump({"open": open_pos, "last": last_id, "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
                 log("心跳：运行中 | 持仓 %d 笔（%s）" % (len(open_pos), ",".join(open_pos) or "-"))
