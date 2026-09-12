@@ -473,8 +473,9 @@ def finalize_pending(open_pos):
               "chart_imgs": p["imgs"], "timer": tm}
         tm["order"] = time.time() - t_order
         open_pos[coin] = tr
-        timing = ("⏱ 从信号发出到推送 共 %.1fs（其中：发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 等同一条信号后续消息 %.1fs）"
-                  % (age, tm["detect"], tm["img"], tm["parse"], tm["chart"], tm["wait"]))
+        timing = ("⏱ 从信号发出到推送 共 %.1fs（发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 等齐后续消息+出单 %.1fs）"
+                  % (age, tm["detect"], tm["img"], tm["parse"], tm["chart"],
+                     max(0.0, age - tm["detect"] - tm["img"] - tm["parse"] - tm["chart"])))
         t_push0 = time.time()
         d0 = 1 if dirc == "LONG" else -1
         crossed = any(((t - entry) * d0 <= 0) for t in tps)   # 止盈价是否已被现价越过（真实下单必须处理）
