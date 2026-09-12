@@ -7,7 +7,7 @@
 - 只处理开单信号；闲聊直接跳过；博主管理指令单独处理
 - 全链路计时：信号发出 → 发现 → 抓图 → 解析 → 读图 → 下单(纸面) → 推送
 """
-import os, re, json, time, base64, datetime
+import os, re, json, time, base64, datetime, threading, hashlib
 os.environ.setdefault("DISPLAY", ":99")
 import requests
 from PIL import Image
@@ -37,7 +37,7 @@ DS_API = "https://api.deepseek.com/chat/completions"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
 GROUPS = ["开单记录", "暴富龙", "UA-nurseneil2", "医生DrProfit2群", "颜驰2群"]
-POLL_SEC = 2
+POLL_SEC = 1
 MARGIN = 300.0
 LEV = 3
 NOTIONAL = MARGIN * LEV
@@ -412,8 +412,12 @@ def finalize_pending(open_pos):
     for coin in list(PENDING):
         p = PENDING[coin]
         tps = sorted(set(p["tps"]))[:TP_TIERS]
-        if not pending_complete(p) and now < p["deadline"]:
-            continue                                  # 继续等同一条信号的后续消息（最多 8 秒）
+        if now < p["deadline"]:
+            # 方案E：信息已齐全（止损 + 3 档止盈）且已给足 1.5 秒收集时间 -> 立即出单，不空等
+            if pending_complete(p) and (now - p["first_ts"]) >= 1.5:
+                log("   ⚡ 信息齐全，提前出单（不空等满 4 秒）")
+            else:
+                continue
         signal_entry = p["entry"]                     # 博主信号里的开仓价（图上/卡片读到）
         age = now - p["first_ts"]
         dirc0 = (p.get("dir") or "LONG").upper()
@@ -484,6 +488,26 @@ def finalize_pending(open_pos):
             % (p["group"], coin, age, tm["detect"], tm["img"], tm["parse"], tm["chart"], tm["wait"], tm["push"],
                entry, signal_entry, p["stop"], tps))
         PENDING.pop(coin, None)
+
+# ---------------- 读图缓存（同一张图不重复调 AI）----------------
+_CHART_CACHE = {}
+
+def read_chart_cached(path):
+    try:
+        h = hashlib.sha1(open(path, "rb").read()).hexdigest()
+    except Exception:
+        return None
+    if h in _CHART_CACHE:
+        log("   ♻️ 读图缓存命中（同一张图，0 AI 调用）")
+        return _CHART_CACHE[h]
+    try:
+        r = read_chart(path)
+    except Exception as e:
+        log("   读图异常: " + str(e)[:80])
+        r = None
+    if r:
+        _CHART_CACHE[h] = r
+    return r
 
 def read_chart_meta(path):
     """从图上读出币种/方向，用于"只有一张图"的信号（币种印在图左上角）"""
@@ -566,6 +590,32 @@ TITLE_JS = """(name) => {
   }
   return false;
 }"""
+
+FEED_JS = """() => {
+  const out = {};
+  for (const el of document.querySelectorAll('[class*="a11y_feed_card_main"]')) {
+    const lines = (el.innerText || '').split(String.fromCharCode(10)).map(s => s.trim()).filter(Boolean);
+    if (!lines.length) continue;
+    out[lines[0]] = lines.slice(1).join(' | ').slice(0, 140);
+  }
+  return out;
+}"""
+
+def feed_snapshot(page):
+    """读一次左侧会话列表：{群标题: 最新预览}（一次 JS 调用，约 0.2s）"""
+    try:
+        return page.evaluate(FEED_JS) or {}
+    except Exception:
+        return {}
+
+def feed_preview_of(feed, name):
+    """从会话列表快照里挑出目标群的预览（标题包含群名即可）"""
+    if not feed:
+        return None
+    for title, prev in feed.items():
+        if name in title:
+            return prev
+    return None
 
 def _read_page(page, name):
     """滚到底部读消息；先用标题校验确认这个页面确实是目标群"""
@@ -663,10 +713,34 @@ def main():
             pass
         notify("【跟单机器人】dryRun 已启动（纸面模式，只抓开单信号，不会下单）")
         hb = 0
+        feed_prev = {}            # 群 -> 上次看到的会话列表预览
+        safety = 0                # 兜底：每 N 轮无条件扫一次所有群
         while True:
+            # ===== 方案A：先用「会话列表预览」判断哪个群有新消息（一次 JS 调用 ≈0.2s）=====
+            ref_page = next((pages[g] for g in GROUPS if pages.get(g) and not pages[g].is_closed()), None)
+            feed = feed_snapshot(ref_page) if ref_page else {}
+            changed, missing = [], []
+            for g in GROUPS:
+                prev_txt = feed_preview_of(feed, g)
+                if prev_txt is None:
+                    missing.append(g)                      # 列表里没这个群 -> 兜底扫
+                elif feed_prev.get(g) != prev_txt:
+                    changed.append(g)
+                feed_prev[g] = prev_txt
+            safety += 1
+            if safety % 30 == 0:                            # 每 15 轮（约 15~30s）全量扫一次兜底
+                to_scan = list(GROUPS)
+            else:
+                to_scan = list(changed)
+                if missing:                                 # 列表里看不到的群：每轮轮换兜底扫 1 个
+                    to_scan.append(missing[safety % len(missing)])
+            if changed:
+                log("🔔 会话列表显示有新消息：%s" % "、".join(changed))
             for g in GROUPS:
                 page = pages.get(g)
                 if page is None:
+                    continue
+                if g not in to_scan:
                     continue
                 if page.is_closed():
                     log("[%s] 页面已关闭，重新打开" % g)
@@ -676,15 +750,17 @@ def main():
                         pages[g] = None
                     continue
                 try:
-                    page.mouse.move(900, 400); page.mouse.wheel(0, 2600); time.sleep(0.35)
+                    page.mouse.move(900, 400); page.mouse.wheel(0, 2600); time.sleep(0.3)
                     rows = page.evaluate(SCAN_JS)
-                    if not rows: continue
+                    if not rows:
+                        finalize_pending(open_pos)          # 方案B：每个群扫完就检查一次出单
+                        continue
                     base = last_id.get(g, 0)
                     new = [r for r in rows if r.get("id") and int(r["id"]) > base]
                     if len(new) > 15:
                         log("[%s] 忽略 %d 条回放" % (g, len(new))); new = []
-                    if not new: continue
-                    last_id[g] = max(int(r["id"]) for r in new)
+                    if new:
+                        last_id[g] = max(int(r["id"]) for r in new)
                     for r in sorted(new, key=lambda r: int(r["id"])):
                         mid = r["id"]
                         t_sig = int(mid) >> 32
@@ -716,24 +792,28 @@ def main():
                             if r.get("loaded", 0) > 0 or imgs:
                                 log("   媒体: 元素=%d 已加载=%d 抓到图=%d" % (r.get("nimg", 0), r.get("loaded", 0), len(imgs)))
                         t_img = time.time()
+                        # ===== 方案C+D：本地正则先解析；需要 AI 时才调，且与读图并行 =====
                         info = fast_parse(txt)
+                        need_chart = bool(imgs) and (info is None or len(info.get("targets") or []) < TP_TIERS or not info.get("stop"))
+                        if info is not None:
+                            log("   ⚡ 快速解析命中（本地正则，0 AI 调用）")
+                        _th, _res = None, {}
+                        if need_chart:
+                            _th = threading.Thread(target=lambda: _res.update({"chart": read_chart_cached(imgs[0])}))
+                            _th.start()
+                        elif imgs:
+                            log("   ⏩ 文字/卡片已够（止损+3档止盈），跳过读图")
                         if info is None:
                             info = parse_text(txt)
-                        else:
-                            log("   ⚡ 快速解析命中（本地正则，0 AI 调用）")
+                        if _th is not None:
+                            _th.join(timeout=120)
+                        info = info or {}
+                        chart = _res.get("chart")
+                        if chart and chart.get("ok"):
+                            log("   读图: 止损 %s 开仓 %s 止盈 %s" % (chart["sl"], chart["entry"], chart["tps"]))
                         t_parse = time.time()
                         coin = (info.get("coin") or "").upper() or None
                         dirc = (info.get("direction") or "").upper() or None
-                        chart = None
-                        for f in imgs:
-                            try:
-                                c = read_chart(f)
-                                if c.get("ok"):
-                                    chart = c
-                                    log("   读图: 止损 %s 开仓 %s 止盈 %s" % (c["sl"], c["entry"], c["tps"]))
-                                    break
-                            except Exception as e:
-                                log("   读图失败: " + str(e)[:90])
                         # 只有图、文字里没有币种 -> 从图上读币种
                         if coin is None and imgs:
                             meta = read_chart_meta(imgs[-1])
@@ -759,6 +839,8 @@ def main():
                             # 后续消息（卡片/带图）补进同一条信号
                             merge_pending(coin, g, info=info, chart=chart, imgs=imgs, t_sig=t_sig, txt=txt, stamps=stamps)
                             log("   并入 %s 的待确认池（补充信息，图=%d）" % (coin, len(imgs)))
+                    # 方案B：本群处理完立刻检查一次出单（不再等整轮扫完 5 个群）
+                    finalize_pending(open_pos)
                 except Exception as e:
                     msg = str(e)[:120]
                     log("[%s] 轮询异常 %s" % (g, msg))
