@@ -941,8 +941,9 @@ def open_group_page(ctx, name):
 
 def main():
     log("==== dryRun 机器人 v2 启动（每群独立标签页）====")
-    last_id, open_pos, trades = {}, {}, []
-    open_pos_ref.clear(); load_runtime()
+    last_id = {}
+    open_pos = open_pos_ref          # 指令系统与主循环共用同一个持仓字典
+    load_runtime()
     if os.path.exists(STATE):
         try:
             sv = json.load(open(STATE, encoding="utf-8"))
@@ -951,6 +952,7 @@ def main():
             _op = sv.get("open")
             if isinstance(_op, dict):
                 open_pos.update(_op)
+                log("已恢复持仓 %d 笔：%s" % (len(_op), "、".join(_op) or "-"))
             if last_id:
                 log("已载入上次进度：" + ", ".join("%s→%s" % (k, datetime.datetime.fromtimestamp(last_id[k] >> 32, CST).strftime("%m-%d %H:%M")) for k in last_id))
         except Exception:
@@ -974,7 +976,8 @@ def main():
             else:
                 log("[%s] 打开失败（未读到消息）" % g)
         log("==== 开始实时监控（%d 个页面）====" % len(pages))
-        json.dump({"open": [], "last": last_id, "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
+        # ⚠️ 不要在这里写 {"open": []}，会把已恢复的持仓清空（曾经踩过这个坑）
+        json.dump({"open": open_pos, "last": last_id, "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
         try:
             price_of("BTC")
