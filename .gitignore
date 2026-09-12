@@ -1,0 +1,31 @@
+# 密钥与本地配置（绝不提交）
+config/config.json
+config/notify.json
+*.key
+*.pem
+.env
+
+# 抓取到的数据（含聊天记录、图片，体积大）
+data/
+**/imgs/
+**/*.jsonl
+**/run.log
+**/nohup.log
+*.tgz
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 浏览器登录态（核心隐私资产）
+fs_profile/
+fs_bot/
+fs_scrape/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
