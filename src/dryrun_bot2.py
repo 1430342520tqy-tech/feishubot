@@ -300,6 +300,33 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
     if timing: L.append(timing)
     return "\n".join(L)
 
+# ---------------- 币种归一化（只做 USDT 计价的币安合约）----------------
+_COIN_ALIAS = {
+    "GOLD": "XAU", "GOLDUSDT": "XAU",                       # 黄金 -> XAUUSDT
+    "XAUT": "XAUT",                                         # Tether Gold
+    "SILVER": "XAG",                                        # 白银
+    "OIL": "CL", "WTI": "CL", "CRUDE": "CL", "USOIL": "CL", # 原油 -> CLUSDT
+    "NATGAS": "NATGAS", "GAS": "NATGAS",
+}
+
+def norm_coin(raw):
+    """统一成币安 USDT-M 的 base（USD 只是别人的写法，我们只交易 USDT 计价合约）"""
+    if not raw:
+        return None
+    s = str(raw).upper().strip().replace("/", "").replace("-", "").replace(" ", "").replace("$", "")
+    for suf in ("USDT.P", "USDTM", "PERP", "USDT", "USD"):
+        if s.endswith(suf) and len(s) > len(suf):
+            s = s[:-len(suf)]
+            break
+    return _COIN_ALIAS.get(s, s) or None
+
+def resolve_coin(raw):
+    """返回 (base, 是否在币安 USDT-M 清单里)"""
+    b = norm_coin(raw)
+    if not b:
+        return None, False
+    return b, ((not _SYMS) or (b in _SYMS))
+
 # ---------------- 快速解析（常见模板秒出结果，避免每次等 AI）----------------
 _SYMS = set()
 try:
@@ -313,17 +340,23 @@ except Exception:
 
 def fast_parse(txt):
     """只匹配博主常用模板；命中即返回，未命中返回 None（交给 AI 解析）"""
-    m = re.search(r"(?:Going|Market|Longing|Buying)\s+(long|short)\s+\$?([A-Za-z0-9]{2,12})", txt, re.I)
+    m = re.search(r"(?:Going|Market|Longing|Buying|Selling|Shorting)\s+(long|short)\s+\$?([A-Za-z0-9]{2,12})", txt, re.I)
     if m:
         dirc = "LONG" if m.group(1).lower() == "long" else "SHORT"
-        coin = m.group(2).upper()
+        raw = m.group(2)
     else:
-        m = re.search(r"([A-Za-z0-9]{2,12})\s*(?:/USDT)?\s*[—\-–]\s*(LONG|SHORT)\b", txt, re.I)
-        if not m:
-            return None
-        coin, dirc = m.group(1).upper(), m.group(2).upper()
-    if _SYMS and coin not in _SYMS:
-        return None                       # 币种不在币安合约清单里 → 交给 AI 判断
+        m = re.search(r"\b(Selling|Buying|Shorting|Longing)\s+\$?([A-Za-z0-9]{2,12})", txt, re.I)
+        if m:
+            dirc = "SHORT" if m.group(1).lower() in ("selling", "shorting") else "LONG"
+            raw = m.group(2)
+        else:
+            m = re.search(r"([A-Za-z0-9]{2,12})\s*(?:/USDT)?\s*[—\-–]\s*(LONG|SHORT)\b", txt, re.I)
+            if not m:
+                return None
+            raw, dirc = m.group(1).upper(), m.group(2).upper()
+    coin, ok = resolve_coin(raw)
+    if not coin or not ok:
+        return None                       # 币种规范化后不在币安 USDT-M 清单里 → 交给 AI/待确认
     stop = None
     for pat in (r"close under\s*\$?([0-9]*\.?[0-9]+)", r"SL[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)",
                 r"stop[ -]?loss[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)", r"止损[^0-9]{0,14}([0-9]*\.?[0-9]+)"):
@@ -844,13 +877,19 @@ def main():
                         chart = _res.get("chart")
                         if chart and chart.get("ok"):
                             log("   读图: 止损 %s 开仓 %s 止盈 %s" % (chart["sl"], chart["entry"], chart["tps"]))
-                        coin = (info.get("coin") or "").upper() or None
+                        raw_coin = info.get("coin")
+                        coin, coin_ok = (resolve_coin(raw_coin) if raw_coin else (None, False))
+                        if raw_coin and coin and not coin_ok:
+                            log("   ⚠️ 币种 %s（原文写法 %s）不在币安 USDT-M 清单里" % (coin, raw_coin))
+                            notify("【信号·不支持】%s\n币安 USDT-M 没有这个币种的合约（原文写法：%s）\n我们只交易 USDT 计价的合约。\n原文：%s"
+                                   % (coin, raw_coin, txt[:160]))
+                            continue
                         dirc = (info.get("direction") or "").upper() or None
                         # 只有图、文字里没有币种 -> 从图上读币种
                         if coin is None and imgs:
                             meta = read_chart_meta(imgs[-1])
-                            mc = (meta.get("coin") or "").upper()
-                            if meta.get("is_chart") and mc and (not _SYMS or mc in _SYMS):
+                            mc, mc_ok = resolve_coin(meta.get("coin"))
+                            if meta.get("is_chart") and mc and mc_ok:
                                 coin = mc
                                 dirc = dirc or ((meta.get("direction") or "").upper() or "LONG")
                                 log("   图上读到币种: %s %s" % (coin, dirc))
