@@ -36,7 +36,7 @@ DS_KEY = os.environ.get("DEEPSEEK_API_KEY") or _CFG.get("deepseek_api_key", "")
 DS_API = "https://api.deepseek.com/chat/completions"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
-GROUPS = ["开单记录", "暴富龙", "UA-nurseneil2", "医生DrProfit2群", "颜驰2群"]
+GROUPS = ["开单记录", "机器人开单通知", "暴富龙", "UA-nurseneil2", "医生DrProfit2群", "颜驰2群"]
 POLL_SEC = 0.5
 MARGIN = 300.0
 LEV = 3
@@ -597,7 +597,7 @@ def pos_report(coin, tr):
 
 # ---------------- 指令系统（只有你本人、在指定指令群、短消息才执行）----------------
 RUNTIME = BASE + "/runtime_config.json"
-CMD_GROUP = "开单记录"
+CMD_GROUPS = ["开单记录", "机器人开单通知"]   # 指令在这两个群里生效
 PAUSED = [False]              # 暂停：仍抓取记录，但不动作
 STATE_DIRTY = [False]
 open_pos_ref = {}             # 在 main() 里指向真正的持仓字典
@@ -606,7 +606,7 @@ HELP_TEXT = """【机器人指令】在「开单记录」群直接发这些词�
 · 帮助 —— 看这份清单
 · 状态 —— 运行状态 / 监控群 / 持仓数
 · 持仓情况 —— 汇报全部持仓（也可写：持仓 BTC）
-· 全部平仓 —— 需再回一句「确认全部平仓」才执行
+· 全部平仓 —— 立即平掉全部持仓
 · 平仓 BTC —— 平掉某个币
 · 减仓 BTC 50 —— 减掉 50%（默认一半）
 · 修改止损 BTC 0.85 —— 改某笔止损
@@ -717,15 +717,12 @@ def handle_command(txt):
         else:
             for c in list(open_pos_ref):
                 pos_report(c, open_pos_ref[c])
-    elif cmd.startswith("确认全部平仓"):
+    elif cmd.startswith("全部平仓") or cmd.startswith("确认全部平仓"):
         if not open_pos_ref:
             notify("【指令】当前没有持仓")
         else:
             for c in list(open_pos_ref):
                 close_position(c, 100, "你的指令：全部平仓")
-    elif cmd.startswith("全部平仓"):
-        notify("【确认】要平掉全部 %d 笔持仓吗？（%s）\n回一句「确认全部平仓」我就执行"
-               % (len(open_pos_ref), "、".join(open_pos_ref) or "-"))
     elif cmd.startswith("平仓"):
         m = re.search(r"平仓\s*([A-Za-z0-9]{2,12})", cmd)
         if m:
@@ -1044,7 +1041,7 @@ def main():
                         if "通过webhook" in txt or "【跟单机器人】" in txt or "invited" in low or "test notification" in low:
                             continue
                         # 指令优先：只有在指定指令群里、由你发的短消息才会被当成指令
-                        if g == CMD_GROUP:
+                        if g in CMD_GROUPS:
                             try:
                                 if handle_command(txt):
                                     continue
