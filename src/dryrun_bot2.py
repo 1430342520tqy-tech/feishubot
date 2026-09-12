@@ -239,37 +239,57 @@ def parse_text(text):
         return {}
 
 # ---------------- 通知格式 ----------------
-def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timing=None, signal_entry=None):
+def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timing=None,
+             signal_entry=None, signal_src=None, crossed=False, entry_mode="市价"):
     d = 1 if (direction or "LONG").upper() == "LONG" else -1
+    lev = LEV
     L = []
     L.append("【已开单·纸面】%s/USDT 永续 · %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
+    L.append("")
     L.append("来源：%s   信号时间：%s" % (src, when))
-    L.append("金额：保证金 %.0fU × %d倍 = 名义 %.0fU" % (MARGIN, LEV, NOTIONAL))
+    L.append("金额：保证金 %.0fU %d倍 = 名义 %.0fU" % (MARGIN, lev, NOTIONAL))
+    L.append("开仓：")
     if isinstance(entry, (int, float)):
-        if add:
-            L.append("开仓：市价成交 %.8g（头仓 1/3）＋ 加仓 2/3 挂单 %.8g" % (entry, add))
+        if entry_mode == "限价挂单":
+            L.append("你的开仓价：限价挂单 %.8g（还没成交，等价格到位）" % entry)
+        elif entry_mode == "市价":
+            L.append("你的开仓价：市价成交 %.8g" % entry)
         else:
-            L.append("开仓：市价成交 %.8g（全仓）" % entry)
-        if isinstance(signal_entry, (int, float)) and abs(signal_entry - entry) / entry > 0.0005:
-            L.append("　　　博主信号开仓价：%.8g（图上/卡片读到，仅作参考）" % signal_entry)
+            L.append("你的开仓价：%.8g" % entry)
     else:
-        L.append("开仓：市价")
+        L.append("你的开仓价：市价")
+    if isinstance(signal_entry, (int, float)) and signal_entry:
+        L.append("博主的开仓价：%.8g（%s读到）" % (signal_entry, signal_src or "图上/卡片/文字"))
+    else:
+        L.append("博主的开仓价：未读到（按 CMP 市价理解）")
     ref = signal_entry if isinstance(signal_entry, (int, float)) and signal_entry else entry
     if isinstance(sl, (int, float)) and isinstance(entry, (int, float)) and entry:
         L.append("止损（挂单）：%.8g" % sl)
         L.append("　　→ 按实际成交 %.2f%%（不含杠杆）· 约 %+.1fU" % ((sl - entry) / entry * 100 * d, (sl - entry) * d / entry * NOTIONAL))
+        L.append("　　→ 含 %d 倍杠杆 %.2f%%（占保证金）" % (lev, (sl - entry) / entry * 100 * d * lev))
         if ref and abs(ref - entry) / entry > 0.0005:
-            L.append("　　→ 按博主信号价 %.2f%%（博主口径）" % ((sl - ref) / ref * 100 * d))
+            L.append("　　→ 博主止损收益率（不算杠杆）%.2f%%" % ((sl - ref) / ref * 100 * d))
     else:
-        L.append("止损：图上/卡片都没读到，等你确认（暂不挂）")
+        L.append("止损：图上/卡片/文字都没读到，等你确认（暂不挂）")
     if tps:
+        n = len(tps[:TP_TIERS])
         for i, t in enumerate(tps[:TP_TIERS], 1):
             if isinstance(entry, (int, float)) and entry:
-                L.append("止盈%d（挂单）：%.8g → 按实际成交 %+.2f%%（不含杠杆）· 平1/3 · 约 %+.1fU" % (
-                    i, t, (t - entry) / entry * 100 * d, (t - entry) * d / entry * NOTIONAL / len(tps[:TP_TIERS])))
-        L.append("规则：TP1 成交后止损移到开仓价（保本）")
+                gross = (t - entry) / entry * 100 * d
+                tier_u = (t - entry) * d / entry * NOTIONAL / n
+                full_u = (t - entry) * d / entry * NOTIONAL
+                L.append("止盈%d（挂单）：%.8g → 预期收益率 %+.2f%%（含 %d 倍杠杆）" % (i, t, gross * lev, lev))
+                L.append("　　　平1/3 · 该档 约 %+.1fU · 若全平在此价 约 %+.1fU" % (tier_u, full_u))
+        extra = ""
+        if len(tps) < TP_TIERS:
+            extra = "（本次只读到 %d 档）" % len(tps)
+        elif crossed:
+            extra = "（注：有止盈价已被现价越过）"
+        L.append("")
+        L.append("规则：TP1 成交后止损移到开仓价（保本损）" + extra)
     else:
-        L.append("止盈：图上/卡片都没读到，等你确认（暂不挂）")
+        L.append("")
+        L.append("规则：止盈图上/卡片/文字都没读到，暂不挂（等你确认）")
     if note: L.append("备注：" + note)
     if timing: L.append(timing)
     return "\n".join(L)
@@ -331,7 +351,7 @@ def fast_parse(txt):
 
 # ---------------- 待确认池：把同一条信号的多条消息合并（文案 + 卡片 + K线图）----------------
 PENDING = {}
-PENDING_WAIT = 8           # 秒：等同一条信号的后续消息（文案/卡片/图 一般 5 秒内到齐）
+PENDING_WAIT = 4           # 秒：等同一条信号的后续消息（用户要求 4 秒）
 
 def merge_pending(coin, group, info=None, chart=None, imgs=None, t_sig=0, txt="", stamps=None):
     p = PENDING.get(coin)
@@ -389,23 +409,42 @@ def finalize_pending(open_pos):
         tps = sorted(set(p["tps"]))[:TP_TIERS]
         if not pending_complete(p) and now < p["deadline"]:
             continue                                  # 继续等同一条信号的后续消息（最多 8 秒）
-        signal_entry = p["entry"]                     # 博主信号里的开仓价（图上/卡片读到，仅作参考）
+        signal_entry = p["entry"]                     # 博主信号里的开仓价（图上/卡片读到）
         age = now - p["first_ts"]
-        # 开仓一律走市价
-        entry = price_of(coin)
-        esrc = "市价成交"
-        if entry is None:
-            notify("【信号·待确认】%s\n拿不到币安实时价，无法市价开仓\n原文：%s"
+        dirc0 = (p.get("dir") or "LONG").upper()
+        mkt = price_of(coin)
+        if mkt is None:
+            notify("【信号·待确认】%s\n拿不到币安实时价，无法开仓\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
+        # 开仓方式（用户规则）：
+        #   博主价与市价相差 ±2% 以内 -> 市价开仓
+        #   做多且博主价高于市价 2% 以上 -> 在博主开仓价挂限价单
+        #   做空且博主价低于市价 2% 以上 -> 在博主开仓价挂限价单
+        #   其余（价格已朝不利方向跑过头）-> 不自动开，发提醒等确认
+        entry, entry_mode, esrc = mkt, "市价", "市价成交"
+        if isinstance(signal_entry, (int, float)) and signal_entry and mkt:
+            diff = (signal_entry - mkt) / mkt
+            if abs(diff) <= 0.02:
+                entry, entry_mode = mkt, "市价"
+            elif dirc0 == "LONG" and diff > 0.02:
+                entry, entry_mode, esrc = signal_entry, "限价挂单", "限价挂单(待成交)"
+            elif dirc0 == "SHORT" and diff < -0.02:
+                entry, entry_mode, esrc = signal_entry, "限价挂单", "限价挂单(待成交)"
+            else:
+                notify("【信号·需你确认】%s %s\n博主开仓价 %.8g 与现价 %.8g 相差 %.2f%%（超过 2%%，且方向不利：%s）\n"
+                       "按规则我不自动开仓。你回一句「市价追」或「挂博主价等回调」，我再下。\n原文：%s"
+                       % (coin, dirc0, signal_entry, mkt, diff * 100, "价格已涨过头" if dirc0 == "LONG" else "价格已跌过头",
+                          (p["texts"][0][:160] if p["texts"] else "")))
+                PENDING.pop(coin, None); continue
         if p["stop"] is None and not tps:
-            notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片都没读到），等你确认后我再挂单\n原文：%s"
+            notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
         if len(open_pos) >= MAX_OPEN and coin not in open_pos:
             notify("【信号·跳过】%s 同时持仓已满 %d 笔" % (coin, MAX_OPEN))
             PENDING.pop(coin, None); continue
-        dirc = p.get("dir") or "LONG"
+        dirc = dirc0
         tm = {"detect": p["t_found"] - p["first_ts"], "img": max(0.0, p["t_img"] - p["t_found"]),
               "parse": max(0.0, p["t_parse"] - p["t_img"]), "chart": max(0.0, p["t_chart"] - p["t_parse"]),
               "order": 0.0, "push": 0.0, "wait": age, "messages": len(p["texts"])}
@@ -420,9 +459,12 @@ def finalize_pending(open_pos):
         timing = ("⏱ 从信号发出到推送 共 %.1fs（其中：发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 等同一条信号后续消息 %.1fs）"
                   % (age, tm["detect"], tm["img"], tm["parse"], tm["chart"], tm["wait"]))
         t_push0 = time.time()
+        d0 = 1 if dirc == "LONG" else -1
+        crossed = any(((t - entry) * d0 <= 0) for t in tps)   # 止盈价是否已被现价越过（真实下单必须处理）
         notify(fmt_plan(coin, dirc, entry, p["stop"], tps, p["group"], tr["t_open"],
                         note=("止损来自%s，共合并 %d 条消息（文案/卡片/图）" % (p.get("stop_src") or "-", len(p["texts"]) + (1 if p["imgs"] else 0))),
-                        add=p["add"], timing=timing, signal_entry=signal_entry))
+                        add=p["add"], timing=timing, signal_entry=signal_entry,
+                        signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode))
         tm["push"] = time.time() - t_push0
         with open(TRADES, "a", encoding="utf-8") as f:
             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
