@@ -7,7 +7,7 @@
 - 只处理开单信号；闲聊直接跳过；博主管理指令单独处理
 - 全链路计时：信号发出 → 发现 → 抓图 → 解析 → 读图 → 下单(纸面) → 推送
 """
-import os, re, json, time, base64, datetime, threading, hashlib
+import os, re, json, time, base64, datetime, threading, hashlib, math
 os.environ.setdefault("DISPLAY", ":99")
 import requests
 from PIL import Image
@@ -36,7 +36,7 @@ DS_KEY = os.environ.get("DEEPSEEK_API_KEY") or _CFG.get("deepseek_api_key", "")
 DS_API = "https://api.deepseek.com/chat/completions"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
-GROUPS = ["开单记录", "机器人开单通知", "暴富龙", "UA-nurseneil2", "医生DrProfit2群", "颜驰2群"]
+GROUPS = ["机器人开单通知", "暴富龙", "UA-nurseneil2", "颜驰2群"]
 POLL_SEC = 0.5
 MARGIN = 300.0
 LEV = 3
@@ -225,10 +225,10 @@ def read_chart(path):
 def parse_text(text):
     prompt = ("从这条加密货币跟单消息里抽取开单信息。只输出JSON："
               "{\"is_signal\":bool,\"coin\":\"大写币种或null\",\"direction\":\"LONG|SHORT|null\","
-              "\"entry\":数字或null,\"entry_is_cmp\":bool,\"add_price\":数字或null,"
+              "\"entry\":数字或null,\"entryRange\":[最小,最大]或null,\"entry_is_cmp\":bool,\"add_price\":数字或null,"
               "\"stop\":数字或null,\"targets\":[数字],\"tp_on_chart\":bool,"
               "\"type\":\"open|manage|info\",\"manage_action\":\"close_all|trim|move_stop_to_cost|null\"}"
-              " 规则：只用消息里真实出现的数字，绝不编造；止盈写在图上则 tp_on_chart=true 且 targets 为空。")
+              " 规则：只用消息里真实出现的数字，绝不编造；止盈写在图上则 tp_on_chart=true 且 targets 为空。开仓价若给的是区间（如「在4360到4310区间多」「4310-4360 区间」），请填 entryRange=[小,大] 且 entry 留 null。")
     body = {"model": "deepseek-v4-flash", "temperature": 0,
             "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text[:900]}]}
     try:
@@ -340,23 +340,42 @@ except Exception:
 
 def fast_parse(txt):
     """只匹配博主常用模板；命中即返回，未命中返回 None（交给 AI 解析）"""
+    raw = None
+    dirc = None
     m = re.search(r"(?:Going|Market|Longing|Buying|Selling|Shorting)\s+(long|short)\s+\$?([A-Za-z0-9]{2,12})", txt, re.I)
     if m:
         dirc = "LONG" if m.group(1).lower() == "long" else "SHORT"
         raw = m.group(2)
-    else:
+    if raw is None:
         m = re.search(r"\b(Selling|Buying|Shorting|Longing)\s+\$?([A-Za-z0-9]{2,12})", txt, re.I)
         if m:
             dirc = "SHORT" if m.group(1).lower() in ("selling", "shorting") else "LONG"
             raw = m.group(2)
-        else:
-            m = re.search(r"([A-Za-z0-9]{2,12})\s*(?:/USDT)?\s*[—\-–]\s*(LONG|SHORT)\b", txt, re.I)
-            if not m:
-                return None
+    if raw is None:
+        m = re.search(r"([A-Za-z0-9]{2,12})\s*(?:/USDT)?\s*[—\-–]\s*(LONG|SHORT)\b", txt, re.I)
+        if m:
             raw, dirc = m.group(1).upper(), m.group(2).upper()
+    # 中文方向词（颜驰这类："…区间多" / "多单" / "做空"）
+    if "区间多" in txt or "做多" in txt or "多单" in txt or "看多" in txt:
+        dirc = "LONG"
+    elif "区间空" in txt or "做空" in txt or "空单" in txt or "看空" in txt:
+        dirc = "SHORT"
+    if raw is None:
+        # 中文/俗称兜底：直接从整段文字里找币安合约（黄金/比特币/闪迪/海力士…）
+        c2 = find_coin_in_text(txt)
+        if c2 and dirc:
+            raw = c2
+    if raw is None:
+        return None
     coin, ok = resolve_coin(raw)
+    if not coin or not ok or coin in ("LONG", "SHORT"):
+        c2 = find_coin_in_text(txt)
+        if c2:
+            coin, ok = c2, True
     if not coin or not ok:
         return None                       # 币种规范化后不在币安 USDT-M 清单里 → 交给 AI/待确认
+    if not dirc:
+        return None
     stop = None
     for pat in (r"close under\s*\$?([0-9]*\.?[0-9]+)", r"SL[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)",
                 r"stop[ -]?loss[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)", r"止损[^0-9]{0,14}([0-9]*\.?[0-9]+)"):
@@ -377,12 +396,32 @@ def fast_parse(txt):
         try: entry = float(mm.group(1))
         except Exception: pass
     tps = []
+    _mt = re.search(r"(?:止盈|目标位?|targets?)\s*[:：]?\s*((?:\$?[0-9]*\.?[0-9]+[\s,，、]*){1,5})", txt, re.I)
+    if _mt:
+        for x in re.findall(r"[0-9]*\.?[0-9]+", _mt.group(1)):
+            try:
+                v = float(x)
+                if v > 0 and v not in tps: tps.append(v)
+            except Exception:
+                pass
     for x in re.findall(r"TP\s?\d?\s*[:：]?\s*\$?([0-9]*\.?[0-9]+)", txt, re.I):
         try: tps.append(float(x))
         except Exception: pass
+    # 区间开仓价（如「在4360到4310区间多」/「4310-4360 区间」）—— 一律取中间值
+    rng = None
+    m = re.search(r"([0-9]*\.?[0-9]+)\s*(?:到|至|~|～|—|–)\s*([0-9]*\.?[0-9]+)", txt)
+    if not m:
+        m = re.search(r"([0-9]*\.?[0-9]+)\s*-\s*([0-9]*\.?[0-9]+)\s*(?:区间|之间)", txt)
+    if m:
+        try:
+            a, b = float(m.group(1)), float(m.group(2))
+            if a > 0 and b > 0 and a != b:
+                rng = [min(a, b), max(a, b)]
+        except Exception:
+            pass
     if not (stop or add or entry or tps):
         return None
-    return {"is_signal": True, "coin": coin, "direction": dirc, "entry": entry,
+    return {"is_signal": True, "coin": coin, "direction": dirc, "entry": entry, "entryRange": rng,
             "entry_is_cmp": bool(re.search(r"\bCMP\b|市价|现价", txt, re.I)),
             "add_price": add, "stop": stop, "targets": tps,
             "tp_on_chart": bool(re.search(r"TPs?\s+above|止盈在?上方|止盈位在上方", txt, re.I)),
@@ -408,6 +447,15 @@ def merge_pending(coin, group, info=None, chart=None, imgs=None, t_sig=0, txt=""
         e = info.get("entry")
         if isinstance(e, (int, float)) and p["entry"] is None:
             p["entry"] = float(e); p["entry_src"] = "消息文字"
+        rng = info.get("entryRange")
+        if isinstance(rng, (list, tuple)) and len(rng) == 2 and p["entry"] is None:
+            try:
+                mid, lo, hi = range_mid(float(rng[0]), float(rng[1]), coin)
+                p["entry"] = mid
+                p["entry_src"] = "区间中间值"
+                p["range_note"] = "博主给的是区间 %.8g ~ %.8g → 按中间值 %.8g 开（已向上取整到合约精度）" % (lo, hi, mid)
+            except Exception:
+                pass
         a = info.get("add_price")
         if isinstance(a, (int, float)) and p["add"] is None:
             p["add"] = float(a)
@@ -594,6 +642,75 @@ def pos_report(coin, tr):
     if tr.get("realized"):
         L.append("已实现盈亏：%+.1fU" % tr["realized"])
     notify("\n".join(L))
+
+# ---------------- 名称映射（中文/俗称 -> 币安 USDT-M base）----------------
+_NAME_MAP = {
+    # 主流币
+    "比特币": "BTC", "大饼": "BTC", "BITCOIN": "BTC",
+    "以太坊": "ETH", "以太": "ETH", "姨太": "ETH", "ETHEREUM": "ETH",
+    "索拉纳": "SOL", "SOLANA": "SOL", "狗狗币": "DOGE", "狗币": "DOGE", "DOGECOIN": "DOGE",
+    "瑞波": "XRP", "瑞波币": "XRP", "RIPPLE": "XRP", "币安币": "BNB", "艾达": "ADA", "艾达币": "ADA",
+    "波卡": "DOT", "雪崩": "AVAX", "莱特币": "LTC", "柚子": "EOS", "波场": "TRX", "特朗普币": "TRUMP",
+    # 贵金属 / 大宗
+    "黄金": "XAU", "金": "XAU", "GOLD": "XAU", "XAUUSD": "XAU",
+    "白银": "XAG", "银": "XAG", "SILVER": "XAG",
+    "原油": "CL", "石油": "CL", "油": "CL", "OIL": "CL", "WTI": "CL", "CRUDE": "CL",
+    "天然气": "NATGAS", "GAS": "NATGAS",
+    # 美股代币（币安有对应 USDT 永续）
+    "闪迪": "SNDK", "SANDISK": "SNDK", "海力士": "SKHY", "SK海力士": "SKHY", "SKHYNIX": "SKHY", "HYNIX": "SKHY",
+    "特斯拉": "TSLA", "TESLA": "TSLA", "英伟达": "NVDA", "NVIDIA": "NVDA", "苹果": "AAPL", "APPLE": "AAPL",
+    "微软": "MSFT", "MICROSOFT": "MSFT", "谷歌": "GOOGL", "GOOGLE": "GOOGL", "亚马逊": "AMZN", "AMAZON": "AMZN",
+    "奈飞": "NFLX", "NETFLIX": "NFLX", "超微": "AMD", "英特尔": "INTC", "INTEL": "INTC", "美光": "MU",
+    " coinbase": "COIN", "COINBASE": "COIN", "微策略": "MSTR", "策略": "MSTR", "帕兰提尔": "PLTR", "PLTR": "PLTR",
+    "阿里": "BABA", "阿里巴巴": "BABA", "拼多多": "PDD", "游戏驿站": "GME", "标普": "SPY", "纳斯达克": "QQQ",
+}
+
+def find_coin_in_text(txt):
+    """从整段文字里找币安 USDT-M 合约（先查中文/俗称别名，再查代码本身）"""
+    up = (txt or "").upper()
+    for alias in sorted(_NAME_MAP.keys(), key=lambda k: -len(k)):
+        a = alias.strip().upper()
+        if a and (a in up):
+            return _NAME_MAP[alias]
+    if _SYMS:
+        cands = [b for b in _SYMS if len(b) >= 2 and
+                 re.search(r"(?<![A-Z0-9])" + re.escape(b) + r"(?![A-Z0-9])", up)]
+        cands.sort(key=len, reverse=True)
+        if cands:
+            return cands[0]
+    return None
+
+# ---------------- 价格精度（币安 tickSize）与区间中间值 ----------------
+_TICKS = {}
+
+def tick_of(coin):
+    """返回该合约的价格精度（tickSize），用于把价格向上取整到可下单的值"""
+    sym = (coin or "").upper() + "USDT"
+    if sym in _TICKS:
+        return _TICKS[sym]
+    if not _TICKS:                      # 第一次调用时拉一次全量
+        try:
+            ex = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=25).json()
+            for s in ex.get("symbols", []):
+                for flt in s.get("filters", []):
+                    if flt.get("filterType") == "PRICE_FILTER":
+                        _TICKS[s["symbol"]] = float(flt.get("tickSize") or 0) or None
+            log("已载入 %d 个合约的价格精度" % len(_TICKS))
+        except Exception as e:
+            log("拉取价格精度失败: " + str(e)[:80])
+    return _TICKS.get(sym)
+
+def ceil_to_tick(price, tick):
+    """向上取整到该合约的最小价格变动单位（做多做空都一样）"""
+    if not tick or tick <= 0:
+        return math.ceil(price) if price != int(price) else price
+    return round(math.ceil(round(price / tick, 8)) * tick, 10)
+
+def range_mid(a, b, coin=None):
+    """区间开仓价 -> 取中间值，再向上取整到该合约精度"""
+    lo, hi = (a, b) if a <= b else (b, a)
+    mid = (lo + hi) / 2.0
+    return ceil_to_tick(mid, tick_of(coin) if coin else None), lo, hi
 
 # ---------------- 指令系统（只有你本人、在指定指令群、短消息才执行）----------------
 RUNTIME = BASE + "/runtime_config.json"
