@@ -240,7 +240,8 @@ def parse_text(text):
 
 # ---------------- 通知格式 ----------------
 def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timing=None,
-             signal_entry=None, signal_src=None, crossed=False, entry_mode="市价"):
+             signal_entry=None, signal_src=None, crossed=False, entry_mode="市价",
+             entry_orders=None, entry_note=""):
     d = 1 if (direction or "LONG").upper() == "LONG" else -1
     lev = LEV
     L = []
@@ -249,13 +250,17 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
     L.append("来源：%s   信号时间：%s" % (src, when))
     L.append("金额：保证金 %.0fU %d倍 = 名义 %.0fU" % (MARGIN, lev, NOTIONAL))
     L.append("开仓：")
-    if isinstance(entry, (int, float)):
-        if entry_mode == "限价挂单":
-            L.append("你的开仓价：限价挂单 %.8g（还没成交，等价格到位）" % entry)
-        elif entry_mode == "市价":
-            L.append("你的开仓价：市价成交 %.8g" % entry)
-        else:
-            L.append("你的开仓价：%.8g" % entry)
+    if entry_mode == "限价分批" and entry_orders:
+        for i, o in enumerate(entry_orders, 1):
+            L.append("挂单%d：%.8g → 保证金 %.0fU（%d倍 = %.0fU 名义）"
+                     % (i, o["price"], o["margin"], lev, o["margin"] * lev))
+        if entry_note:
+            L.append("（%s）" % entry_note)
+        L.append("你的开仓均价（两笔都成交时）：%.8g" % entry)
+    elif isinstance(entry, (int, float)):
+        L.append("你的开仓价：市价成交 %.8g" % entry)
+        if entry_note:
+            L.append("（%s）" % entry_note)
     else:
         L.append("你的开仓价：市价")
     if isinstance(signal_entry, (int, float)) and signal_entry:
@@ -417,26 +422,32 @@ def finalize_pending(open_pos):
             notify("【信号·待确认】%s\n拿不到币安实时价，无法开仓\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
-        # 开仓方式（用户规则）：
-        #   博主价与市价相差 ±2% 以内 -> 市价开仓
-        #   做多且博主价高于市价 2% 以上 -> 在博主开仓价挂限价单
-        #   做空且博主价低于市价 2% 以上 -> 在博主开仓价挂限价单
-        #   其余（价格已朝不利方向跑过头）-> 不自动开，发提醒等确认
+        # 开仓方式（用户规则：不追高/不追空，逆势有利直接市价）
+        #   博主价与市价相差 ±2% 以内            -> 市价开满仓
+        #   做多 且 市价高于博主价 2% 以上        -> 不追高：分两笔挂限价（博主价×1.01 一半 + 博主价 一半）
+        #   做空 且 市价低于博主价 2% 以上        -> 不追空：分两笔挂限价（博主价×0.99 一半 + 博主价 一半）
+        #   其余（做多时市价低于博主价 / 做空时市价高于博主价）-> 直接市价，止损不变
         entry, entry_mode, esrc = mkt, "市价", "市价成交"
+        entry_orders = [{"kind": "市价", "price": mkt, "margin": MARGIN}]
+        entry_note = ""
         if isinstance(signal_entry, (int, float)) and signal_entry and mkt:
-            diff = (signal_entry - mkt) / mkt
-            if abs(diff) <= 0.02:
-                entry, entry_mode = mkt, "市价"
-            elif dirc0 == "LONG" and diff > 0.02:
-                entry, entry_mode, esrc = signal_entry, "限价挂单", "限价挂单(待成交)"
-            elif dirc0 == "SHORT" and diff < -0.02:
-                entry, entry_mode, esrc = signal_entry, "限价挂单", "限价挂单(待成交)"
-            else:
-                notify("【信号·需你确认】%s %s\n博主开仓价 %.8g 与现价 %.8g 相差 %.2f%%（超过 2%%，且方向不利：%s）\n"
-                       "按规则我不自动开仓。你回一句「市价追」或「挂博主价等回调」，我再下。\n原文：%s"
-                       % (coin, dirc0, signal_entry, mkt, diff * 100, "价格已涨过头" if dirc0 == "LONG" else "价格已跌过头",
-                          (p["texts"][0][:160] if p["texts"] else "")))
-                PENDING.pop(coin, None); continue
+            diff = (signal_entry - mkt) / mkt          # >0 表示市价在博主价下方
+            if dirc0 == "LONG" and diff < -0.02:       # 市价高于博主价 2% 以上 -> 不追高
+                p1 = signal_entry * 1.01
+                entry_orders = [{"kind": "限价", "price": p1, "margin": MARGIN / 2},
+                                {"kind": "限价", "price": signal_entry, "margin": MARGIN / 2}]
+                entry_mode = "限价分批"
+                entry = (p1 * 0.5 + signal_entry * 0.5)
+                entry_note = "现价 %.8g 比博主开仓价高 %.1f%%，超过 2%%，**不追高**，分两笔挂限价" % (mkt, -diff * 100)
+            elif dirc0 == "SHORT" and diff > 0.02:     # 市价低于博主价 2% 以上 -> 不追空
+                p1 = signal_entry * 0.99
+                entry_orders = [{"kind": "限价", "price": p1, "margin": MARGIN / 2},
+                                {"kind": "限价", "price": signal_entry, "margin": MARGIN / 2}]
+                entry_mode = "限价分批"
+                entry = (p1 * 0.5 + signal_entry * 0.5)
+                entry_note = "现价 %.8g 比博主开仓价低 %.1f%%，超过 2%%，**不追空**，分两笔挂限价" % (mkt, diff * 100)
+            elif signal_entry:
+                entry_note = "现价与博主开仓价相差 %.2f%%（≤2%%），直接市价开" % (diff * 100)
         if p["stop"] is None and not tps:
             notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
@@ -464,7 +475,8 @@ def finalize_pending(open_pos):
         notify(fmt_plan(coin, dirc, entry, p["stop"], tps, p["group"], tr["t_open"],
                         note=("止损来自%s，共合并 %d 条消息（文案/卡片/图）" % (p.get("stop_src") or "-", len(p["texts"]) + (1 if p["imgs"] else 0))),
                         add=p["add"], timing=timing, signal_entry=signal_entry,
-                        signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode))
+                        signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode,
+                        entry_orders=entry_orders, entry_note=entry_note))
         tm["push"] = time.time() - t_push0
         with open(TRADES, "a", encoding="utf-8") as f:
             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
