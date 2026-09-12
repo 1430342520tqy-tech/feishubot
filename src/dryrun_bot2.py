@@ -446,6 +446,9 @@ def finalize_pending(open_pos):
     for coin in list(PENDING):
         p = PENDING[coin]
         tps = sorted(set(p["tps"]))[:TP_TIERS]
+        if PAUSED[0]:
+            log("   ⏸ 已暂停：%s 的信号只记录不开单" % coin)
+            PENDING.pop(coin, None); continue
         if now < p["deadline"]:
             # 方案E：信息已齐全（止损 + 3 档止盈）且已给足 1.5 秒收集时间 -> 立即出单，不空等
             if pending_complete(p) and (now - p["first_ts"]) >= 1.5:
@@ -591,6 +594,210 @@ def pos_report(coin, tr):
     if tr.get("realized"):
         L.append("已实现盈亏：%+.1fU" % tr["realized"])
     notify("\n".join(L))
+
+# ---------------- 指令系统（只有你本人、在指定指令群、短消息才执行）----------------
+RUNTIME = BASE + "/runtime_config.json"
+CMD_GROUP = "开单记录"
+PAUSED = [False]              # 暂停：仍抓取记录，但不动作
+STATE_DIRTY = [False]
+open_pos_ref = {}             # 在 main() 里指向真正的持仓字典
+
+HELP_TEXT = """【机器人指令】在「开单记录」群直接发这些词（短消息即可）：
+· 帮助 —— 看这份清单
+· 状态 —— 运行状态 / 监控群 / 持仓数
+· 持仓情况 —— 汇报全部持仓（也可写：持仓 BTC）
+· 全部平仓 —— 需再回一句「确认全部平仓」才执行
+· 平仓 BTC —— 平掉某个币
+· 减仓 BTC 50 —— 减掉 50%（默认一半）
+· 修改止损 BTC 0.85 —— 改某笔止损
+· 移保本 BTC —— 止损移到开仓价
+· 暂停 / 继续 —— 暂停时不动作（仍记录）
+· 修改监控群 开单记录,暴富龙,UA-nurseneil2
+· 修改金额 300 / 修改杠杆 3
+· 测试模式 开 / 测试模式 关 —— 是否忽略 5 笔上限"""
+
+def load_runtime():
+    global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE
+    try:
+        if os.path.exists(RUNTIME):
+            cfg = json.load(open(RUNTIME, encoding="utf-8"))
+            if cfg.get("groups"):
+                GROUPS = [g for g in cfg["groups"] if g]
+            if cfg.get("margin"):
+                MARGIN = float(cfg["margin"])
+            if cfg.get("leverage"):
+                LEV = int(cfg["leverage"])
+            NOTIONAL = MARGIN * LEV
+            if "test_mode" in cfg:
+                TEST_MODE = bool(cfg["test_mode"])
+            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s"
+                % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE))
+    except Exception as e:
+        log("读取运行配置失败: " + str(e)[:80])
+
+def save_runtime():
+    try:
+        json.dump({"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE},
+                  open(RUNTIME, "w"), ensure_ascii=False, indent=1)
+        STATE_DIRTY[0] = True
+    except Exception as e:
+        log("保存运行配置失败: " + str(e)[:80])
+
+def close_position(coin, pct=100.0, why="手动指令"):
+    """纸面平仓（真实下单层接上后走同一入口）"""
+    tr = open_pos_ref.get(coin)
+    if not tr:
+        notify("【指令】没有 %s 的持仓" % coin)
+        return
+    px = price_of(coin)
+    if px is None:
+        notify("【指令】%s 取不到实时价，平仓失败" % coin)
+        return
+    d = 1 if tr["dir"] == "LONG" else -1
+    part = max(0.0, min(1.0, pct / 100.0)) * tr.get("remaining", 1.0)
+    pnl = (px - tr["entry"]) * d / tr["entry"] * NOTIONAL * part
+    tr["realized"] = tr.get("realized", 0.0) + pnl
+    tr["remaining"] = max(0.0, tr.get("remaining", 1.0) - part)
+    STATE_DIRTY[0] = True
+    with open(TRADES, "a", encoding="utf-8") as f:
+        f.write(json.dumps(tr, ensure_ascii=False) + "\n")
+    if tr["remaining"] <= 0.001:
+        open_pos_ref.pop(coin, None)
+        notify("【已平仓·纸面】%s %s（%s）@%.8g\n本次盈亏：%+.1fU · 累计：%+.1fU"
+               % (coin, tr["dir"], why, px, pnl, tr["realized"]))
+    else:
+        notify("【已减仓·纸面】%s %s（%s）@%.8g\n本次平掉 %.0f%% · 盈亏 %+.1fU · 剩余 %.0f%%"
+               % (coin, tr["dir"], why, px, part * 100, pnl, tr["remaining"] * 100))
+
+def handle_command(txt):
+    """返回 True 表示这条消息是指令（已处理，不再走信号流程）"""
+    global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE
+    t = re.sub(r"\s+", " ", (txt or "")).strip()
+    if len(t) > 60:
+        return False
+    KEY = ["帮助", "状态", "持仓情况", "持仓", "全部平仓", "确认全部平仓", "平仓", "减仓",
+           "修改止损", "移保本", "暂停", "继续", "修改监控群", "修改金额", "修改杠杆", "测试模式"]
+    # 去掉可能的昵称/时间前缀后，指令必须在消息开头（防止转发内容被误当指令）
+    nick = lambda x: re.sub(r"^[^\s]{2,16}\s+", "", x)
+    tm = lambda x: re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x, flags=re.I).strip()
+    body = None
+    for cand in (t, tm(t), nick(t), tm(nick(t)), nick(tm(t))):
+        if any(cand.startswith(k) for k in KEY):
+            body = cand
+            break
+    if body is None:
+        return False
+    cmd = None
+    for k in KEY:
+        if body.startswith(k):
+            cmd = body; break
+    if cmd is None and len(body) <= 12:            # 极短消息允许"关键词出现在任意位置"
+        for k in KEY:
+            if k in body:
+                cmd = body[body.find(k):]; break
+    if not cmd:
+        return False
+    log("   🎛 收到指令：%s" % cmd)
+    if cmd.startswith("帮助"):
+        notify(HELP_TEXT)
+    elif cmd.startswith("状态"):
+        notify("【机器人状态】\n监控群：%s\n持仓：%d 笔（%s）\n单笔：保证金 %.0fU × %d倍 = 名义 %.0fU\n测试模式：%s\n暂停：%s"
+               % ("、".join(GROUPS), len(open_pos_ref), "、".join(open_pos_ref) or "-",
+                  MARGIN, LEV, NOTIONAL, "开" if TEST_MODE else "关", "是" if PAUSED[0] else "否"))
+    elif cmd.startswith("持仓情况") or cmd.startswith("持仓"):
+        m = re.search(r"(?:持仓情况|持仓)\s*([A-Za-z0-9]{2,12})", cmd)
+        if m:
+            c, _ = resolve_coin(m.group(1))
+            if c in open_pos_ref:
+                pos_report(c, open_pos_ref[c])
+            else:
+                notify("【指令】没有 %s 的持仓" % (c or m.group(1)))
+        elif not open_pos_ref:
+            notify("【指令】当前没有任何持仓")
+        else:
+            for c in list(open_pos_ref):
+                pos_report(c, open_pos_ref[c])
+    elif cmd.startswith("确认全部平仓"):
+        if not open_pos_ref:
+            notify("【指令】当前没有持仓")
+        else:
+            for c in list(open_pos_ref):
+                close_position(c, 100, "你的指令：全部平仓")
+    elif cmd.startswith("全部平仓"):
+        notify("【确认】要平掉全部 %d 笔持仓吗？（%s）\n回一句「确认全部平仓」我就执行"
+               % (len(open_pos_ref), "、".join(open_pos_ref) or "-"))
+    elif cmd.startswith("平仓"):
+        m = re.search(r"平仓\s*([A-Za-z0-9]{2,12})", cmd)
+        if m:
+            c, _ = resolve_coin(m.group(1))
+            close_position(c, 100, "你的指令：平仓")
+        else:
+            notify("【指令】格式：平仓 BTC")
+    elif cmd.startswith("减仓"):
+        m = re.search(r"减仓\s*([A-Za-z0-9]{2,12})(?:\s*(\d{1,3}))?", cmd)
+        if m:
+            c, _ = resolve_coin(m.group(1))
+            pct = float(m.group(2)) if m.group(2) else 50.0
+            close_position(c, pct, "你的指令：减仓 %g%%" % pct)
+        else:
+            notify("【指令】格式：减仓 BTC 50")
+    elif cmd.startswith("修改止损"):
+        m = re.search(r"修改止损\s*([A-Za-z0-9]{2,12})\s*([0-9]*\.?[0-9]+)", cmd)
+        if m:
+            c, _ = resolve_coin(m.group(1))
+            tr = open_pos_ref.get(c)
+            if tr:
+                tr["sl"] = float(m.group(2)); STATE_DIRTY[0] = True
+                notify("【指令】%s 止损已改为 %.8g" % (c, tr["sl"]))
+            else:
+                notify("【指令】没有 %s 的持仓" % c)
+        else:
+            notify("【指令】格式：修改止损 BTC 0.85")
+    elif cmd.startswith("移保本"):
+        m = re.search(r"移保本\s*([A-Za-z0-9]{2,12})", cmd)
+        if m:
+            c, _ = resolve_coin(m.group(1))
+            tr = open_pos_ref.get(c)
+            if tr:
+                tr["sl"] = tr["entry"]; STATE_DIRTY[0] = True
+                notify("【指令】%s 止损已移到开仓价 %.8g（保本损）" % (c, tr["entry"]))
+            else:
+                notify("【指令】没有 %s 的持仓" % c)
+    elif cmd.startswith("暂停"):
+        PAUSED[0] = True
+        notify("【指令】已暂停：仍会抓取和记录，但不会开单/平仓。回复「继续」恢复")
+    elif cmd.startswith("继续"):
+        PAUSED[0] = False
+        notify("【指令】已恢复")
+    elif cmd.startswith("修改监控群"):
+        m = re.search(r"修改监控群\s*(.+)", cmd)
+        if m:
+            gs = [x.strip() for x in re.split(r"[,，、\s]+", m.group(1)) if x.strip()]
+            if gs:
+                GROUPS[:] = gs
+                save_runtime()
+                notify("【指令】监控群已改为：%s\n（已写入配置，重启后仍生效；新增的群需要重启机器人才能打开页面）" % "、".join(GROUPS))
+        else:
+            notify("【指令】格式：修改监控群 A,B,C")
+    elif cmd.startswith("修改金额"):
+        m = re.search(r"修改金额\s*(\d+)", cmd)
+        if m:
+            MARGIN = float(m.group(1)); NOTIONAL = MARGIN * LEV
+            save_runtime()
+            notify("【指令】单笔保证金已改为 %.0fU（%d倍 = 名义 %.0fU）" % (MARGIN, LEV, NOTIONAL))
+    elif cmd.startswith("修改杠杆"):
+        m = re.search(r"修改杠杆\s*(\d+)", cmd)
+        if m:
+            LEV = int(m.group(1)); NOTIONAL = MARGIN * LEV
+            save_runtime()
+            notify("【指令】杠杆已改为 %d 倍（保证金 %.0fU = 名义 %.0fU）" % (LEV, MARGIN, NOTIONAL))
+    elif cmd.startswith("测试模式"):
+        on = ("开" in cmd) or ("on" in cmd.lower())
+        TEST_MODE = on
+        save_runtime()
+        notify("【指令】测试模式已%s（%s）" % ("打开" if on else "关闭",
+              "不受 5 笔上限拦截" if on else "超过 5 笔会跳过"))
+    return True
 
 # ---------------- 页面 JS ----------------
 SCAN_JS = """() => {
@@ -738,6 +945,7 @@ def open_group_page(ctx, name):
 def main():
     log("==== dryRun 机器人 v2 启动（每群独立标签页）====")
     last_id, open_pos, trades = {}, {}, []
+    open_pos_ref.clear(); load_runtime()
     if os.path.exists(STATE):
         try:
             sv = json.load(open(STATE, encoding="utf-8"))
@@ -835,6 +1043,13 @@ def main():
                         low = txt.lower()
                         if "通过webhook" in txt or "【跟单机器人】" in txt or "invited" in low or "test notification" in low:
                             continue
+                        # 指令优先：只有在指定指令群里、由你发的短消息才会被当成指令
+                        if g == CMD_GROUP:
+                            try:
+                                if handle_command(txt):
+                                    continue
+                            except Exception as _e:
+                                log("   指令处理异常 " + str(_e)[:90])
                         SIG_KW = ["long", "Long", "LONG", "short", "Short", "SHORT", "Entry", "CMP",
                                   "做多", "做空", "止损", "止盈", "平仓", "减仓", "close", "Closed", "TP", "SL"]
                         has_img = r.get("loaded", 0) > 0 or r.get("nimg", 0) >= 2
@@ -1001,6 +1216,8 @@ def main():
             except Exception as e:
                 log("持仓监控异常 " + str(e)[:100])
             hb += 1
+            if STATE_DIRTY[0]:
+                STATE_DIRTY[0] = False
             json.dump({"open": open_pos, "last": last_id, "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
