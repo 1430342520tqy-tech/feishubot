@@ -44,17 +44,99 @@ def _cfg():
         return {}, {}
 
 
-# 字段定义：名称 -> Bitable 类型（1=文本 2=数字 5=日期）
+# 字段定义：名称 -> (Bitable 类型, property)  —— 顺序即表里的从左到右顺序
+# 用户 2026-09-13 要求：
+#   · 开单/结单时间精确到秒（日期字段不一定能显示秒 + 数字列位数整列统一 → 时间/价格用文本，显示绝对精确）
+#   · 删掉 持仓小时 / 名义U / 结单方式 / 备注
+#   · 杠杆改叫「杠杆倍数」，不带小数点
+#   · 所有「xx率」带 % 且不要小数
+#   · 价格要能直出原值（如 0.8521），不能被截成 0.9
+MONEY = {"formatter": "0.00"}
+INTFMT = {"formatter": "0"}
+
 FIELDS = [
-    ("币种", 1), ("方向", 1),
-    ("开单时间", 5), ("结单时间", 5), ("持仓时长", 1), ("持仓小时", 2),
-    ("保证金U", 2), ("杠杆", 2), ("名义U", 2),
-    ("入场价", 2), ("止损价", 2), ("止盈1", 2), ("止盈2", 2), ("止盈3", 2),
-    ("止损点数%", 2),
-    ("结单方式", 1), ("平仓价", 2),
-    ("毛盈亏U", 2), ("手续费U", 2), ("净盈亏U", 2), ("净收益率%", 2),
-    ("来源群", 1), ("记录类型", 1), ("备注", 1),
+    ("币种", 1, None),
+    ("方向", 1, None),
+    ("开单时间", 1, None),
+    ("结单时间", 1, None),
+    ("持仓时长", 1, None),
+    ("保证金U", 2, MONEY),
+    ("杠杆倍数", 2, INTFMT),
+    ("入场价", 1, None),
+    ("止损价", 1, None),
+    ("止损点数%", 1, None),
+    ("止盈1", 1, None),
+    ("止盈2", 1, None),
+    ("止盈3", 1, None),
+    ("平仓价", 1, None),
+    ("毛盈亏U", 2, MONEY),
+    ("手续费U", 2, MONEY),
+    ("净盈亏U", 2, MONEY),
+    ("净收益率%", 1, None),
+    ("来源群", 1, None),
+    ("记录类型", 1, None),
 ]
+
+
+def ensure_fields(log=print):
+    """把缺的列按 FIELDS 的顺序建出来（已存在的跳过）"""
+    bt, _ = _cfg()
+    app_token, table_id = (bt.get("app_token") or "").strip(), (bt.get("table_id") or "").strip()
+    if not app_token or not table_id:
+        log("[统计] 未配置 bitable.app_token / table_id → 跳过建列")
+        return False
+    d, err = _api("GET", "/bitable/v1/apps/%s/tables/%s/fields?page_size=200" % (app_token, table_id))
+    if err:
+        log("[统计] 读字段失败：%s" % err)
+        return False
+    have = {f.get("field_name") for f in (d.get("data") or {}).get("items", [])}
+    made = []
+    for name, ftype, prop in FIELDS:
+        if name in have:
+            continue
+        payload = {"field_name": name, "type": ftype}
+        if prop:
+            payload["property"] = prop
+        _, e2 = _api("POST", "/bitable/v1/apps/%s/tables/%s/fields" % (app_token, table_id), payload)
+        if e2:
+            log("[统计] 建列 %s 失败：%s" % (name, e2))
+        else:
+            made.append(name)
+    log("[统计] 字段就绪（新建 %d 列：%s）" % (len(made), "、".join(made) or "无"))
+    return True
+
+
+def _price_text(v):
+    """价格转文本：保留原值、去掉多余的 0（0.8521 就是 0.8521；77000 就是 77000）"""
+    if v is None or v == "":
+        return None
+    try:
+        s = ("%.10f" % float(v)).rstrip("0")
+        if s.endswith("."):
+            s = s[:-1]
+        return s
+    except Exception:
+        return str(v)
+
+
+def _time_text(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(int(ts), CST).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _pct_text(v, digits=0):
+    """收益率/点数 -> '835%' 这种（用户要求带 % 且不要小数）"""
+    if v is None:
+        return None
+    try:
+        return ("%." + str(digits) + "f%%") % float(v)
+    except Exception:
+        return None
+
 
 
 def _token():
@@ -101,32 +183,6 @@ def _api(method, path, payload=None, token=None, timeout=20):
         return None, "HTTP %s: %s" % (e.code, raw)
     except Exception as e:
         return None, "%s: %s" % (type(e).__name__, e)
-
-
-def ensure_fields(log=print):
-    """把缺的列自动建出来（表里默认字段不用管，留着空即是）"""
-    bt, _ = _cfg()
-    app_token, table_id = (bt.get("app_token") or "").strip(), (bt.get("table_id") or "").strip()
-    if not app_token or not table_id:
-        log("[统计] 未配置 bitable.app_token / table_id → 跳过建列")
-        return False
-    d, err = _api("GET", "/bitable/v1/apps/%s/tables/%s/fields?page_size=200" % (app_token, table_id))
-    if err:
-        log("[统计] 读字段失败：%s" % err)
-        return False
-    have = {f.get("field_name") for f in (d.get("data") or {}).get("items", [])}
-    made = []
-    for name, ftype in FIELDS:
-        if name in have:
-            continue
-        _, e2 = _api("POST", "/bitable/v1/apps/%s/tables/%s/fields" % (app_token, table_id),
-                     {"field_name": name, "type": ftype})
-        if e2:
-            log("[统计] 建列 %s 失败：%s" % (name, e2))
-        else:
-            made.append(name)
-    log("[统计] 字段就绪（新建 %d 列：%s）" % (len(made), "、".join(made) or "无"))
-    return True
 
 
 def _hold_text(sec):
@@ -202,30 +258,28 @@ def build_row(tr, margin=None):
     row = {
         "币种": str(tr.get("coin") or ""),
         "方向": ("做多" if str(tr.get("dir")).upper() == "LONG" else "做空"),
-        "开单时间": int(t_open) * 1000 if t_open else None,
-        "结单时间": int(t_close) * 1000,
+        # 时间用文本 -> 保证精确到秒、显示无误差（用户明确要求）
+        "开单时间": _time_text(t_open),
+        "结单时间": _time_text(t_close),
         "持仓时长": _hold_text(hold),
-        "持仓小时": round(hold / 3600.0, 3),
         "保证金U": round(margin, 2),
-        "杠杆": lev,
-        "名义U": round(notional, 2),
-        "入场价": float(entry) if entry else None,
-        "止损价": float(sl) if sl else None,
-        "止损点数%": sl_pts,
-        "结单方式": _exit_kind(tr.get("exit_why")),
-        "平仓价": float(tr["exit"]) if isinstance(tr.get("exit"), (int, float)) else None,
-        "毛盈亏U": round(gross, 4),
-        "手续费U": round(-fee, 4),
-        "净盈亏U": round(net, 4),
-        "净收益率%": round(net / margin * 100, 4) if margin else None,
+        "杠杆倍数": lev,
+        # 价格用文本 -> 0.8521 就显示 0.8521，不会被列的显示位数截成 0.9
+        "入场价": _price_text(entry) if entry else None,
+        "止损价": _price_text(sl) if sl else None,
+        "止损点数%": _pct_text(sl_pts) if sl_pts is not None else None,
+        "平仓价": _price_text(tr["exit"]) if isinstance(tr.get("exit"), (int, float)) else None,
+        "毛盈亏U": round(gross, 2),
+        "手续费U": round(-fee, 2),
+        "净盈亏U": round(net, 2),
+        # 收益率带 % 且不要小数（用户要求）
+        "净收益率%": _pct_text(net / margin * 100) if margin else None,
         "来源群": str(tr.get("group") or ""),
         "记录类型": ("实盘" if str(tr.get("real_layer")) == "实盘" else "纸面"),
-        "备注": "%s ｜ 入场来源 %s ｜ 止损来源 %s ｜ 原文 %s" % (
-            tr.get("exit_why") or "-", tr.get("entry_src") or "-", tr.get("stop_src") or "-",
-            (tr.get("text") or "")[:120]),
     }
     for i in range(3):
-        row["止盈%d" % (i + 1)] = float(tps[i]) if i < len(tps) and isinstance(tps[i], (int, float)) else None
+        row["止盈%d" % (i + 1)] = (_price_text(tps[i])
+                                   if i < len(tps) and isinstance(tps[i], (int, float)) else None)
     return {k: v for k, v in row.items() if v is not None}
 
 
@@ -242,9 +296,9 @@ def push_close(tr, log=print):
     if err:
         log("[统计] ❌ 写多维表格失败：%s" % err)
         return False
-    log("[统计] ✅ 已写入多维表格：%s %s 净%.2fU（%.2f%%）持仓%s"
+    log("[统计] ✅ 已写入多维表格：%s %s 净%+.2fU（%s）持仓%s"
         % (row.get("币种"), row.get("方向"), row.get("净盈亏U") or 0,
-           row.get("净收益率%") or 0, row.get("持仓时长")))
+           row.get("净收益率%") or "-", row.get("持仓时长")))
     return True
 
 
