@@ -545,6 +545,15 @@ def finalize_pending(open_pos):
         if over_cap and not TEST_MODE:
             notify("【信号·跳过】%s 同时持仓已满 %d 笔" % (coin, MAX_OPEN))
             PENDING.pop(coin, None); continue
+        if coin in open_pos:
+            _ex = open_pos[coin]
+            notify("【信号·跳过】%s 已有持仓，不重复开单\n现有：%s 入场 %.8g · 止损 %.8g · 剩余 %.0f%%\n本次信号原文：%s"
+                   % (coin, _ex.get("dir"), _ex.get("entry") or 0, _ex.get("sl") or 0,
+                      (_ex.get("remaining", 1.0) * 100),
+                      (p["texts"][0][:120] if p["texts"] else "")))
+            log("   ↳ %s 已有持仓，跳过本次信号（防重复开单）" % coin)
+            PENDING.pop(coin, None)
+            continue
         dirc = dirc0
         tm = {"detect": p["t_found"] - p["first_ts"], "img": max(0.0, p["t_img"] - p["t_found"]),
               "parse": max(0.0, p["t_parse"] - p["t_img"]), "chart": max(0.0, p["t_chart"] - p["t_parse"]),
@@ -717,6 +726,20 @@ RUNTIME = BASE + "/runtime_config.json"
 CMD_GROUPS = ["开单记录", "机器人开单通知"]   # 指令在这两个群里生效
 PAUSED = [False]              # 暂停：仍抓取记录，但不动作
 STATE_DIRTY = [False]
+
+# ===== 消息级去重：防止重启/游标回退后把旧信号当新信号重复开单 =====
+SEEN = set()
+SEEN_MAX = 1500
+
+def mark_seen(mid):
+    try:
+        SEEN.add(int(mid))
+    except Exception:
+        return
+    if len(SEEN) > SEEN_MAX:                      # 只保留最近的，避免无限膨胀
+        for x in sorted(SEEN)[:len(SEEN) - SEEN_MAX]:
+            SEEN.discard(x)
+
 open_pos_ref = {}             # 在 main() 里指向真正的持仓字典
 
 HELP_TEXT = """【机器人指令】在「开单记录」群直接发这些词（短消息即可）：
@@ -1066,6 +1089,13 @@ def main():
             sv = json.load(open(STATE, encoding="utf-8"))
             for k, v in (sv.get("last") or {}).items():
                 last_id[k] = int(v)
+            for _x in (sv.get("seen") or []):
+                try:
+                    SEEN.add(int(_x))
+                except Exception:
+                    pass
+            if SEEN:
+                log("已载入已处理消息 %d 条（防重复开单）" % len(SEEN))
             _op = sv.get("open")
             if isinstance(_op, dict):
                 open_pos.update(_op)
@@ -1094,7 +1124,8 @@ def main():
                 log("[%s] 打开失败（未读到消息）" % g)
         log("==== 开始实时监控（%d 个页面）====" % len(pages))
         # ⚠️ 不要在这里写 {"open": []}，会把已恢复的持仓清空（曾经踩过这个坑）
-        json.dump({"open": open_pos, "last": last_id, "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
+        json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:],
+                   "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
         try:
             price_of("BTC")
@@ -1157,6 +1188,11 @@ def main():
                         when = datetime.datetime.fromtimestamp(t_sig, CST).strftime("%m-%d %H:%M:%S")
                         txt = r["text"]
                         log("[%s] 发现新消息 | 发出=%s | %s" % (g, when, txt[:110]))
+                        if int(mid) in SEEN:
+                            log("   ↳ 该消息此前已处理过，跳过（防重复开单）")
+                            continue
+                        mark_seen(mid)
+                        STATE_DIRTY[0] = True
                         low = txt.lower()
                         SELF_MARKS = ["【跟单机器人】", "【机器人指令】", "【已开单·纸面】", "【已结单·纸面】", "【止盈成交·纸面】", "【你的持仓】", "【指令】", "【博主指令】", "【信号·"]
                         if any(_m in txt for _m in SELF_MARKS) or "通过webhook" in txt or "invited" in low or "test notification" in low:
@@ -1336,7 +1372,8 @@ def main():
             hb += 1
             if STATE_DIRTY[0]:
                 STATE_DIRTY[0] = False
-            json.dump({"open": open_pos, "last": last_id, "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
+            json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:],
+                       "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
                 log("心跳：运行中 | 持仓 %d 笔（%s）" % (len(open_pos), ",".join(open_pos) or "-"))
