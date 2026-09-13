@@ -193,6 +193,60 @@ def fmt_real_plan(plan, title="实盘计划"):
         L.append("③ " + plan["sl_note"])
     return "\n".join(L)
 
+# ---------------- 成交统计（结单时写飞书多维表格）----------------
+# 用户 2026-09-13 定：只统计【已结单】的（持仓中不写）｜整单一一行｜
+# 收益率=净盈亏÷保证金（含杠杆）｜手续费计入｜落地只在飞书多维表格一个地方。
+try:
+    import trade_stats
+    _STATS_OK = True
+    _STATS_ERR = ""
+except Exception as _e:
+    trade_stats = None
+    _STATS_OK = False
+    _STATS_ERR = str(_e)[:120]
+
+# 币安 USDT-M 实测费率（2026-09-13 探测：maker 万2 / taker 万5）
+FEE_MAKER = 0.0002    # 限价单成交（挂单）
+FEE_TAKER = 0.0005    # 市价单成交（吃单）
+
+
+def _add_fee(tr, px_notional, rate, why):
+    """累加手续费。px_notional = 该笔【成交时的名义】(数量 × 成交价)"""
+    try:
+        f = abs(float(px_notional)) * float(rate)
+    except Exception:
+        return 0.0
+    tr["fee"] = round(tr.get("fee", 0.0) + f, 6)
+    tr.setdefault("fee_items", []).append(
+        {"why": why, "notional": round(float(px_notional), 4), "rate": rate, "fee": round(f, 6)})
+    return f
+
+
+def _stat_close(tr):
+    """结单收尾：补结单时间 / 持仓时长 / 净盈亏，然后写飞书多维表格。
+    ⚠️ 只在【结单】时调用 —— 持仓中的单不统计（用户要求）。"""
+    tr["t_close_ts"] = int(time.time())
+    if not tr.get("t_open_ts"):
+        # 兼容旧仓（用旧代码开的，没有 t_open_ts）：从无年份的 t_open 字符串按当年补全
+        tr["t_open_ts"] = (trade_stats.open_ts(tr) if _STATS_OK else None) or tr["t_close_ts"]
+    tr["hold_sec"] = tr["t_close_ts"] - int(tr["t_open_ts"])
+    tr["pnl_net"] = round(float(tr.get("realized") or 0) - float(tr.get("fee") or 0), 6)
+    tr["margin"] = MARGIN
+    tr["lev"] = LEV
+    tr["notional"] = NOTIONAL
+    tr["exit_iso"] = datetime.datetime.fromtimestamp(tr["t_close_ts"], CST).strftime("%Y-%m-%d %H:%M:%S")
+    log("   ↳ 结单统计：持仓 %s ｜ 毛 %+.2fU ｜ 手续费 -%.2fU ｜ 净 %+.2fU ｜ 收益率 %+.2f%%（按保证金 %.0fU）"
+        % (trade_stats._hold_text(tr["hold_sec"]) if _STATS_OK else "%ds" % tr["hold_sec"],
+           float(tr.get("realized") or 0), float(tr.get("fee") or 0), tr["pnl_net"],
+           (tr["pnl_net"] / MARGIN * 100) if MARGIN else 0, MARGIN))
+    if not _STATS_OK:
+        log("   ⚠️ 统计模块未加载（%s）→ 本单不写表（数据已存在本地记录里，可事后补录）" % _STATS_ERR)
+        return
+    try:
+        trade_stats.push_close(tr, log=log)
+    except Exception as _e:
+        log("   ⚠️ 写统计表异常（不影响交易）：%s" % str(_e)[:130])
+
 # ---------------- 行情 ----------------
 _ex = None
 def price_of(coin):
@@ -809,6 +863,13 @@ def finalize_pending(open_pos):
               "chart_imgs": p["imgs"], "timer": tm}
         tm["order"] = time.time() - t_order
         open_pos[coin] = tr
+        # ===== 统计用时间戳（t_open 是信号时刻、无年份，保留兼容；新增带年份的 ISO 与 Unix 秒）+ 开仓手续费 =====
+        tr["signal_ts"] = int(p["first_ts"])
+        tr["t_open_ts"] = int(time.time())          # 实际开仓（成交）时刻
+        tr["t_open_iso"] = datetime.datetime.fromtimestamp(tr["t_open_ts"], CST).strftime("%Y-%m-%d %H:%M:%S")
+        tr["margin"], tr["lev"], tr["notional"] = MARGIN, LEV, NOTIONAL
+        _add_fee(tr, NOTIONAL, (FEE_TAKER if entry_mode == "市价" else FEE_MAKER),
+                 "开仓(%s)" % entry_mode)
         tr["real_layer"] = _be_mode()
         _rplan = real_plan_open(coin, dirc, entry, p["stop"], tps)   # 影子模式：只生成计划
         tm["order"] = time.time() - t_order
@@ -1084,7 +1145,13 @@ def close_position(coin, pct=100.0, why="手动指令"):
     part = max(0.0, min(1.0, pct / 100.0)) * tr.get("remaining", 1.0)
     pnl = (px - tr["entry"]) * d / tr["entry"] * NOTIONAL * part
     tr["realized"] = tr.get("realized", 0.0) + pnl
+    _add_fee(tr, NOTIONAL * part * (px / tr["entry"]), FEE_TAKER, "手动平仓")   # 市价平 → taker
     tr["remaining"] = max(0.0, tr.get("remaining", 1.0) - part)
+    if tr["remaining"] <= 0.001:
+        # ⚠️ 旧代码这里不写 status/exit/exit_why → 手动平的仓在统计里"没有结单信息"。现在补齐。
+        tr.update({"status": "CLOSED", "exit": px, "exit_why": "手动平仓(%s)" % why,
+                   "pnl": tr["realized"]})
+        _stat_close(tr)
     STATE_DIRTY[0] = True
     with open(TRADES, "a", encoding="utf-8") as f:
         f.write(json.dumps(tr, ensure_ascii=False) + "\n")
@@ -1817,6 +1884,9 @@ def main():
                         tr.update({"status": "CLOSED", "exit": stop,
                                    "exit_why": ("止损" if not filled else "保本止损(TP1后)"),
                                    "pnl": tr["realized"], "remaining": 0.0})
+                        # 止损是 STOP_MARKET 触发后市价平 → taker
+                        _add_fee(tr, NOTIONAL * remaining * (stop / tr["entry"]), FEE_TAKER, "止损平仓")
+                        _stat_close(tr)
                         with open(TRADES, "a", encoding="utf-8") as f:
                             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
                         notify("【已结单·纸面】%s %s\n结果：%s @%.8g（剩余 %.0f%%）\n累计盈亏：%+.1fU（保证金 %.0fU）"
@@ -1843,6 +1913,8 @@ def main():
                         tp = tps[hit_i]
                         pnl = (tp - tr["entry"]) * d / tr["entry"] * NOTIONAL * part
                         tr["realized"] = tr.get("realized", 0.0) + pnl
+                        # 止盈是【限价单】成交 → maker 万2；成交名义按成交价算
+                        _add_fee(tr, NOTIONAL * part * (tp / tr["entry"]), FEE_MAKER, "止盈%d" % (hit_i + 1))
                         filled.append(hit_i)
                         remaining = max(0.0, remaining - part)
                         tr["remaining"] = remaining
@@ -1867,6 +1939,9 @@ def main():
                         if remaining <= 0.001:
                             tr.update({"status": "CLOSED", "exit": tp, "exit_why": "全部止盈",
                                        "pnl": tr["realized"]})
+                            _stat_close(tr)
+                            with open(TRADES, "a", encoding="utf-8") as f:   # 补写最终 CLOSED 记录（含结单时间）
+                                f.write(json.dumps(tr, ensure_ascii=False) + "\n")
                             notify("【已结单·纸面】%s %s\n全部止盈完成，累计盈亏：%+.1fU" % (coin, tr["dir"], tr["realized"]))
                             open_pos.pop(coin, None)
             except Exception as e:
