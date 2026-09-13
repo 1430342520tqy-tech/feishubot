@@ -102,6 +102,97 @@ def notify(text):
         except Exception as e:
             log("   webhook 失败: " + str(e)[:120])
 
+# ---------------- 真实下单层（影子模式）----------------
+# 把每一笔纸面动作同步交给 binance_exec：默认 LIVE=False → **只生成"将要对币安发什么单"的计划，
+# 一条委托都不会发**。用户核对无误后，把 runtime_config.json 的 live_trading 改成 true 即为实盘。
+try:
+    import binance_exec as bexec
+    _BEXEC_OK = True
+    _BEXEC_ERR = ""
+except Exception as _e:
+    bexec = None
+    _BEXEC_OK = False
+    _BEXEC_ERR = str(_e)[:120]
+
+
+def _be_mode():
+    """影子 / 实盘"""
+    try:
+        return "实盘" if (bexec and bexec.LIVE[0]) else "影子"
+    except Exception:
+        return "影子"
+
+
+def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
+    """开仓 → 交给真实下单层生成完整计划（市价/限价腿 + 各档止盈 + Algo 止损）"""
+    if not _BEXEC_OK:
+        return None
+    try:
+        return bexec.open_full_position(coin.upper() + "USDT", dirc, entry, stop,
+                                        list(tps or []), margin=margin or MARGIN)
+    except Exception as e:
+        log("   ⚠️ 真实下单层计划生成失败（不影响纸面）：%s" % str(e)[:140])
+        return None
+
+
+def real_plan_sync_sl(coin, dirc, new_stop, qty=None):
+    """止损移动/重挂（TP1 后移保本损、分批止盈后修正数量）"""
+    if not _BEXEC_OK:
+        return None
+    return bexec.sync_sl(coin.upper() + "USDT", dirc, new_stop, qty)
+
+
+def real_plan_close(coin, dirc, qty=None):
+    """平仓/减仓 → 真实层对应动作"""
+    if not _BEXEC_OK:
+        return None
+    sym = coin.upper() + "USDT"
+    try:
+        if qty is None:
+            return bexec.close_position_market(sym, dirc, None)
+        return bexec.close_position_market(sym, dirc, qty)
+    except Exception as e:
+        log("   ⚠️ 真实下单层平仓计划生成失败：%s" % str(e)[:140])
+        return None
+
+
+def real_qty_estimate(entry, remaining):
+    """影子模式下估算真实持仓数量（实盘时以交易所实际持仓为准）"""
+    try:
+        return (NOTIONAL * float(remaining)) / float(entry)
+    except Exception:
+        return 0.0
+
+
+def fmt_real_plan(plan, title="实盘计划"):
+    """把计划压成一段人看得懂的通知"""
+    if not plan:
+        return ""
+    if plan.get("shadow") is False and bexec and bexec.LIVE[0]:
+        head = "【%s·实盘】⚠️ 已真实下单" % title
+    else:
+        head = "【%s·影子】未发送任何委托，仅供核对" % title
+    L = [head, "%s %s ｜ 名义 %.0fU（保证金 %.0fU × %d倍）"
+         % (plan.get("symbol"), plan.get("dir"), plan.get("notional", 0),
+            plan.get("margin", 0), plan.get("lev", 0))]
+    for leg in plan.get("entry_legs", []):
+        if leg.get("kind") == "market":
+            L.append("① 市价开仓 数量 %s（参考价 %s）"
+                     % ((leg.get("would_send") or {}).get("quantity", "-"), leg.get("ref_price")))
+        else:
+            L.append("① 限价开仓 %s 名义 %.0fU  %s"
+                     % (leg.get("price"), leg.get("notional", 0), leg.get("why") or ""))
+    for t in plan.get("tps", []):
+        L.append("② 止盈%d 限价 %s 数量 %s" % (t.get("tier"), t.get("price"), t.get("qty")))
+    if plan.get("tps_note"):
+        L.append("② " + plan["tps_note"])
+    if plan.get("sl"):
+        L.append("③ 止损 STOP_MARKET(Algo接口) 触发价 %s 数量 %s"
+                 % (plan["sl"].get("triggerPrice"), plan["sl"].get("quantity")))
+    if plan.get("sl_note"):
+        L.append("③ " + plan["sl_note"])
+    return "\n".join(L)
+
 # ---------------- 行情 ----------------
 _ex = None
 def price_of(coin):
@@ -520,7 +611,8 @@ def pending_complete(p):
 # 用户决定：这种情况「挂止损 + 在 2:1 盈亏比位置自动挂第一档止盈」；
 #           后续博主补了真实止盈位，就把这档撤掉按真实档位重挂。
 R_FALLBACK_MULT = 2.0        # 盈亏比 2:1
-R_FALLBACK_PART = 1.0 / 3    # 该档只平 1/3（等同"第一档"），剩下 2/3 等真实止盈位
+# 用户 2026-09-13 决定：如果博主后续【没有】补真实止盈位，这一档就**直接全平**（锁定 2R 利润）。
+R_FALLBACK_PART = 1.0
 
 # "未能识别为信号"的通报节流（避免某个群狂发图时刷屏）
 UNIDENT_NOTIFY_COOLDOWN = 600
@@ -598,8 +690,8 @@ def finalize_pending(open_pos):
             if _ft is not None:
                 tps = [_ft]
                 tp_fallback = True
-                log("   ↳ 博主未给止盈 → 启用 2R 兜底：入场 %s 止损 %s → 2R 目标 %s（该档只平 %.0f%%）"
-                    % (entry, p["stop"], _ft, R_FALLBACK_PART * 100))
+                log("   ↳ 博主未给止盈 → 启用 2R 兜底：入场 %s 止损 %s → 2R 目标 %s（到价全平）"
+                    % (entry, p["stop"], _ft, ))
         over_cap = (len(open_pos) >= MAX_OPEN and coin not in open_pos)
         if over_cap and not TEST_MODE:
             notify("【信号·跳过】%s 同时持仓已满 %d 笔" % (coin, MAX_OPEN))
@@ -618,6 +710,21 @@ def finalize_pending(open_pos):
                     f.write(json.dumps(_ex, ensure_ascii=False) + "\n")
                 log("   ↳ %s 收到真实止盈位 %s → 撤掉 2R 兜底档 %s 并重挂"
                     % (coin, tps, _old_tps))
+                if _BEXEC_OK:
+                    try:      # 真实层：撤掉旧限价止盈，按真实档位重挂（数量撤单后按真实持仓再取）
+                        _sym = coin.upper() + "USDT"
+                        _plan = {"symbol": _sym, "dir": _ex.get("dir"), "action": "替换止盈档",
+                                 "cancel": "DELETE /fapi/v1/allOpenOrders（旧限价止盈）"
+                                           " + DELETE /fapi/v1/algoOrder（旧 Algo 止损）",
+                                 "new_tps": [{"price": bexec.fmt_price(_sym, t)} for t in tps],
+                                 "new_sl_trigger": (bexec.fmt_price(_sym, _ex.get("sl"))
+                                                    if _ex.get("sl") else None),
+                                 "note": "数量在撤单后按真实持仓剩余量重新计算",
+                                 "shadow": not bexec.LIVE[0]}
+                        bexec.audit("replace_tp_plan", _plan)
+                        log("   ↳ 真实层计划：撤旧挂单 → 按 %s 重挂止盈（影子模式仅记录）" % tps)
+                    except Exception as _e:
+                        log("   ⚠️ 真实层重挂计划生成失败：%s" % str(_e)[:130])
                 notify("【止盈更新·纸面】%s %s\n博主补了真实止盈位，已撤掉 2R 兜底那档并重挂：\n"
                        "撤掉：%s\n重挂：%s\n（真实下单层接上后走同一入口：先撤旧限价止盈，再按新档位重挂）"
                        % (coin, _ex.get("dir"),
@@ -646,19 +753,29 @@ def finalize_pending(open_pos):
               "chart_imgs": p["imgs"], "timer": tm}
         tm["order"] = time.time() - t_order
         open_pos[coin] = tr
+        tr["real_layer"] = _be_mode()
+        _rplan = real_plan_open(coin, dirc, entry, p["stop"], tps)   # 影子模式：只生成计划
+        tm["order"] = time.time() - t_order
+        if _rplan:
+            log("   ↳ [真实下单层·%s] 已生成下单计划（市价/限价腿 + %d 档止盈 + Algo 止损）"
+                % (_be_mode(), len(_rplan.get("tps") or [])))
         timing = ("⏱ 从信号发出到推送 共 %.1fs（发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 等齐后续消息+出单 %.1fs）"
                   % (age, tm["detect"], tm["img"], tm["parse"], tm["chart"],
                      max(0.0, age - tm["detect"] - tm["img"] - tm["parse"] - tm["chart"])))
         t_push0 = time.time()
         d0 = 1 if dirc == "LONG" else -1
         crossed = any(((t - entry) * d0 <= 0) for t in tps)   # 止盈价是否已被现价越过（真实下单必须处理）
-        notify(fmt_plan(coin, dirc, entry, p["stop"], tps, p["group"], tr["t_open"],
+        _txt = fmt_plan(coin, dirc, entry, p["stop"], tps, p["group"], tr["t_open"],
                         note=("止损来自%s，共合并 %d 条消息（文案/卡片/图）" % (p.get("stop_src") or "-", len(p["texts"]) + (1 if p["imgs"] else 0))
-                              + ("｜⚠️ 博主未给止盈，已按 **2:1 盈亏比** 在 %.8g 自动挂第一档（该档平 %.0f%%，其余等真实止盈位）" % (tps[0], R_FALLBACK_PART * 100) if tp_fallback else "")
+                              + ("｜⚠️ 博主未给止盈，已按 **2:1 盈亏比** 在 %.8g 自动挂止盈（到价**全平**；若博主后续补了真实止盈位会自动撤掉重挂）" % tps[0] if tp_fallback else "")
                               + ("｜⚠️ 测试阶段：当前已持 %d 笔（上限 %d）" % (len(open_pos), MAX_OPEN) if over_cap else "")),
                         add=p["add"], timing=timing, signal_entry=signal_entry,
                         signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode,
-                        entry_orders=entry_orders, entry_note=entry_note))
+                        entry_orders=entry_orders, entry_note=entry_note)
+        _rp = fmt_real_plan(_rplan) if _rplan else ""
+        if _rp:
+            _txt += "\n\n" + _rp
+        notify(_txt)
         tm["push"] = time.time() - t_push0
         with open(TRADES, "a", encoding="utf-8") as f:
             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
@@ -835,7 +952,8 @@ HELP_TEXT = """【机器人指令】在「开单记录」群直接发这些词�
 · 暂停 / 继续 —— 暂停时不动作（仍记录）
 · 修改监控群 开单记录,暴富龙,UA-nurseneil2
 · 修改金额 300 / 修改杠杆 3
-· 测试模式 开 / 测试模式 关 —— 是否忽略 5 笔上限"""
+· 测试模式 开 / 测试模式 关 —— 是否忽略 5 笔上限
+· 实盘模式 开 确认 / 实盘模式 关 —— 真实下单层开关（默认影子：只记录计划不发单）"""
 
 def load_runtime():
     global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE
@@ -851,18 +969,50 @@ def load_runtime():
             NOTIONAL = MARGIN * LEV
             if "test_mode" in cfg:
                 TEST_MODE = bool(cfg["test_mode"])
-            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s"
-                % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE))
+            # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
+            if _BEXEC_OK:
+                bexec.LIVE[0] = bool(cfg.get("live_trading", False))
+                bexec.LEV = LEV
+            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 真实下单层=%s"
+                % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE, _be_mode()))
     except Exception as e:
         log("读取运行配置失败: " + str(e)[:80])
 
 def save_runtime():
     try:
-        json.dump({"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE},
-                  open(RUNTIME, "w"), ensure_ascii=False, indent=1)
+        _old = {}
+        try:
+            _old = json.load(open(RUNTIME, encoding="utf-8"))
+        except Exception:
+            pass
+        out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE}
+        # ⚠️ 必须保留 live_trading：否则任何一条指令（改金额/改杠杆/改监控群）都会把实盘开关悄悄抹掉
+        if "live_trading" in _old:
+            out["live_trading"] = _old["live_trading"]
+        json.dump(out, open(RUNTIME, "w"), ensure_ascii=False, indent=1)
         STATE_DIRTY[0] = True
     except Exception as e:
         log("保存运行配置失败: " + str(e)[:80])
+
+def _set_live(on):
+    """切换真实下单层开关并落盘（runtime_config.json 的 live_trading）"""
+    if _BEXEC_OK:
+        bexec.LIVE[0] = bool(on)
+    try:
+        try:
+            cfg = json.load(open(RUNTIME, encoding="utf-8"))
+        except Exception:
+            cfg = {}
+        cfg["live_trading"] = bool(on)
+        cfg.setdefault("groups", GROUPS)
+        cfg.setdefault("margin", MARGIN)
+        cfg.setdefault("leverage", LEV)
+        cfg.setdefault("test_mode", TEST_MODE)
+        json.dump(cfg, open(RUNTIME, "w"), ensure_ascii=False, indent=1)
+    except Exception as e:
+        log("写入实盘开关失败: " + str(e)[:80])
+    log("真实下单层开关 -> %s（live_trading=%s）" % ("实盘" if on else "影子", bool(on)))
+
 
 def close_position(coin, pct=100.0, why="手动指令"):
     """纸面平仓（真实下单层接上后走同一入口）"""
@@ -882,6 +1032,18 @@ def close_position(coin, pct=100.0, why="手动指令"):
     STATE_DIRTY[0] = True
     with open(TRADES, "a", encoding="utf-8") as f:
         f.write(json.dumps(tr, ensure_ascii=False) + "\n")
+    if _BEXEC_OK:      # 真实层同步：撤旧挂单，全平 or 按剩余量重挂止损
+        try:
+            _sym = coin.upper() + "USDT"
+            bexec.cancel_all(_sym)
+            if tr["remaining"] <= 0.001:
+                real_plan_close(coin, tr["dir"], None)
+            else:
+                bexec.sync_sl(_sym, tr["dir"], tr.get("sl") or tr["entry"],
+                              real_qty_estimate(tr["entry"], tr["remaining"]))
+            log("   ↳ [真实下单层·%s] 已记录手工平/减仓的对应计划" % _be_mode())
+        except Exception as _e:
+            log("   ⚠️ 真实层手工平仓计划失败：%s" % str(_e)[:120])
     if tr["remaining"] <= 0.001:
         open_pos_ref.pop(coin, None)
         notify("【已平仓·纸面】%s %s（%s）@%.8g\n本次盈亏：%+.1fU · 累计：%+.1fU"
@@ -897,7 +1059,8 @@ def handle_command(txt):
     if len(t) > 60:
         return False
     KEY = ["帮助", "状态", "持仓情况", "持仓", "全部平仓", "确认全部平仓", "平仓", "减仓",
-           "修改止损", "移保本", "暂停", "继续", "修改监控群", "修改金额", "修改杠杆", "测试模式"]
+           "修改止损", "移保本", "暂停", "继续", "修改监控群", "修改金额", "修改杠杆", "测试模式",
+           "实盘模式"]
     # 去掉可能的昵称/时间前缀后，指令必须在消息开头（防止转发内容被误当指令）
     nick = lambda x: re.sub(r"^[^\s]{2,16}\s+", "", x)
     tm = lambda x: re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x, flags=re.I).strip()
@@ -1009,6 +1172,19 @@ def handle_command(txt):
             LEV = int(m.group(1)); NOTIONAL = MARGIN * LEV
             save_runtime()
             notify("【指令】杠杆已改为 %d 倍（保证金 %.0fU = 名义 %.0fU）" % (LEV, MARGIN, NOTIONAL))
+    elif cmd.startswith("实盘模式"):
+        if "关" in cmd:
+            _set_live(False)
+            notify("【指令】真实下单层已切回 **影子模式**（只记录下单计划，不发任何委托）")
+        elif ("开" in cmd) and ("确认" in cmd):
+            _set_live(True)
+            notify("【指令】⚠️ 真实下单层已切到 **实盘**！\n"
+                   "之后的信号会真的向币安发单（双向持仓 / %d 倍杠杆 / 止损走 Algo 接口）。\n"
+                   "要停就发「实盘模式 关」。" % LEV)
+        else:
+            notify("【指令】实盘开关需要二次确认：\n"
+                   "· 开启实盘：实盘模式 开 确认\n· 关闭实盘：实盘模式 关\n当前：%s%s"
+                   % (_be_mode(), "" if _BEXEC_OK else "（⚠️ 下单层未加载：%s）" % _BEXEC_ERR))
     elif cmd.startswith("测试模式"):
         on = ("开" in cmd) or ("on" in cmd.lower())
         TEST_MODE = on
@@ -1561,6 +1737,12 @@ def main():
                             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
                         notify("【已结单·纸面】%s %s\n结果：%s @%.8g（剩余 %.0f%%）\n累计盈亏：%+.1fU（保证金 %.0fU）"
                                % (coin, tr["dir"], tr["exit_why"], stop, remaining * 100, tr["realized"], MARGIN))
+                        if _BEXEC_OK:      # 真实层：仓位已了结 → 撤掉剩余挂单
+                            try:
+                                bexec.cancel_all(coin.upper() + "USDT")
+                                log("   ↳ [真实下单层·%s] 已记录撤单计划（仓位已了结）" % _be_mode())
+                            except Exception as _e:
+                                log("   ⚠️ 真实层撤单计划失败：%s" % str(_e)[:120])
                         open_pos.pop(coin, None)
                         continue
                     # ② 依次检查各档止盈
@@ -1589,6 +1771,15 @@ def main():
                         notify("【止盈成交·纸面】%s %s\nTP%d 成交 @%.8g（平%.0f%%）\n该档盈亏：%+.1fU · 累计：%+.1fU\n剩余仓位：%.0f%%%s"
                                % (coin, tr["dir"], hit_i + 1, tp, part * 100, pnl, tr["realized"], remaining * 100,
                                   ("\n止损已移到开仓价 %.8g（保本损）" % stop) if hit_i == 0 else ""))
+                        if _BEXEC_OK:      # 真实层：限价止盈成交 → Algo 止损数量必须跟着改（撤单重挂）
+                            try:
+                                bexec.sync_sl(coin.upper() + "USDT", tr["dir"],
+                                              tr.get("sl") or tr["entry"],
+                                              real_qty_estimate(tr["entry"], remaining))
+                                log("   ↳ [真实下单层·%s] 已记录止损同步计划：%s，数量按剩余 %.0f%% 重算"
+                                    % (_be_mode(), "移到开仓价" if hit_i == 0 else "价格不变", remaining * 100))
+                            except Exception as _e:
+                                log("   ⚠️ 真实层止损同步计划失败：%s" % str(_e)[:120])
                         if remaining <= 0.001:
                             tr.update({"status": "CLOSED", "exit": tp, "exit_why": "全部止盈",
                                        "pnl": tr["realized"]})
