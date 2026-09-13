@@ -512,18 +512,44 @@ def fast_parse(txt):
     if mm:
         try: entry = float(mm.group(1))
         except Exception: pass
+    if entry is None:
+        # 「77065价格做空」/「现价77000做多」/「@77000」这类写法（用户的测试消息就是这种）
+        for pat in (r"([0-9]*\.?[0-9]+)\s*价格?\s*(?:做多|做空|多单|空单)",
+                    r"(?:现价|市价|CMP|@)\s*\$?([0-9]*\.?[0-9]+)"):
+            mm2 = re.search(pat, txt, re.I)
+            if mm2:
+                try:
+                    entry = float(mm2.group(1)); break
+                except Exception:
+                    pass
     tps = []
-    _mt = re.search(r"(?:止盈|目标位?|targets?)\s*[:：]?\s*((?:\$?[0-9]*\.?[0-9]+[\s,，、]*){1,5})", txt, re.I)
-    if _mt:
-        for x in re.findall(r"[0-9]*\.?[0-9]+", _mt.group(1)):
+    # ⚠️ 必须逐个关键词扫描，不能只 search 第一个：
+    #    用户的测试「第一止盈74500 第二止盈70500」曾被整条漏掉第二档（16:17 实测）。
+    #    分段规则：每个止盈类关键词后取到【下一个任意关键词】为止，
+    #    这样既不会漏档，也不会把紧跟着的止损/加仓数字误当成止盈。
+    _BOUND = (r"(?:止盈|目标位?|targets?|(?:TP|Tp|tp)\s?\d?|止损|stop[ -]?loss|SL|"
+              r"加仓|DCA|入场|进场|Entry)")
+    _kw = list(re.finditer(_BOUND, txt, re.I))
+    for _i, _m in enumerate(_kw):
+        if not re.match(r"(?:止盈|目标位?|targets?|(?:TP|Tp|tp)\s?\d?)", _m.group(0), re.I):
+            continue                                   # 只管止盈类关键词
+        _end = _kw[_i + 1].start() if _i + 1 < len(_kw) else len(txt)
+        _seg = txt[_m.end():_end]
+        _nums = []
+        for _x in re.findall(r"[0-9]*\.?[0-9]+", _seg):
             try:
-                v = float(x)
-                if v > 0 and v not in tps: tps.append(v)
+                _nums.append(float(_x))
             except Exception:
                 pass
-    for x in re.findall(r"TP\s?\d?\s*[:：]?\s*\$?([0-9]*\.?[0-9]+)", txt, re.I):
-        try: tps.append(float(x))
-        except Exception: pass
+        # 「止盈1 0.24 …」中紧跟关键词的单个 1~4 是档位序号，不是价格
+        if len(_nums) >= 2 and _nums[0] in (1.0, 2.0, 3.0, 4.0):
+            _nums = _nums[1:]
+        for _v in _nums[:TP_TIERS]:
+            if _v > 0 and _v not in tps:
+                tps.append(_v)
+    # 保留博主给的先后顺序（不要按数值排序）：做空时数值排序会把最远那档排到最前，
+    # 再截断到 3 档就会把【最近的止盈】丢掉。最终档位顺序在 finalize_pending 里按"离入场近→远"再规整一次。
+    tps = list(dict.fromkeys(tps))[:TP_TIERS]
     # 区间开仓价（如「在4360到4310区间多」/「4310-4360 区间」）—— 一律取中间值
     rng = None
     m = re.search(r"([0-9]*\.?[0-9]+)\s*(?:到|至|~|～|—|–)\s*([0-9]*\.?[0-9]+)", txt)
@@ -543,6 +569,25 @@ def fast_parse(txt):
             "add_price": add, "stop": stop, "targets": tps,
             "tp_on_chart": bool(re.search(r"TPs?\s+above|止盈在?上方|止盈位在上方", txt, re.I)),
             "type": "open", "manage_action": None, "_fast": True}
+
+# 止盈类关键词计数：用来判断"快速解析是不是可疑地少读了档位"
+_TPKW_RE = re.compile(r"止盈|目标位?|targets?|(?:TP|Tp|tp)\s?\d?", re.I)
+
+
+def fast_parse_suspect(txt, info):
+    """快速解析（本地正则）结果是否【可疑地不完整】。
+    存在的意义：快速解析命中会跳过 AI，一旦它少读，就会【静默丢数据】。
+    实例：2026-09-13 16:17 用户测试「第一止盈74500 第二止盈70500」被读成只有 74500，
+          于是到 74500 就全平，第二档 70500 被完全放弃 —— 因为快速解析命中就跳过了 AI。"""
+    if not info:
+        return True
+    n_kw = len(_TPKW_RE.findall(txt or ""))
+    got = len(info.get("targets") or [])
+    if n_kw and got < min(n_kw, TP_TIERS):
+        return True
+    if not info.get("stop"):
+        return True
+    return False
 
 # ---------------- 待确认池：把同一条信号的多条消息合并（文案 + 卡片 + K线图）----------------
 PENDING = {}
@@ -635,7 +680,9 @@ def finalize_pending(open_pos):
     now = time.time()
     for coin in list(PENDING):
         p = PENDING[coin]
-        tps = sorted(set(p["tps"]))[:TP_TIERS]
+        # 去重但【保留博主给的先后顺序】。排序留到拿到入场价之后按"离入场由近到远"做 ——
+        # 做空的「第一止盈74500 第二止盈70500」若按数值升序排，TP1 会错成最远那档 70500。
+        tps = list(dict.fromkeys(p["tps"]))
         if PAUSED[0]:
             log("   ⏸ 已暂停：%s 的信号只记录不开单" % coin)
             PENDING.pop(coin, None); continue
@@ -683,6 +730,15 @@ def finalize_pending(open_pos):
             notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
+        # ===== 止盈档位排序（关键）=====
+        # 必须按【离入场价由近到远】排，不能按数值大小排：
+        # 做空的「第一止盈74500 / 第二止盈70500」按数值升序会变成 70500 在先，
+        # 于是 TP1 变成最远那档、TP1 后移保本损的时机也跟着错。
+        if tps and isinstance(entry, (int, float)) and entry:
+            _tp_sorted = sorted(set(tps), key=lambda t: abs(float(t) - float(entry)))
+        else:
+            _tp_sorted = list(dict.fromkeys(tps))
+        tps = _tp_sorted[:TP_TIERS]
         # ===== 2R 兜底：有开仓价+止损、但没有止盈 =====
         tp_fallback = False
         if not tps and isinstance(p["stop"], (int, float)) and p["stop"]:
@@ -1565,9 +1621,16 @@ def main():
                         t_img = time.time()
                         # ===== 方案C+D：本地正则先解析；需要 AI 时才调，且与读图并行 =====
                         info = fast_parse(txt)
-                        need_chart = bool(imgs) and (info is None or len(info.get("targets") or []) < TP_TIERS or not info.get("stop"))
-                        if info is not None:
+                        _fast = info
+                        _suspect = fast_parse_suspect(txt, info)
+                        if info is not None and not _suspect:
                             log("   ⚡ 快速解析命中（本地正则，0 AI 调用）")
+                        elif info is not None and _suspect:
+                            log("   ⚠️ 快速解析不完整（文字里 %d 个止盈关键词，只读到 %d 档）"
+                                "→ 改调 AI 复核，避免静默漏档"
+                                % (len(_TPKW_RE.findall(txt)), len(info.get("targets") or [])))
+                            info = None
+                        need_chart = bool(imgs) and (info is None or len(info.get("targets") or []) < TP_TIERS or not info.get("stop"))
                         _th, _res = None, {}
                         if need_chart:
                             _th = threading.Thread(target=lambda: _res.update({"chart": read_chart_cached(imgs[0])}))
@@ -1576,6 +1639,17 @@ def main():
                             log("   ⏩ 文字/卡片已够（止损+3档止盈），跳过读图")
                         if info is None:
                             info = parse_text(txt)
+                        # AI 结果若比快速解析还少 → 合并补齐（绝不因为 AI 少读而丢档）
+                        if isinstance(_fast, dict):
+                            if isinstance(info, dict):
+                                if len(_fast.get("targets") or []) > len(info.get("targets") or []):
+                                    log("   ↳ AI 止盈档位少于快速解析，已合并补齐：%s" % _fast["targets"])
+                                    info["targets"] = _fast["targets"]
+                                for _k in ("stop", "entry"):
+                                    if info.get(_k) is None and _fast.get(_k) is not None:
+                                        info[_k] = _fast[_k]
+                            else:
+                                info = _fast
                         t_parse = time.time()                 # 文本解析耗时（不含读图）
                         if _th is not None:
                             _th.join(timeout=120)
@@ -1808,6 +1882,76 @@ def main():
             time.sleep(POLL_SEC)
 
 if __name__ == "__main__":
+    if "--selftest-parse" in sys.argv:
+        # 本地正则解析自检（不联网、不动状态）。第一条就是用户 16:17 的测试消息。
+        cases = [
+            ("用户测试：比特币77065价格做空+第一/第二止盈",
+             "用户963038 比特币 77065价格做空 止损77500 第一止盈74500 第二止盈70500",
+             {"coin": "BTC", "direction": "SHORT", "entry": 77065.0, "stop": 77500.0,
+              "targets": [74500.0, 70500.0]}),
+            ("黄金区间多 + 三档止盈",
+             "黄金Xau在4360到4310区间多，止损4275，止盈4480 4620 4700",
+             {"coin": "XAU", "direction": "LONG", "stop": 4275.0,
+              "targets": [4480.0, 4620.0, 4700.0]}),
+            ("止盈1 + 多档数字（不能被当档位序号吃掉）",
+             "BTC 做多 止损0.190 止盈1 0.240 0.260 0.280",
+             {"coin": "BTC", "direction": "LONG", "stop": 0.19,
+              "targets": [0.24, 0.26, 0.28]}),
+            ("止盈在前止损在后（不能把止损吃成止盈）",
+             "BTC 做空 止盈74500 止损77500",
+             {"coin": "BTC", "direction": "SHORT", "stop": 77500.0, "targets": [74500.0]}),
+            ("博主只给止损不给止盈（交给 2R 兜底）",
+             "Going long LSK here at CMP. SL 0.1993",
+             {"coin": "LSK", "direction": "LONG", "stop": 0.1993, "targets": []}),
+        ]
+        _ok = 0
+        for _name, _txt, _want in cases:
+            _got = fast_parse(_txt)
+            if _got is None:
+                print("[FAIL] %-42s 解析返回 None" % _name)
+                continue
+            _bad = []
+            for _k, _v in _want.items():
+                _g = _got.get(_k)
+                if _k == "targets":
+                    if list(_g or []) != list(_v):
+                        _bad.append("targets got=%s want=%s" % (_g, _v))
+                elif _k == "direction":
+                    if (_g or "") != _v:
+                        _bad.append("direction got=%s want=%s" % (_g, _v))
+                elif isinstance(_v, float):
+                    if _g is None or abs(float(_g) - _v) > 1e-9:
+                        _bad.append("%s got=%s want=%s" % (_k, _g, _v))
+                elif _g != _v:
+                    _bad.append("%s got=%s want=%s" % (_k, _g, _v))
+            if _bad:
+                print("[FAIL] %-42s %s" % (_name, " ; ".join(_bad)))
+            else:
+                print("[ OK ] %-42s %s" % (_name, json.dumps(
+                    {k: _got.get(k) for k in ("coin", "direction", "entry", "stop", "targets")},
+                    ensure_ascii=False)))
+                _ok += 1
+        # 不完整检测：直接对"看起来少读了"的情形做单元校验
+        _susp_cases = [
+            ("3 个止盈关键词/只读到 1 档 → 可疑",
+             "BTC 做多 止损1 止盈 止盈 止盈", {"targets": [1.0], "stop": 1.0}, True),
+            ("3 个止盈关键词/读到 3 档 → 不可疑",
+             "BTC 做多 止盈1 止盈2 止盈3", {"targets": [1.0, 2.0, 3.0], "stop": 1.0}, False),
+            ("没读到止损 → 可疑", "BTC 做多 止盈1 止盈2 止盈3",
+             {"targets": [1.0, 2.0, 3.0], "stop": None}, True),
+            ("没有止盈关键词 → 不可疑（交给 2R 兜底）",
+             "Going long LSK here at CMP. SL 0.1993", {"targets": [], "stop": 0.1993}, False),
+        ]
+        _s_ok = 0
+        for _n, _t, _i, _want in _susp_cases:
+            _g = bool(fast_parse_suspect(_t, _i))
+            print("%s %-42s suspect=%s want=%s" % ("[ OK ]" if _g == _want else "[FAIL]", _n, _g, _want))
+            _s_ok += 1 if _g == _want else 0
+        print("-" * 62)
+        print("解析自检：%d/%d 通过；不完整检测 %d/%d 通过"
+              % (_ok, len(cases), _s_ok, len(_susp_cases)))
+        sys.exit(0 if (_ok == len(cases) and _s_ok == len(_susp_cases)) else 1)
+
     if "--selftest-tp" in sys.argv:
         # 2R 兜底止盈自检：不启动机器人、不联网、不动任何状态
         cases = [
