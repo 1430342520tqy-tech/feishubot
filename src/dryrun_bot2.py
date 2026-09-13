@@ -1428,6 +1428,16 @@ def main():
             log("币安行情已预热（减少下单阶段耗时）")
         except Exception:
             pass
+        if _BEXEC_OK:
+            # 预热真实下单层：合约规格（exchangeInfo ~900 个）和持仓模式只拉一次，
+            # 否则【第一条信号】会额外背 1~3 秒的网络耗时。
+            try:
+                bexec.load_specs()
+                _hg = bexec.is_hedge()
+                log("真实下单层已预热：合约规格 %d 个 ｜ 持仓模式=%s ｜ 当前=%s"
+                    % (len(bexec._SPEC), "双向hedge" if _hg else "单向", _be_mode()))
+            except Exception as _e:
+                log("真实下单层预热失败（不影响纸面运行）：%s" % str(_e)[:120])
         _cu = ("\n⚠️ 检测到停机期间积压 %d 条消息，正在按序回补（超过 %d 分钟的信号只通报、不下单）"
                % (catchup_total, CATCHUP_MAX_AGE // 60)) if catchup_total else ""
         notify("【跟单机器人】dryRun 已启动（纸面模式，只抓开单信号，不会下单）" + _cu)
