@@ -7,7 +7,7 @@
 - 只处理开单信号；闲聊直接跳过；博主管理指令单独处理
 - 全链路计时：信号发出 → 发现 → 抓图 → 解析 → 读图 → 下单(纸面) → 推送
 """
-import os, re, json, time, base64, datetime, threading, hashlib, math
+import os, re, sys, json, time, base64, datetime, threading, hashlib, math
 os.environ.setdefault("DISPLAY", ":99")
 import requests
 from PIL import Image
@@ -53,6 +53,25 @@ SEARCH_TERM = {"颜驰2群": "颜驰"}
 CATCHUP_MAX_AGE = 1800     # 时效闸门：发出时间超过 30 分钟的信号只通报、不下单
 CATCHUP_MAX_MSGS = 50      # 数量上限：单次扫描最多真正处理 50 条，其余只通报
 RUNTIME_MTIME = [0.0]      # 方案B：runtime_config.json 的 mtime，用于热加载检测
+
+# 方案C（开页提速）前置调研：把页面上所有"像 chat-id"的属性抓出来，
+# 只有拿到真实的会话 id 才能判断"直链打开"这条路可不可行。**纯只读诊断，不影响功能。**
+CHATID_JS = """() => {
+  const res = {url: location.href, hits: []};
+  const seen = new Set();
+  let n = 0;
+  for (const e of document.querySelectorAll('*')) {
+    if (++n > 4000) break;
+    for (const a of Array.from(e.attributes || [])) {
+      const s = a.name + '=' + a.value;
+      if (a.value && a.value.length < 80 && /chat|conversation|session/i.test(s)) {
+        if (!seen.has(s)) { seen.add(s); res.hits.push(e.tagName + ' ' + s); }
+      }
+    }
+  }
+  res.hits = res.hits.slice(0, 25);
+  return res;
+}"""
 
 os.makedirs(IMGDIR, exist_ok=True)
 
@@ -495,6 +514,26 @@ def pending_complete(p):
     tps = sorted(set(p["tps"]))
     return p["entry"] is not None and p["stop"] is not None and len(tps) >= TP_TIERS
 
+# ---------------- 2R 兜底止盈（2026-09-13 用户决定）----------------
+# 背景：博主有时只给开仓价 + 止损，不给止盈（实例：LSK「Entry 0.21144 / SL 0.1993 / Risk 0.5%」，
+#       文字无止盈、消息里也没有图 → 任何算法都读不出来）。
+# 用户决定：这种情况「挂止损 + 在 2:1 盈亏比位置自动挂第一档止盈」；
+#           后续博主补了真实止盈位，就把这档撤掉按真实档位重挂。
+R_FALLBACK_MULT = 2.0        # 盈亏比 2:1
+R_FALLBACK_PART = 1.0 / 3    # 该档只平 1/3（等同"第一档"），剩下 2/3 等真实止盈位
+
+
+def fallback_tp_2r(entry, stop, dirc, mult=R_FALLBACK_MULT):
+    """只有开仓价+止损、没有止盈时，按 2:1 盈亏比推出第一档止盈价。
+    R = |入场 − 止损|；做多 = 入场 + 2R，做空 = 入场 − 2R。"""
+    if not isinstance(entry, (int, float)) or not isinstance(stop, (int, float)):
+        return None
+    r = abs(float(entry) - float(stop))
+    if r <= 0:
+        return None
+    t = float(entry) + mult * r if str(dirc).upper() == "LONG" else float(entry) - mult * r
+    return round(t, 10)
+
 def finalize_pending(open_pos):
     """到点或信息齐全 -> 出单；信息不足 -> 只发提醒，绝不猜价"""
     now = time.time()
@@ -548,12 +587,40 @@ def finalize_pending(open_pos):
             notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
+        # ===== 2R 兜底：有开仓价+止损、但没有止盈 =====
+        tp_fallback = False
+        if not tps and isinstance(p["stop"], (int, float)) and p["stop"]:
+            _ft = fallback_tp_2r(entry, p["stop"], dirc0)
+            if _ft is not None:
+                tps = [_ft]
+                tp_fallback = True
+                log("   ↳ 博主未给止盈 → 启用 2R 兜底：入场 %s 止损 %s → 2R 目标 %s（该档只平 %.0f%%）"
+                    % (entry, p["stop"], _ft, R_FALLBACK_PART * 100))
         over_cap = (len(open_pos) >= MAX_OPEN and coin not in open_pos)
         if over_cap and not TEST_MODE:
             notify("【信号·跳过】%s 同时持仓已满 %d 笔" % (coin, MAX_OPEN))
             PENDING.pop(coin, None); continue
         if coin in open_pos:
             _ex = open_pos[coin]
+            # ===== 博主后来补了真实止盈位 → 撤掉 2R 兜底那档，按真实档位重挂 =====
+            if _ex.get("tp_fallback") and tps:
+                _old_tps = list(_ex.get("tps") or [])
+                _ex["tps"] = tps
+                _ex["tp_fallback"] = False
+                _ex["tp_part"] = None
+                _ex["filled"] = []
+                STATE_DIRTY[0] = True
+                with open(TRADES, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(_ex, ensure_ascii=False) + "\n")
+                log("   ↳ %s 收到真实止盈位 %s → 撤掉 2R 兜底档 %s 并重挂"
+                    % (coin, tps, _old_tps))
+                notify("【止盈更新·纸面】%s %s\n博主补了真实止盈位，已撤掉 2R 兜底那档并重挂：\n"
+                       "撤掉：%s\n重挂：%s\n（真实下单层接上后走同一入口：先撤旧限价止盈，再按新档位重挂）"
+                       % (coin, _ex.get("dir"),
+                          "、".join("%.8g" % t for t in _old_tps),
+                          "、".join("%.8g" % t for t in tps)))
+                PENDING.pop(coin, None)
+                continue
             notify("【信号·跳过】%s 已有持仓，不重复开单\n现有：%s 入场 %.8g · 止损 %.8g · 剩余 %.0f%%\n本次信号原文：%s"
                    % (coin, _ex.get("dir"), _ex.get("entry") or 0, _ex.get("sl") or 0,
                       (_ex.get("remaining", 1.0) * 100),
@@ -567,7 +634,9 @@ def finalize_pending(open_pos):
               "order": 0.0, "push": 0.0, "wait": age, "messages": len(p["texts"])}
         t_order = time.time()
         tr = {"coin": coin, "dir": dirc, "entry": entry, "signal_entry": signal_entry, "add": p["add"],
-              "sl": p["stop"], "tps": tps, "entry_src": esrc, "stop_src": p.get("stop_src"),
+              "sl": p["stop"], "tps": tps, "tp_fallback": tp_fallback,
+              "tp_part": (R_FALLBACK_PART if tp_fallback else None),
+              "entry_src": esrc, "stop_src": p.get("stop_src"),
               "t_open": datetime.datetime.fromtimestamp(p["first_ts"], CST).strftime("%m-%d %H:%M:%S"),
               "group": p["group"], "text": (p["texts"][0] if p["texts"] else "")[:300], "status": "OPEN",
               "chart_imgs": p["imgs"], "timer": tm}
@@ -581,6 +650,7 @@ def finalize_pending(open_pos):
         crossed = any(((t - entry) * d0 <= 0) for t in tps)   # 止盈价是否已被现价越过（真实下单必须处理）
         notify(fmt_plan(coin, dirc, entry, p["stop"], tps, p["group"], tr["t_open"],
                         note=("止损来自%s，共合并 %d 条消息（文案/卡片/图）" % (p.get("stop_src") or "-", len(p["texts"]) + (1 if p["imgs"] else 0))
+                              + ("｜⚠️ 博主未给止盈，已按 **2:1 盈亏比** 在 %.8g 自动挂第一档（该档平 %.0f%%，其余等真实止盈位）" % (tps[0], R_FALLBACK_PART * 100) if tp_fallback else "")
                               + ("｜⚠️ 测试阶段：当前已持 %d 笔（上限 %d）" % (len(open_pos), MAX_OPEN) if over_cap else "")),
                         add=p["add"], timing=timing, signal_entry=signal_entry,
                         signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode,
@@ -1160,6 +1230,12 @@ def main():
                 _n = adopt_page(g, rows)
                 if _n:
                     catchup_total += _n
+                try:                      # 方案C 前置调研：只读诊断，记录 URL 与 chat-id 候选
+                    _ci = pg.evaluate(CHATID_JS)
+                    log("   ↳ [%s] URL=%s ｜ chat-id 候选: %s"
+                        % (g, _ci.get("url"), " ; ".join(_ci.get("hits") or []) or "未找到"))
+                except Exception as _e:
+                    log("   ↳ [%s] chat-id 探测失败 %s" % (g, str(_e)[:60]))
             else:
                 log("[%s] 打开失败（未读到消息）" % g)
         log("==== 开始实时监控（%d 个页面）====" % len(pages))
@@ -1360,10 +1436,15 @@ def main():
                             log("   待确认池 %s：开仓=%s(%s) 加仓=%s 止损=%s 止盈=%s 图=%d 已合并%d条消息" % (
                                 coin, p["entry"], p.get("entry_src") or "-", p["add"], p["stop"],
                                 sorted(set(p["tps"])), len(p["imgs"]), len(p["texts"])))
-                        elif coin and coin in PENDING and (chart or imgs or any(isinstance(info.get(k), (int, float)) for k in ("entry", "stop", "add_price"))):
-                            # 后续消息（卡片/带图）补进同一条信号
+                        elif coin and (coin in PENDING or coin in open_pos) and (
+                                chart or imgs
+                                or any(isinstance(info.get(k), (int, float)) for k in ("entry", "stop", "add_price"))
+                                or (info.get("targets") or [])):
+                            # 后续消息（卡片/带图）补进同一条信号；
+                            # 已有持仓的币也放进来 —— 博主后来补的止盈位要能更新上去（2R 兜底替换）
                             merge_pending(coin, g, info=info, chart=chart, imgs=imgs, t_sig=t_sig, txt=txt, stamps=stamps)
-                            log("   并入 %s 的待确认池（补充信息，图=%d）" % (coin, len(imgs)))
+                            log("   并入 %s 的待确认池（补充信息，图=%d%s）"
+                                % (coin, len(imgs), "，持仓中→待更新止盈" if coin in open_pos else ""))
                     # 方案B：本群处理完立刻检查一次出单（不再等整轮扫完 5 个群）
                     finalize_pending(open_pos)
                 except Exception as e:
@@ -1470,7 +1551,8 @@ def main():
                             hit_i = i
                             break
                     if hit_i is not None:
-                        part = 1.0 / max(len(tps), 1)
+                        # 2R 兜底档只平 1/3（由 tp_part 显式指定）；常规档位仍按 1/档数 平分
+                        part = tr.get("tp_part") or (1.0 / max(len(tps), 1))
                         tp = tps[hit_i]
                         pnl = (tp - tr["entry"]) * d / tr["entry"] * NOTIONAL * part
                         tr["realized"] = tr.get("realized", 0.0) + pnl
@@ -1503,4 +1585,30 @@ def main():
                 log("心跳：运行中 | 持仓 %d 笔（%s）" % (len(open_pos), ",".join(open_pos) or "-"))
             time.sleep(POLL_SEC)
 
-main()
+if __name__ == "__main__":
+    if "--selftest-tp" in sys.argv:
+        # 2R 兜底止盈自检：不启动机器人、不联网、不动任何状态
+        cases = [
+            ("做多 入场100 止损95 -> 2R=110", (100, 95, "LONG"), 110.0),
+            ("做空 入场100 止损105 -> 2R=90", (100, 105, "SHORT"), 90.0),
+            ("实例 LSK 入场0.21519 止损0.1993", (0.21519, 0.1993, "LONG"), 0.21519 + 2 * (0.21519 - 0.1993)),
+            ("实例 DOGE 入场0.08438 止损0.0828", (0.08438, 0.0828, "LONG"), 0.08438 + 2 * (0.08438 - 0.0828)),
+            ("没止损 -> None（走绝对底线，不下单）", (100, None, "LONG"), None),
+            ("入场=止损 -> None（R 为 0）", (100, 100, "LONG"), None),
+        ]
+        _ok = 0
+        for _name, (_e, _s, _d), _want in cases:
+            _got = fallback_tp_2r(_e, _s, _d)
+            if _got is None and _want is None:
+                _good = True
+            elif _got is None or _want is None:
+                _good = False
+            else:
+                _good = abs(_got - _want) < 1e-9
+            print("%s %-38s got=%s want=%s" % ("[ OK ]" if _good else "[FAIL]", _name, _got, _want))
+            _ok += 1 if _good else 0
+        print("-" * 62)
+        print("2R 兜底自检：%d/%d 通过（盈亏比 %.0f:1，该档平 %.0f%%）"
+              % (_ok, len(cases), R_FALLBACK_MULT, R_FALLBACK_PART * 100))
+        sys.exit(0 if _ok == len(cases) else 1)
+    main()
