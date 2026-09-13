@@ -10,6 +10,7 @@
 用法：
     python binance_reconcile.py            # 打印对账表
     python binance_reconcile.py --push     # 同时推到飞书
+    python binance_reconcile.py --audit    # 额外复核 API Key 权限（提现是否关闭、IP 白名单）
 """
 import os
 import sys
@@ -28,9 +29,11 @@ STATE = os.path.join(BASE, "v21", "state.json")
 TRADES = os.path.join(BASE, "v21", "trades_dryrun.jsonl")
 NOTIFY = os.path.join(BASE, "notify.json")
 FAPI = "https://fapi.binance.com"
+SAPI = "https://api.binance.com"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
 PUSH = "--push" in sys.argv
+AUDIT = "--audit" in sys.argv
 
 
 def load_json(path, default=None):
@@ -228,8 +231,31 @@ for s in both:
     if not same:
         p("     ↳ 方向不一致，必须人工确认！")
 
+# ---------------- 7. API Key 权限复核（--audit，安全项） ----------------
+if AUDIT:
+    p("")
+    p("【7】API Key 权限复核（安全项）")
+    rest, rerr = call("/sapi/v1/account/apiRestrictions", base=SAPI)
+    if rerr or not isinstance(rest, dict):
+        p("  ⚠️ 读不到权限信息：%s" % rerr)
+    else:
+        wd = rest.get("enableWithdrawals")
+        fu = rest.get("enableFutures")
+        ipr = rest.get("ipRestrict")
+        spot = rest.get("enableSpotAndMarginTrading")
+        p("  提现 enableWithdrawals = %s  %s"
+          % (wd, "✅ 已关闭（必须一直保持）" if wd is False else "❌ 危险！提现是开着的，立刻去币安关掉"))
+        p("  合约 enableFutures     = %s" % fu)
+        p("  现货/杠杆              = %s  %s"
+          % (spot, "✅ 已关闭" if spot is False else "⚠️ 开着（非必需）"))
+        p("  IP 白名单 ipRestrict   = %s  %s"
+          % (ipr, "✅ 已限制" if ipr else "⚠️ 未限制，建议开启"))
+        p("  可交易 canTrade        = %s" % acct.get("canTrade"))
+        if wd is not False or not ipr:
+            problems += 1
+
 p("")
-p("【6】盈亏对照")
+p("【8】盈亏对照")
 p("  纸面已实现盈亏   %+.2f USDT" % paper_pnl)
 if paper_closed:
     p("    · 已结单明细：%s" % "、".join("%s %+.1fU" % (c, v) for c, v in paper_closed))
