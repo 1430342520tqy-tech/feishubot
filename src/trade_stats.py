@@ -145,15 +145,17 @@ def _hold_text(sec):
 
 
 def _exit_kind(why):
+    """归类结单方式。⚠️ 顺序有讲究：先判『手动/指令』再判止盈/保本/止损 ——
+    否则『手动平仓(全部平仓指令，TP1后移保本)』会因为含『保本』二字被误归成保本止损。"""
     w = str(why or "")
+    if "手动" in w or "指令" in w:
+        return "手动平仓"
     if "止盈" in w:
         return "止盈"
     if "保本" in w:
         return "保本止损"
     if "止损" in w:
         return "止损"
-    if "手动" in w or "指令" in w:
-        return "手动平仓"
     return w or "-"
 
 
