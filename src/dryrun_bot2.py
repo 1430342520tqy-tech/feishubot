@@ -47,6 +47,13 @@ TEST_MODE = True       # 测试阶段：抓到的一切信号都要出单（不�
 MSG_URL = "https://www.feishu.cn/messenger"
 SEARCH_TERM = {"颜驰2群": "颜驰"}
 
+# ===== 停机/重启回补闸门（2026-09-13 新增，方案A）=====
+# 背景：启动时曾把游标直接抬到"页面最新一条"，导致停机期间到达的信号被静默吞掉。
+#       现在改为保留原游标，让首次扫描自然回补，并用下面两道闸门防止一次性补进太多过期信号。
+CATCHUP_MAX_AGE = 1800     # 时效闸门：发出时间超过 30 分钟的信号只通报、不下单
+CATCHUP_MAX_MSGS = 50      # 数量上限：单次扫描最多真正处理 50 条，其余只通报
+RUNTIME_MTIME = [0.0]      # 方案B：runtime_config.json 的 mtime，用于热加载检测
+
 os.makedirs(IMGDIR, exist_ok=True)
 
 def log(msg):
@@ -913,7 +920,7 @@ def handle_command(txt):
             if gs:
                 GROUPS[:] = gs
                 save_runtime()
-                notify("【指令】监控群已改为：%s\n（已写入配置，重启后仍生效；新增的群需要重启机器人才能打开页面）" % "、".join(GROUPS))
+                notify("【指令】监控群已改为：%s\n（已热加载生效，无需重启；新增群的页面约 1 分钟内自动打开）" % "、".join(GROUPS))
         else:
             notify("【指令】格式：修改监控群 A,B,C")
     elif cmd.startswith("修改金额"):
@@ -1084,6 +1091,10 @@ def main():
     last_id = {}
     open_pos = open_pos_ref          # 指令系统与主循环共用同一个持仓字典
     load_runtime()
+    try:
+        RUNTIME_MTIME[0] = os.path.getmtime(RUNTIME)      # 方案B：热加载基线
+    except Exception:
+        RUNTIME_MTIME[0] = 0.0
     if os.path.exists(STATE):
         try:
             sv = json.load(open(STATE, encoding="utf-8"))
@@ -1111,15 +1122,44 @@ def main():
                                                         "--js-flags=--max-old-space-size=320",
                                                         "--disable-features=Translate,BackForwardCache"])
         pages = {}
+        # 打开页面后的统一处理：⚠️ 绝不把游标抬到"页面最新"，否则停机期间的消息会被静默吞掉
+        def adopt_page(g, rows):
+            """返回该群停机积压条数；None 表示没读到消息。仅对无游标的新群做初始化。"""
+            ids = [int(r["id"]) for r in rows if r.get("id")]
+            if not ids:
+                return None
+            newest = max(ids)
+            saved = last_id.get(g, 0)
+            if saved <= 0:
+                last_id[g] = newest
+                log("   ↳ [%s] 无历史游标（首次运行/新增群），游标初始化为页面最新 %s，不回补历史"
+                    % (g, datetime.datetime.fromtimestamp(newest >> 32, CST).strftime("%m-%d %H:%M:%S")))
+                return 0
+            gap = sorted([r for r in rows if r.get("id") and int(r["id"]) > saved],
+                         key=lambda r: int(r["id"]))
+            if gap:
+                log("   ↳ [%s] 停机期间积压 %d 条（%s ~ %s），本轮将按序回补"
+                    % (g, len(gap),
+                       datetime.datetime.fromtimestamp(int(gap[0]["id"]) >> 32, CST).strftime("%m-%d %H:%M"),
+                       datetime.datetime.fromtimestamp(int(gap[-1]["id"]) >> 32, CST).strftime("%m-%d %H:%M")))
+            else:
+                log("   ↳ [%s] 无积压，游标保持不变" % g)
+            return len(gap)
+
+        catchup_total = 0
         for g in GROUPS:
             pg, rows = open_group_page(ctx, g)
             pages[g] = pg
             ids = [int(r["id"]) for r in rows if r.get("id")]
             if ids:
-                last_id[g] = max(last_id.get(g, 0), max(ids))
-                log("[%s] 已打开并定位 最新 %s  id=%s | 末条=%s" % (
+                log("[%s] 已打开 | 页面最新 %s | 本群游标 %s | 末条=%s" % (
                     g, datetime.datetime.fromtimestamp(max(ids) >> 32, CST).strftime("%m-%d %H:%M:%S"),
-                    max(ids), (rows[-1].get("text") or "")[:36]))
+                    (datetime.datetime.fromtimestamp(last_id[g] >> 32, CST).strftime("%m-%d %H:%M:%S")
+                     if last_id.get(g) else "无"),
+                    (rows[-1].get("text") or "")[:36]))
+                _n = adopt_page(g, rows)
+                if _n:
+                    catchup_total += _n
             else:
                 log("[%s] 打开失败（未读到消息）" % g)
         log("==== 开始实时监控（%d 个页面）====" % len(pages))
@@ -1132,7 +1172,9 @@ def main():
             log("币安行情已预热（减少下单阶段耗时）")
         except Exception:
             pass
-        notify("【跟单机器人】dryRun 已启动（纸面模式，只抓开单信号，不会下单）")
+        _cu = ("\n⚠️ 检测到停机期间积压 %d 条消息，正在按序回补（超过 %d 分钟的信号只通报、不下单）"
+               % (catchup_total, CATCHUP_MAX_AGE // 60)) if catchup_total else ""
+        notify("【跟单机器人】dryRun 已启动（纸面模式，只抓开单信号，不会下单）" + _cu)
         hb = 0
         feed_prev = {}            # 群 -> 上次看到的会话列表预览
         safety = 0                # 兜底：每 N 轮无条件扫一次所有群
@@ -1157,18 +1199,22 @@ def main():
                     to_scan.append(missing[safety % len(missing)])
             if changed:
                 log("🔔 会话列表显示有新消息：%s" % "、".join(changed))
+            missed_sig = []          # 本轮被闸门拦下的消息（只通报，不下单）
             for g in GROUPS:
                 page = pages.get(g)
-                if page is None:
-                    continue
                 if g not in to_scan:
                     continue
-                if page.is_closed():
-                    log("[%s] 页面已关闭，重新打开" % g)
+                if page is None or page.is_closed():
+                    # ⚠️ 旧代码在 page 为 None 时直接 continue —— 那个群会永久停止监控，且日志里毫无提示。
+                    #    现在改为主动重开；重开后保留原游标，停机期间的消息由回补闸门处理。
+                    log("[%s] 页面不存在/已关闭，正在重新打开…" % g)
                     try:
-                        pages[g] = open_group_page(ctx, g)[0]
-                    except Exception:
+                        _pg, _rows = open_group_page(ctx, g)
+                        pages[g] = _pg
+                        adopt_page(g, _rows)
+                    except Exception as _e:
                         pages[g] = None
+                        log("[%s] 重开失败（下一轮会继续重试）：%s" % (g, str(_e)[:80]))
                     continue
                 try:
                     page.mouse.move(900, 400); page.mouse.wheel(0, 2600); time.sleep(0.3)
@@ -1177,12 +1223,34 @@ def main():
                         finalize_pending(open_pos)          # 方案B：每个群扫完就检查一次出单
                         continue
                     base = last_id.get(g, 0)
-                    new = [r for r in rows if r.get("id") and int(r["id"]) > base]
-                    if len(new) > 15:
-                        log("[%s] 忽略 %d 条回放" % (g, len(new))); new = []
-                    if new:
-                        last_id[g] = max(int(r["id"]) for r in new)
-                    for r in sorted(new, key=lambda r: int(r["id"])):
+                    cand = sorted([r for r in rows if r.get("id") and int(r["id"]) > base],
+                                  key=lambda r: int(r["id"]))
+                    # ===== 回补闸门（2026-09-13）替代旧的「发现 >15 条就静默全丢」=====
+                    # ① 超过 CATCHUP_MAX_AGE 的老信号 -> 只通报不下单，避免拿过期点位追单
+                    # ② 超过 CATCHUP_MAX_MSGS 的 -> 只处理最新那批，其余只通报
+                    # 两条路径都推进游标 + 标记已处理，确保永不重复，但绝不静默丢弃
+                    now_ts = time.time()
+                    fresh, gated = [], []
+                    for r in cand:
+                        if now_ts - (int(r["id"]) >> 32) > CATCHUP_MAX_AGE:
+                            gated.append(("超时效", r))
+                        else:
+                            fresh.append(r)
+                    if len(fresh) > CATCHUP_MAX_MSGS:
+                        gated.extend(("超数量上限", r) for r in fresh[:-CATCHUP_MAX_MSGS])
+                        fresh = fresh[-CATCHUP_MAX_MSGS:]
+                    for _why, r in gated:
+                        _mid = r["id"]
+                        mark_seen(_mid)
+                        last_id[g] = max(last_id.get(g, 0), int(_mid))
+                        STATE_DIRTY[0] = True
+                        missed_sig.append((g, _why, int(_mid) >> 32, (r.get("text") or "")[:70]))
+                    if gated:
+                        log("[%s] 回补闸门拦下 %d 条（超时效 %d / 超上限 %d）：只通报不下单"
+                            % (g, len(gated), sum(1 for w, _ in gated if w == "超时效"),
+                               sum(1 for w, _ in gated if w == "超数量上限")))
+                    new = fresh
+                    for r in new:
                         mid = r["id"]
                         t_sig = int(mid) >> 32
                         when = datetime.datetime.fromtimestamp(t_sig, CST).strftime("%m-%d %H:%M:%S")
@@ -1190,8 +1258,11 @@ def main():
                         log("[%s] 发现新消息 | 发出=%s | %s" % (g, when, txt[:110]))
                         if int(mid) in SEEN:
                             log("   ↳ 该消息此前已处理过，跳过（防重复开单）")
+                            last_id[g] = max(last_id.get(g, 0), int(mid))
                             continue
                         mark_seen(mid)
+                        # 逐条推进游标：进程若中途挂掉，重启后只会重放（SEEN 挡住重复开单），不会丢单
+                        last_id[g] = max(last_id.get(g, 0), int(mid))
                         STATE_DIRTY[0] = True
                         low = txt.lower()
                         SELF_MARKS = ["【跟单机器人】", "【机器人指令】", "【已开单·纸面】", "【已结单·纸面】", "【止盈成交·纸面】", "【你的持仓】", "【指令】", "【博主指令】", "【信号·"]
@@ -1308,6 +1379,59 @@ def main():
                             pages[g] = open_group_page(ctx, g)[0]
                         except Exception:
                             pages[g] = None
+            # 被回补闸门拦下的消息：汇总通报给你（文本以 【跟单机器人】 开头，
+            # 会被下面的 SELF_MARKS 检查过滤掉，不会引发自我循环 —— 这条依赖别删）
+            if missed_sig:
+                _ls = ["【跟单机器人】⚠️ 回补闸门拦下 %d 条消息（未下单，仅通报）" % len(missed_sig)]
+                for _g, _why, _ts, _tx in missed_sig[:8]:
+                    _ls.append("· %s｜%s｜%s\n  %s" % (
+                        _why, _g,
+                        datetime.datetime.fromtimestamp(_ts, CST).strftime("%m-%d %H:%M:%S"), _tx))
+                if len(missed_sig) > 8:
+                    _ls.append("· …另有 %d 条（详见 run.log）" % (len(missed_sig) - 8))
+                try:
+                    notify("\n".join(_ls))
+                except Exception as _e:
+                    log("错过信号通报失败 " + str(_e)[:80])
+            # ===== 方案B：runtime_config.json 热加载 =====
+            # 目的：改金额/杠杆/测试模式/监控群时不再 restart 进程，
+            #       从而彻底消除「重启 4.5 分钟盲窗」。新增群只新开一个页面。
+            try:
+                _mt = os.path.getmtime(RUNTIME)
+            except Exception:
+                _mt = RUNTIME_MTIME[0]
+            if _mt != RUNTIME_MTIME[0]:
+                _old = ("、".join(GROUPS), MARGIN, LEV, bool(TEST_MODE))
+                load_runtime()
+                RUNTIME_MTIME[0] = _mt
+                _chg = []
+                for _g in [x for x in list(pages) if x not in GROUPS]:       # 不再监控 -> 关页面省内存
+                    _pg = pages.pop(_g, None)
+                    try:
+                        if _pg and not _pg.is_closed():
+                            _pg.close()
+                    except Exception:
+                        pass
+                    last_id.pop(_g, None)
+                    _chg.append("移除 %s" % _g)
+                    log("[热加载] 已关闭不再监控的群页面：%s" % _g)
+                for _g in [x for x in GROUPS if x not in pages]:              # 新增 -> 立刻开页面
+                    log("[热加载] 新增监控群 %s，正在开页面（约 1 分钟）…" % _g)
+                    try:
+                        _pg, _rows = open_group_page(ctx, _g)
+                        pages[_g] = _pg
+                        adopt_page(_g, _rows)                                 # 无游标则从页面最新起步
+                        _chg.append("新增 %s" % _g)
+                    except Exception as _e:
+                        pages[_g] = None
+                        log("[热加载] %s 开页失败：%s" % (_g, str(_e)[:80]))
+                        _chg.append("新增 %s（开页失败）" % _g)
+                _new = ("、".join(GROUPS), MARGIN, LEV, bool(TEST_MODE))
+                if _chg or _new != _old:
+                    log("[热加载] 生效：%s -> %s" % (_old, _new))
+                    notify("【跟单机器人】配置已热加载（未重启，无盲窗）\n监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s%s"
+                           % (_new[0], _new[1], _new[2], _new[3],
+                              ("\n" + "；".join(_chg)) if _chg else ""))
             # 待确认池：信息齐全就出单，到点还没齐也只发提醒（绝不猜价）
             try:
                 finalize_pending(open_pos)
