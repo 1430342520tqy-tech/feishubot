@@ -522,6 +522,10 @@ def pending_complete(p):
 R_FALLBACK_MULT = 2.0        # 盈亏比 2:1
 R_FALLBACK_PART = 1.0 / 3    # 该档只平 1/3（等同"第一档"），剩下 2/3 等真实止盈位
 
+# "未能识别为信号"的通报节流（避免某个群狂发图时刷屏）
+UNIDENT_NOTIFY_COOLDOWN = 600
+_UNIDENT_NOTIFY = {}         # 群 -> 上次通报时间戳
+
 
 def fallback_tp_2r(entry, stop, dirc, mult=R_FALLBACK_MULT):
     """只有开仓价+止损、没有止盈时，按 2:1 盈亏比推出第一档止盈价。
@@ -1425,6 +1429,7 @@ def main():
                                     except Exception as _e:
                                         log("   持仓汇报失败 " + str(_e)[:80])
                         if info.get("type") == "manage" and not _act:
+                            log("   ↳ 判定为博主管理类消息但无明确动作 → 不动作：%s" % txt[:80])
                             continue
                         if _act:
                             notify("【博主指令】%s\n群：%s  时间：%s\n动作：%s\n原文：%s" % (coin or "?", g, when, _act, txt[:200]))
@@ -1445,6 +1450,22 @@ def main():
                             merge_pending(coin, g, info=info, chart=chart, imgs=imgs, t_sig=t_sig, txt=txt, stamps=stamps)
                             log("   并入 %s 的待确认池（补充信息，图=%d%s）"
                                 % (coin, len(imgs), "，持仓中→待更新止盈" if coin in open_pos else ""))
+                        else:
+                            # ⚠️ 2026-09-13：这里以前是【什么都不做、也不留一行日志】的静默丢弃。
+                            #    实例：13:56 黄金mansoor 发「XAUUSD 👀 + 推文链接 + 图」，
+                            #    图都抓到了，却既没下单、也没任何记录 —— 你完全不知道错过了什么。
+                            log("   ↳ 没通过信号门槛（币种=%s 方向=%s 图=%d 类型=%s），未下单：%s"
+                                % (coin or "-", dirc or "-", len(imgs), info.get("type") or "-", txt[:100]))
+                            _looks_signal = bool(coin) and (
+                                bool(imgs) or any(k in txt for k in ("止损", "止盈", "Entry", "SL", "TP")))
+                            if _looks_signal and (time.time() - _UNIDENT_NOTIFY.get(g, 0) > UNIDENT_NOTIFY_COOLDOWN):
+                                _UNIDENT_NOTIFY[g] = time.time()
+                                notify("【信号·未能识别】%s\n识别到币种 %s%s，但没能解析出方向/点位 "
+                                       "→ **未下单**，等你确认\n原文：%s"
+                                       % (coin, coin,
+                                          ("，图已抓到 %d 张（读了但没读出可用的方向/点位）" % len(imgs))
+                                          if imgs else "，无图",
+                                          txt[:200]))
                     # 方案B：本群处理完立刻检查一次出单（不再等整轮扫完 5 个群）
                     finalize_pending(open_pos)
                 except Exception as e:
