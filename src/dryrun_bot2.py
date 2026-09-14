@@ -397,9 +397,20 @@ def parse_text(text):
     prompt = ("从这条加密货币跟单消息里抽取开单信息。只输出JSON："
               "{\"is_signal\":bool,\"coin\":\"大写币种或null\",\"direction\":\"LONG|SHORT|null\","
               "\"entry\":数字或null,\"entryRange\":[最小,最大]或null,\"entry_is_cmp\":bool,\"add_price\":数字或null,"
-              "\"stop\":数字或null,\"targets\":[数字],\"tp_on_chart\":bool,"
+              "\"entryLegs\":[数字]或null,\"stop\":数字或null,\"stopRange\":[小,大]或null,\"stopPct\":数字或null,"
+              "\"targets\":[数字],\"targetRanges\":[[小,大]]或null,\"tp_on_chart\":bool,"
               "\"type\":\"open|manage|info\",\"manage_action\":\"close_all|trim|move_stop_to_cost|null\"}"
-              " 规则：只用消息里真实出现的数字，绝不编造；止盈写在图上则 tp_on_chart=true 且 targets 为空。开仓价若给的是区间（如「在4360到4310区间多」「4310-4360 区间」），请填 entryRange=[小,大] 且 entry 留 null。")
+              " 规则："
+              "① 只用消息里真实出现的数字，绝不编造；"
+              "② 止盈写在图上则 tp_on_chart=true 且 targets 为空；"
+              "③ 开仓价若给的是区间（如「在4360到4310区间多」）→ entryRange=[小,大]，entry 留 null；"
+              "④ 【分批建仓】若给了多个入场点位（如「77777进头仓，76666 75555继续分批接多」"
+              "或「跌到95第一笔，90第二笔」）→ entryLegs=[点位1,点位2,...] 按出现顺序，entry 留 null；"
+              "⑤ 止损若给的是区间 → stopRange=[小,大]；"
+              "⑥ 【百分比止损】若写「带个3%止损」「3%止损」→ stopPct=3（只填数字），stop 留 null；"
+              "⑦ 止盈若是区间（如「止盈2400到2350」）→ targetRanges=[[2350,2400]]，不要塞进 targets；"
+              "⑧ 一档止盈只给一个数就放 targets；多个止盈按顺序放 targets。"
+              "重要：方向必须按原文判断（做多/多/空/做空/LONG/SHORT）。")
     body = {"model": "deepseek-v4-flash", "temperature": 0,
             "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text[:900]}]}
     try:
@@ -527,9 +538,10 @@ def fast_parse(txt):
         if m:
             raw, dirc = m.group(1).upper(), m.group(2).upper()
     # 中文方向词（颜驰这类："…区间多" / "多单" / "做空"）
-    if "区间多" in txt or "做多" in txt or "多单" in txt or "看多" in txt:
+    # 2026-09-14 补充：暴富龙常用「分批接多」「进头仓」「买多」「卖空」等说法
+    if re.search(r"区间多|做多|多单|看多|接多|进多|买多|冲多|追多|低吸|抄底", txt):
         dirc = "LONG"
-    elif "区间空" in txt or "做空" in txt or "空单" in txt or "看空" in txt:
+    elif re.search(r"区间空|做空|空单|看空|接空|进空|卖空|高抛|摸顶", txt):
         dirc = "SHORT"
     if raw is None:
         # 中文/俗称兜底：直接从整段文字里找币安合约（黄金/比特币/闪迪/海力士…）
@@ -616,9 +628,56 @@ def fast_parse(txt):
                 rng = [min(a, b), max(a, b)]
         except Exception:
             pass
-    if not (stop or add or entry or tps):
+    # ===== 用户规则（2026-09-14）本地正则支持 =====
+    # ⚠️ 必须放在"什么都没解析到就返回 None"的检查【之前】——
+    #    否则「76666 75555继续分批接多，74000止损」这种消息因为止损写在数字后面、
+    #    没有止盈关键词，会被判成"什么都没读到"而整条丢掉。
+    out_legs, out_stop_pct, out_stop_range, out_tp_ranges = None, None, None, None
+    # ① 分批建仓：「76666 75555继续分批接多」「跌到95第一笔开仓，90第二笔」
+    _legtxt = None
+    _mleg = re.search(r"((?:\$?[0-9]*\.?[0-9]+[\s,，、]+){1,4}\$?[0-9]*\.?[0-9]+)\s*"
+                      r"(?:继续)?(?:分批|分次|分笔)", txt)
+    if _mleg:
+        _legtxt = _mleg.group(1)
+    else:
+        _ml2 = re.search(r"(?:跌到|涨到|到)\s*\$?([0-9]*\.?[0-9]+)[^0-9]{0,12}?"
+                         r"(?:第一笔|第1笔|首笔)[^0-9]{0,20}?\$?([0-9]*\.?[0-9]+)[^0-9]{0,12}?(?:第二笔|第2笔)", txt)
+        if _ml2:
+            _legtxt = _ml2.group(1) + " " + _ml2.group(2)
+    if _legtxt:
+        try:
+            _lv = []
+            for x in re.findall(r"[0-9]*\.?[0-9]+", _legtxt):
+                v = float(x)
+                if v > 0 and v not in _lv:
+                    _lv.append(v)
+            if len(_lv) >= 2:
+                out_legs = _lv
+        except Exception:
+            pass
+    # ② 百分比止损：「带个3%止损」「3%止损」「止损3%」
+    _msp = re.search(r"(?:带个?|带)?\s*([0-9]*\.?[0-9]+)\s*%\s*(?:的)?\s*止损", txt)
+    if not _msp:
+        _msp = re.search(r"止损[^0-9%]{0,8}([0-9]*\.?[0-9]+)\s*%", txt)
+    if _msp:
+        try:
+            out_stop_pct = float(_msp.group(1))
+        except Exception:
+            pass
+    # ③ 止损区间
+    _msr = re.search(r"止损[^0-9]{0,10}\$?([0-9]*\.?[0-9]+)\s*(?:到|至|~|～|-|—|–)\s*\$?([0-9]*\.?[0-9]+)", txt)
+    if _msr:
+        out_stop_range = [float(_msr.group(1)), float(_msr.group(2))]
+    # ④ 止盈区间：止盈2400到2350
+    _mtr = re.findall(r"(?:止盈|目标位?|targets?)[^0-9]{0,10}\$?([0-9]*\.?[0-9]+)\s*"
+                      r"(?:到|至|~|～|-|—|–)\s*\$?([0-9]*\.?[0-9]+)", txt)
+    if _mtr:
+        out_tp_ranges = [[float(a), float(b)] for a, b in _mtr]
+    if not (stop or add or entry or tps or out_legs or out_stop_pct or out_stop_range or out_tp_ranges):
         return None
     return {"is_signal": True, "coin": coin, "direction": dirc, "entry": entry, "entryRange": rng,
+            "entryLegs": out_legs, "stopPct": out_stop_pct,
+            "stopRange": out_stop_range, "targetRanges": out_tp_ranges,
             "entry_is_cmp": bool(re.search(r"\bCMP\b|市价|现价", txt, re.I)),
             "add_price": add, "stop": stop, "targets": tps,
             "tp_on_chart": bool(re.search(r"TPs?\s+above|止盈在?上方|止盈位在上方", txt, re.I)),
@@ -651,6 +710,7 @@ def merge_pending(coin, group, info=None, chart=None, imgs=None, t_sig=0, txt=""
     p = PENDING.get(coin)
     if p is None:
         p = {"group": group, "entry": None, "entry_src": None, "add": None, "stop": None, "stop_src": None,
+             "legs": [], "stop_pct": None,
              "tps": [], "imgs": [], "texts": [], "first_ts": t_sig or int(time.time()),
              "t_found": (stamps or {}).get("found", time.time()), "t_img": (stamps or {}).get("img", 0.0),
              "t_parse": (stamps or {}).get("parse", 0.0), "t_chart": (stamps or {}).get("chart", 0.0),
@@ -675,13 +735,67 @@ def merge_pending(coin, group, info=None, chart=None, imgs=None, t_sig=0, txt=""
         a = info.get("add_price")
         if isinstance(a, (int, float)) and p["add"] is None:
             p["add"] = float(a)
+        # ===== 分批建仓：多个入场点位（用户规则 2026-09-14）=====
+        if not p.get("legs"):
+            _lg = []
+            for x in (info.get("entryLegs") or []):
+                try:
+                    xv = float(x)
+                    if xv > 0 and xv not in _lg:
+                        _lg.append(xv)
+                except Exception:
+                    pass
+            if len(_lg) >= 2:
+                p["legs"] = _lg
+                p["entry"] = None                  # 分批建仓以各点位为准，不取单一入场价
+                p["entry_src"] = "分批建仓(%d笔)" % len(_lg)
+                log("   ↳ 识别到分批建仓 %d 个点位：%s" % (len(_lg), _lg))
+        # ===== 止损区间 → 取中点（用户规则 3：区间一律取中间值）=====
+        # ⚠️ 区间必须【优先于】散点：否则「止损98到92」会先被散点正则抓成 98，
+        #    区间中点就永远轮不上（实测踩过这个坑）。
+        _sr = info.get("stopRange")
+        _sr_used = False
+        if isinstance(_sr, (list, tuple)) and len(_sr) == 2:
+            try:
+                _lo, _hi = sorted([float(_sr[0]), float(_sr[1])])
+                if _lo != _hi:
+                    p["stop"] = (_lo + _hi) / 2.0
+                    p["stop_src"] = "止损区间中间值"
+                    _sr_used = True
+                    log("   ↳ 止损区间 %.8g~%.8g → 取中点 %.8g" % (_lo, _hi, p["stop"]))
+            except Exception:
+                pass
         s = info.get("stop")
-        if isinstance(s, (int, float)) and p["stop"] is None:
+        if (not _sr_used) and isinstance(s, (int, float)) and p["stop"] is None:
             p["stop"] = float(s); p["stop_src"] = "消息文字"
+        # ===== 百分比止损（用户规则 5）=====
+        _sp = info.get("stopPct")
+        if isinstance(_sp, (int, float)) and 0 < float(_sp) < 90 and p.get("stop_pct") is None:
+            p["stop_pct"] = float(_sp)
+            log("   ↳ 识别到百分比止损 %.2f%%（按开仓价折算止损位）" % float(_sp))
+        # ===== 止盈区间 → 取中点（用户规则 3）=====
+        _ranges = []
+        for _tr in (info.get("targetRanges") or []):
+            try:
+                if isinstance(_tr, (list, tuple)) and len(_tr) == 2:
+                    _lo, _hi = sorted([float(_tr[0]), float(_tr[1])])
+                    if _lo == _hi:
+                        continue
+                    _ranges.append((_lo, _hi))
+                    _mid = (_lo + _hi) / 2.0
+                    if _mid > 0 and _mid not in p["tps"]:
+                        p["tps"].append(_mid)
+                        log("   ↳ 止盈区间 %.8g~%.8g → 取中点 %.8g" % (_lo, _hi, _mid))
+            except Exception:
+                pass
         for t in (info.get("targets") or []):
             try:
                 tv = float(t)
-                if tv not in p["tps"]: p["tps"].append(tv)
+                # 落在已识别区间内的散点要丢弃：它们是区间的两个端点，不是独立的止盈档
+                if any(_lo - 1e-9 <= tv <= _hi + 1e-9 for _lo, _hi in _ranges):
+                    continue
+                if tv not in p["tps"]:
+                    p["tps"].append(tv)
             except Exception:
                 pass
         if txt:
@@ -731,6 +845,10 @@ _CLOSE_ANNOUNCE = re.compile(
 # 【Giggle 的止盈】错配给 BTC，于是 开仓价 2540（而 BTC 市价 77760）、止损 38，
 # 2R 兜底算出止盈 7582.1 → 止盈早已越过 → 秒平、记 +1773U 假盈利。
 MAX_ENTRY_DEV = 0.20     # 解析出的开仓价与市价偏离超过 20% → 判为解析错误
+# ===== 黄金mansoor 专属规则（用户 2026-09-14）=====
+# 「假设是4000开多，此时价格低于4000则开进去；假设是4001，则挂单在4000开多」——
+# 即：只在市价对我们更有利时市价进，否则一律按博主价挂限价等他回踩。**只对这一组生效。**
+STRICT_LIMIT_GROUPS = []  # 由 runtime_config.json 的 strict_limit_groups 决定
 MAX_STOP_PCT = 0.40      # 止损距离开仓价超过 40% → 判为荒谬
 MIN_STOP_PCT = 0.0005    # 止损距离小于 0.05% → 等于没设止损
 
@@ -822,17 +940,40 @@ def finalize_pending(open_pos):
             notify("【信号·待确认】%s\n拿不到币安实时价，无法开仓\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
-        # 开仓方式（用户规则：不追高/不追空，逆势有利直接市价）
-        #   博主价与市价相差 ±2% 以内            -> 市价开满仓
-        #   做多 且 市价高于博主价 2% 以上        -> 不追高：分两笔挂限价（博主价×1.01 一半 + 博主价 一半）
-        #   做空 且 市价低于博主价 2% 以上        -> 不追空：分两笔挂限价（博主价×0.99 一半 + 博主价 一半）
-        #   其余（做多时市价低于博主价 / 做空时市价高于博主价）-> 直接市价，止损不变
+        # ===== 入场计划 =====
+        # ① 分批建仓（用户规则4，适用所有博主）：给了 N 个点位 → N 笔限价，保证金等分
+        # ② 黄金mansoor 专属规则（用户规则1）：市价对我们更有利则市价进，否则按博主价挂限价
+        # ③ 其余群沿用：±2% 内市价，超出则不追高/不追空（两笔限价）
         entry, entry_mode, esrc = mkt, "市价", "市价成交"
         entry_orders = [{"kind": "市价", "price": mkt, "margin": MARGIN}]
         entry_note = ""
-        if isinstance(signal_entry, (int, float)) and signal_entry and mkt:
+        _grp = p.get("group") or ""
+        _legs = list(p.get("legs") or [])
+        if len(_legs) >= 2:
+            # ① 分批建仓
+            _each = MARGIN / len(_legs)
+            entry_orders = [{"kind": "限价", "price": float(x), "margin": _each} for x in _legs]
+            entry_mode = "限价分批"
+            entry = sum(float(x) for x in _legs) / len(_legs)
+            entry_note = ("**分批建仓 %d 笔**（保证金等分，各 %.0fU）：%s"
+                          % (len(_legs), _each, "、".join("%.8g" % float(x) for x in _legs)))
+            log("   ↳ 分批建仓：%d 个点位 %s，每笔保证金 %.0fU" % (len(_legs), _legs, _each))
+        elif isinstance(signal_entry, (int, float)) and signal_entry and mkt:
             diff = (signal_entry - mkt) / mkt          # >0 表示市价在博主价下方
-            if dirc0 == "LONG" and diff < -0.02:       # 市价高于博主价 2% 以上 -> 不追高
+            if _grp in STRICT_LIMIT_GROUPS:
+                # ② 黄金mansoor：只在市价对我们更有利时市价进；否则按博主价挂限价
+                _better = (dirc0 == "LONG" and diff > 0) or (dirc0 == "SHORT" and diff < 0)
+                if _better:
+                    entry_note = ("现价 %.8g 比博主价 %.8g 更有利 → 直接市价进（%s专属规则）"
+                                  % (mkt, signal_entry, _grp))
+                else:
+                    entry_orders = [{"kind": "限价", "price": signal_entry, "margin": MARGIN}]
+                    entry_mode = "限价分批"
+                    entry = signal_entry
+                    entry_note = ("现价 %.8g 比博主价 %.8g 不利 → **按博主价挂限价，等回踩**（%s专属规则）"
+                                  % (mkt, signal_entry, _grp))
+                    log("   ↳ [%s专属] 按博主价挂限价 %.8g（现价 %.8g）" % (_grp, signal_entry, mkt))
+            elif dirc0 == "LONG" and diff < -0.02:       # 市价高于博主价 2% 以上 -> 不追高
                 p1 = signal_entry * 1.01
                 entry_orders = [{"kind": "限价", "price": p1, "margin": MARGIN / 2},
                                 {"kind": "限价", "price": signal_entry, "margin": MARGIN / 2}]
@@ -848,6 +989,22 @@ def finalize_pending(open_pos):
                 entry_note = "现价 %.8g 比博主开仓价低 %.1f%%，超过 2%%，**不追空**，分两笔挂限价" % (mkt, diff * 100)
             elif signal_entry:
                 entry_note = "现价与博主开仓价相差 %.2f%%（≤2%%），直接市价开" % (diff * 100)
+        # ===== 止损推导（用户规则2/5，适用所有博主）=====
+        # 没给止损时：① 有百分比止损 → 按开仓价折算；② 否则有止盈 → 止损 = 第一止盈距离的一半（保证 2:1）
+        _d0 = 1 if dirc0 == "LONG" else -1
+        if p["stop"] is None and isinstance(entry, (int, float)) and entry:
+            if isinstance(p.get("stop_pct"), (int, float)) and p["stop_pct"]:
+                p["stop"] = round(float(entry) * (1 - _d0 * float(p["stop_pct"]) / 100.0), 10)
+                p["stop_src"] = "百分比止损 %.2f%%" % float(p["stop_pct"])
+                log("   ↳ 百分比止损 %.2f%% → 止损位 %.8g" % (float(p["stop_pct"]), p["stop"]))
+            elif tps:
+                _tp1 = min(tps, key=lambda t: abs(float(t) - float(entry)))
+                _dist = abs(float(_tp1) - float(entry))
+                if _dist > 0:
+                    p["stop"] = round(float(entry) - _d0 * _dist / 2.0, 10)
+                    p["stop_src"] = "按第一止盈 %.8g 反推(2:1)" % float(_tp1)
+                    log("   ↳ 博主未给止损 → 按第一止盈 %.8g 的一半反推止损 %.8g（2:1）"
+                        % (float(_tp1), p["stop"]))
         if p["stop"] is None and not tps:
             notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
@@ -901,6 +1058,13 @@ def finalize_pending(open_pos):
             if len(_allc) >= 2:
                 _why = ("这条消息里出现了 %d 个币种（%s），属于笼统总结，"
                         "机器人无法确定每个价格属于哪个币" % (len(_allc), "、".join(sorted(_allc)[:6])))
+        # 「头仓 + 分批」同时出现时，分几笔、每笔多少钱是不确定的 → 问用户
+        # 注意：不要匹配「第一笔/第二笔」—— 那只是用户在数分批的笔数（规则4的标准写法）
+        if _why is None and p.get("legs"):
+            _t0 = p["texts"][0] if p["texts"] else ""
+            if re.search(r"头仓|首仓|底仓|试仓", _t0):
+                _why = ("同时出现「头仓/首仓」和「分批」，机器人无法确定总共分几笔、每笔多少保证金"
+                        "（识别到 %d 个点位 %s）" % (len(p["legs"]), p["legs"]))
         if _why:
             ask_user(coin, p, _why)
             PENDING.pop(coin, None)
@@ -1197,12 +1361,14 @@ HELP_TEXT = """【机器人指令】在「开单记录」群直接发这些词�
 · 开 / 不开 —— 把握不准时机器人会问你，回「开」才开单、回「不开」作废"""
 
 def load_runtime():
-    global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE
+    global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE, STRICT_LIMIT_GROUPS
     try:
         if os.path.exists(RUNTIME):
             cfg = json.load(open(RUNTIME, encoding="utf-8"))
             if cfg.get("groups"):
                 GROUPS = [g for g in cfg["groups"] if g]
+            if "strict_limit_groups" in cfg:
+                STRICT_LIMIT_GROUPS = [g for g in (cfg.get("strict_limit_groups") or []) if g]
             if cfg.get("margin"):
                 MARGIN = float(cfg["margin"])
             if cfg.get("leverage"):
@@ -1214,8 +1380,9 @@ def load_runtime():
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
                 bexec.LEV = LEV
-            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 真实下单层=%s"
-                % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE, _be_mode()))
+            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s"
+                % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE,
+                   "、".join(STRICT_LIMIT_GROUPS) or "无", _be_mode()))
     except Exception as e:
         log("读取运行配置失败: " + str(e)[:80])
 
@@ -1227,9 +1394,11 @@ def save_runtime():
         except Exception:
             pass
         out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE}
-        # ⚠️ 必须保留 live_trading：否则任何一条指令（改金额/改杠杆/改监控群）都会把实盘开关悄悄抹掉
+        # ⚠️ 必须保留 live_trading / strict_limit_groups：否则任何一条指令都会把它们悄悄抹掉
         if "live_trading" in _old:
             out["live_trading"] = _old["live_trading"]
+        if "strict_limit_groups" in _old:
+            out["strict_limit_groups"] = _old["strict_limit_groups"]
         json.dump(out, open(RUNTIME, "w"), ensure_ascii=False, indent=1)
         STATE_DIRTY[0] = True
     except Exception as e:
