@@ -726,6 +726,18 @@ _CLOSE_ANNOUNCE = re.compile(
     r"止盈(达成|已到|命中|触发|到位)|止损(达成|已到|被扫|触发|到位)|"
     r"已平仓|平仓完成|结单|全部平仓|已止盈|已止损)", re.I)
 
+# ===== 价格合理性阈值（2026-09-14 新增）=====
+# 事故：暴富龙一条消息混了 BTC/以太坊/Giggle 三个币，fast_parse 把【以太坊的区间】和
+# 【Giggle 的止盈】错配给 BTC，于是 开仓价 2540（而 BTC 市价 77760）、止损 38，
+# 2R 兜底算出止盈 7582.1 → 止盈早已越过 → 秒平、记 +1773U 假盈利。
+MAX_ENTRY_DEV = 0.20     # 解析出的开仓价与市价偏离超过 20% → 判为解析错误
+MAX_STOP_PCT = 0.40      # 止损距离开仓价超过 40% → 判为荒谬
+MIN_STOP_PCT = 0.0005    # 止损距离小于 0.05% → 等于没设止损
+
+# ===== 待人工确认（用户 2026-09-14：把握不准必须问我，回「开」才开）=====
+ASKING = {}              # coin -> {p, reason, ask_ts, txt}
+ASK_TIMEOUT = 1800       # 30 分钟没回复自动作废
+
 
 def fallback_tp_2r(entry, stop, dirc, mult=R_FALLBACK_MULT):
     """只有开仓价+止损、没有止盈时，按 2:1 盈亏比推出第一档止盈价。
@@ -737,6 +749,53 @@ def fallback_tp_2r(entry, stop, dirc, mult=R_FALLBACK_MULT):
         return None
     t = float(entry) + mult * r if str(dirc).upper() == "LONG" else float(entry) - mult * r
     return round(t, 10)
+
+def find_all_coins(txt):
+    """找出文本里出现的【所有】币安 USDT-M 币种 —— 用来识别"一条消息混了多个币"的笼统总结。
+    事故教训：暴富龙的「9.14视频总结」里 BTC/以太坊/Giggle 混在一起，fast_parse 把
+    以太坊的区间、Giggle 的止盈都算到了 BTC 头上。"""
+    hits = set()
+    t = txt or ""
+    for k, v in _NAME_MAP.items():
+        if len(k) >= 2 and k in t:
+            hits.add(v)
+    for s in _SYMS:
+        if len(s) >= 2 and not s.isdigit() and re.search(
+                r"(?<![A-Za-z0-9])" + re.escape(s) + r"(?![A-Za-z0-9])", t, re.I):
+            hits.add(s)
+    return hits
+
+
+def ask_user(coin, p, reason):
+    """把握不准 → 挂起并询问用户。回「开」才开单，回「不开」作废。"""
+    ASKING[coin] = {"p": p, "reason": reason, "ask_ts": time.time(),
+                    "txt": (p["texts"][0][:300] if p.get("texts") else "")}
+    d = 1 if (p.get("dir") or "LONG").upper() == "LONG" else -1
+    tps = sorted(set(p.get("tps") or []))
+    notify("\n".join([
+        "【信号·待你确认】%s %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"),
+        "⚠️ 把握不准的原因：%s" % reason,
+        "解析结果：开仓=%s ｜ 止损=%s ｜ 止盈=%s"
+        % (p.get("entry") if p.get("entry") is not None else "未读到",
+           p.get("stop") if p.get("stop") is not None else "未读到",
+           tps if tps else "未读到"),
+        "原文：%s" % (p["texts"][0][:180] if p.get("texts") else ""),
+        "",
+        "**回复「开」= 按上面这组参数开单；回复「不开」= 作废。**",
+        "（%d 分钟内没回复自动作废）" % (ASK_TIMEOUT // 60)]))
+    log("   ❓ 已挂起等用户确认：%s（%s）" % (coin, reason))
+
+
+def expire_asking():
+    """超时未回复的待确认信号自动作废"""
+    now = time.time()
+    for c in list(ASKING):
+        if now - ASKING[c].get("ask_ts", now) > ASK_TIMEOUT:
+            ASKING.pop(c, None)
+            notify("【信号·待确认】%s 超过 %d 分钟没回复，已自动作废（未下单）"
+                   % (c, ASK_TIMEOUT // 60))
+            log("   ⏰ 待确认信号 %s 超时作废" % c)
+
 
 def finalize_pending(open_pos):
     """到点或信息齐全 -> 出单；信息不足 -> 只发提醒，绝不猜价"""
@@ -817,6 +876,35 @@ def finalize_pending(open_pos):
             if len(_good) != len(tps):
                 log("   ↳ 剔除方向不对的止盈位：%s" % [t for t in tps if t not in _good])
             tps = _good
+        # ===== 价格合理性校验 + 多币种混判 → 一律【询问用户】而不是猜（2026-09-14 用户要求）=====
+        # 事故复刻：开仓价 2540（BTC 市价 77760）/ 止损 38 / 止盈 7582.1 → 秒平记 +1773U 假盈利
+        _why = None
+        if isinstance(entry, (int, float)) and entry and mkt:
+            _dev = abs(float(entry) - float(mkt)) / float(mkt)
+            if _dev > MAX_ENTRY_DEV:
+                _why = ("解析出的开仓价 %.8g 与当前市价 %.8g 相差 %.0f%%（超过 %.0f%%），"
+                        "像是把别的币的价格串过来了" % (entry, mkt, _dev * 100, MAX_ENTRY_DEV * 100))
+        if _why is None and isinstance(p["stop"], (int, float)) and p["stop"] and isinstance(entry, (int, float)) and entry:
+            _sp = abs(float(p["stop"]) - float(entry)) / float(entry)
+            if _sp > MAX_STOP_PCT:
+                _why = "止损距入场价 %.0f%%（超过 %.0f%%，不像真的止损）" % (_sp * 100, MAX_STOP_PCT * 100)
+            elif _sp < MIN_STOP_PCT:
+                _why = "止损几乎等于入场价（距离仅 %.3f%%），等于没设止损" % (_sp * 100)
+        if _why is None and tps and isinstance(mkt, (int, float)) and mkt:
+            _crossed = [t for t in tps
+                        if (float(t) <= float(mkt) if dirc0 == "LONG" else float(t) >= float(mkt))]
+            if _crossed:
+                _why = ("止盈位 %s 已经被当前市价 %.8g 越过 —— 信号已过期，或价格张冠李戴"
+                        % (_crossed, mkt))
+        if _why is None:
+            _allc = find_all_coins(p["texts"][0] if p["texts"] else "")
+            if len(_allc) >= 2:
+                _why = ("这条消息里出现了 %d 个币种（%s），属于笼统总结，"
+                        "机器人无法确定每个价格属于哪个币" % (len(_allc), "、".join(sorted(_allc)[:6])))
+        if _why:
+            ask_user(coin, p, _why)
+            PENDING.pop(coin, None)
+            continue
         # ===== 止盈档位排序（关键）=====
         # 必须按【离入场价由近到远】排，不能按数值大小排：
         # 做空的「第一止盈74500 / 第二止盈70500」按数值升序会变成 70500 在先，
@@ -1103,7 +1191,10 @@ HELP_TEXT = """【机器人指令】在「开单记录」群直接发这些词�
 · 修改监控群 开单记录,暴富龙,UA-nurseneil2
 · 修改金额 300 / 修改杠杆 3
 · 测试模式 开 / 测试模式 关 —— 是否忽略 5 笔上限
-· 实盘模式 开 确认 / 实盘模式 关 —— 真实下单层开关（默认影子：只记录计划不发单）"""
+· 实盘模式 开 确认 / 实盘模式 关 —— 真实下单层开关（默认影子：只记录计划不发单）
+· 挂单情况 —— 列出当前挂单 + 待确认信号 + 各持仓的止损止盈
+· 待确认 —— 重发当前等你确认的信号
+· 开 / 不开 —— 把握不准时机器人会问你，回「开」才开单、回「不开」作废"""
 
 def load_runtime():
     global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE
@@ -1208,6 +1299,39 @@ def close_position(coin, pct=100.0, why="手动指令"):
         notify("【已减仓·纸面】%s %s（%s）@%.8g\n本次平掉 %.0f%% · 盈亏 %+.1fU · 剩余 %.0f%%"
                % (coin, tr["dir"], why, px, part * 100, pnl, tr["remaining"] * 100))
 
+def _handle_ask(verb, coin_hint=""):
+    """处理用户的「开 / 不开」回复。返回 True 表示这是一条指令。"""
+    # 找出要处理的待确认信号：指定币种优先，否则取最近挂起的那一个
+    coin = None
+    if coin_hint:
+        for c in ASKING:
+            if c.upper() == coin_hint or c.upper().startswith(coin_hint):
+                coin = c
+                break
+        if coin is None:
+            notify("【指令】没有 %s 的待确认信号。当前待确认：%s"
+                   % (coin_hint, "、".join(ASKING) or "无"))
+            return True
+    elif ASKING:
+        coin = max(ASKING, key=lambda c: ASKING[c].get("ask_ts", 0))
+    else:
+        notify("【指令】当前没有待确认的信号")
+        return True
+
+    item = ASKING.pop(coin)
+    p = item["p"]
+    if verb in ("不开", "作废"):
+        notify("【指令】已作废 %s 的待确认信号（未下单）" % coin)
+        log("   ❌ 用户选择不开：%s" % coin)
+        return True
+    # 用户说「开」→ 把信号放回待确认池，走正常出单流程
+    p["deadline"] = 0                 # 立刻处理，不再等合并窗口
+    PENDING[coin] = p
+    notify("【指令】收到「开」→ %s 立刻按解析结果出单（保证金 %.0fU × %d倍）" % (coin, MARGIN, LEV))
+    log("   ✅ 用户确认开单：%s，放回待确认池立即出单" % coin)
+    return True
+
+
 def handle_command(txt):
     """返回 True 表示这条消息是指令（已处理，不再走信号流程）"""
     global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE
@@ -1216,10 +1340,17 @@ def handle_command(txt):
         return False
     KEY = ["帮助", "状态", "持仓情况", "持仓", "全部平仓", "确认全部平仓", "平仓", "减仓",
            "修改止损", "移保本", "暂停", "继续", "修改监控群", "修改金额", "修改杠杆", "测试模式",
-           "实盘模式"]
+           "实盘模式", "挂单情况", "挂单", "待确认"]
     # 去掉可能的昵称/时间前缀后，指令必须在消息开头（防止转发内容被误当指令）
     nick = lambda x: re.sub(r"^[^\s]{2,16}\s+", "", x)
     tm = lambda x: re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x, flags=re.I).strip()
+    # ===== 「开 / 不开」确认（用户 2026-09-14 要求：把握不准必须问他）=====
+    # 用**严格全匹配**且要求极短，避免"开单记录"这类正常文字被误当指令。
+    _ct = (tm(t) or t).strip()
+    if len(_ct) <= 16:
+        _m = re.fullmatch(r"(不开|作废|开单|开)[\s:：]*([A-Za-z0-9]{2,12})?", _ct)
+        if _m:
+            return _handle_ask(_m.group(1), (_m.group(2) or "").upper())
     body = None
     for cand in (t, tm(t), nick(t), tm(nick(t)), nick(tm(t))):
         if any(cand.startswith(k) for k in KEY):
@@ -1257,6 +1388,54 @@ def handle_command(txt):
         else:
             for c in list(open_pos_ref):
                 pos_report(c, open_pos_ref[c])
+    elif cmd.startswith("挂单情况") or cmd.startswith("挂单"):
+        # 用户 2026-09-14 要求：挂单情况也要能查（Giggle 那单看不到是否挂上了）
+        L = ["【挂单情况】"]
+        if ASKING:
+            L.append("· 待你确认的信号 %d 个：" % len(ASKING))
+            for c, it in ASKING.items():
+                L.append("   %s %s ｜ 原因：%s" % (c, (it["p"].get("dir") or ""), it.get("reason", "")))
+        else:
+            L.append("· 待你确认的信号：无")
+        if PENDING:
+            L.append("· 正在合并中的信号 %d 个：%s" % (len(PENDING), "、".join(PENDING)))
+        if _BEXEC_OK:
+            L.append("· 真实层挂单（%s模式）：" % _be_mode())
+            try:
+                _oo = bexec.open_orders() or []
+                _ao = bexec.open_algo_orders() or []
+                if not _oo and not _ao:
+                    L.append("   币安账户上当前没有挂单")
+                for o in _oo:
+                    L.append("   经典 %s %s 价 %s 量 %s" % (o.get("symbol"), o.get("type"),
+                                                          o.get("price"), o.get("origQty")))
+                for o in _ao:
+                    L.append("   Algo %s %s 触发价 %s 量 %s"
+                             % (o.get("symbol"), o.get("type") or o.get("orderType"),
+                                o.get("triggerPrice") or o.get("stopPrice"),
+                                o.get("quantity") or o.get("origQty")))
+            except Exception as _e:
+                L.append("   读取失败：%s" % str(_e)[:100])
+        else:
+            L.append("· 真实下单层未加载")
+        L.append("· 持仓 %d 笔：%s" % (len(open_pos_ref), "、".join(open_pos_ref) or "无"))
+        # 纸面模式下把"本该挂在哪"也列出来，方便核对
+        for c, tr in list(open_pos_ref.items()):
+            _tps = tr.get("tps") or []
+            _fl = tr.get("filled", [])
+            L.append("   %s：止损 %s ｜ 止盈 %s（已成交 %s）"
+                     % (c, tr.get("sl"), _tps or "未读到", _fl or "无"))
+        notify("\n".join(L))
+    elif cmd.startswith("待确认"):
+        if not ASKING:
+            notify("【指令】当前没有待你确认的信号")
+        else:
+            for c, it in ASKING.items():
+                p = it["p"]
+                notify("【待确认】%s %s\n原因：%s\n解析：开仓=%s 止损=%s 止盈=%s\n原文：%s\n回复「开」或「不开」"
+                       % (c, p.get("dir"), it.get("reason"), p.get("entry"), p.get("stop"),
+                          sorted(set(p.get("tps") or [])) or "未读到",
+                          (p["texts"][0][:150] if p.get("texts") else "")))
     elif cmd.startswith("全部平仓") or cmd.startswith("确认全部平仓"):
         if not open_pos_ref:
             notify("【指令】当前没有持仓")
@@ -1905,6 +2084,11 @@ def main():
                     notify("【跟单机器人】配置已热加载（未重启，无盲窗）\n监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s%s"
                            % (_new[0], _new[1], _new[2], _new[3],
                               ("\n" + "；".join(_chg)) if _chg else ""))
+            # 待确认信号超时作废
+            try:
+                expire_asking()
+            except Exception as e:
+                log("待确认超时处理异常 " + str(e)[:80])
             # 待确认池：信息齐全就出单，到点还没齐也只发提醒（绝不猜价）
             try:
                 finalize_pending(open_pos)
