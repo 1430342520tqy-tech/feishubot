@@ -717,6 +717,15 @@ R_FALLBACK_PART = 1.0
 UNIDENT_NOTIFY_COOLDOWN = 600
 _UNIDENT_NOTIFY = {}         # 群 -> 上次通报时间戳
 
+# 博主的【结单/止盈止损已触发】通报 —— 这类消息**绝不能开新仓**。
+# 实例（2026-09-14 08:00 UA群）："Trade Closed — DOGE/USDT LONG ... Stop loss hit at $0.08280"
+#   被抽成 方向=LONG + 止损=0.0828 而市价 0.08238 → 止损落在入场价上方 → 秒平并记假盈利。
+_CLOSE_ANNOUNCE = re.compile(
+    r"(trade\s+closed|stop[ -]?loss\s+hit|sl\s+hit|stopped\s+out|tp\s?\d?\s*hit|"
+    r"take[ -]?profit\s+hit|target\s+hit|hit\s+at|closed\s+at|profit\s+taken|"
+    r"止盈(达成|已到|命中|触发|到位)|止损(达成|已到|被扫|触发|到位)|"
+    r"已平仓|平仓完成|结单|全部平仓|已止盈|已止损)", re.I)
+
 
 def fallback_tp_2r(entry, stop, dirc, mult=R_FALLBACK_MULT):
     """只有开仓价+止损、没有止盈时，按 2:1 盈亏比推出第一档止盈价。
@@ -784,6 +793,30 @@ def finalize_pending(open_pos):
             notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
+        # ===== 止损/止盈【方向合理性校验】（2026-09-14 新增；对真单是保命检查）=====
+        # 实例：08:00 UA 群博主发的是「Trade Closed — DOGE/USDT LONG ... Stop loss hit at $0.08280」，
+        #   从这句话里被抽出 方向=LONG、止损=0.0828，而市价是 0.08238 →
+        #   做多的"止损"却落在入场价【上方】→ 一开仓立刻满足止损条件 → 秒平，还记了一笔 +4.6U 的**假盈利**。
+        # 真单场景下这更危险：STOP_MARKET 挂错边会被币安拒绝，或触发即成交。
+        if isinstance(p["stop"], (int, float)) and p["stop"] and isinstance(entry, (int, float)) and entry:
+            if dirc0 == "LONG" and float(p["stop"]) >= float(entry):
+                notify("【信号·拒绝】%s 做多\n止损价 %.8g **不低于** 入场价 %.8g —— 做多的止损必须在下方，"
+                       "判为解析错误，**不下单**\n原文：%s"
+                       % (coin, p["stop"], entry, (p["texts"][0][:160] if p["texts"] else "")))
+                log("   ⛔ 止损方向不对（做多但止损≥入场 %.8g），拒绝出单" % entry)
+                PENDING.pop(coin, None); continue
+            if dirc0 == "SHORT" and float(p["stop"]) <= float(entry):
+                notify("【信号·拒绝】%s 做空\n止损价 %.8g **不高于** 入场价 %.8g —— 做空的止损必须在上方，"
+                       "判为解析错误，**不下单**\n原文：%s"
+                       % (coin, p["stop"], entry, (p["texts"][0][:160] if p["texts"] else "")))
+                log("   ⛔ 止损方向不对（做空但止损≤入场 %.8g），拒绝出单" % entry)
+                PENDING.pop(coin, None); continue
+        # 止盈方向同理：做多的止盈必须在上方、做空必须在下方 → 方向不对的直接剔除
+        if tps and isinstance(entry, (int, float)) and entry:
+            _good = [t for t in tps if (float(t) > float(entry) if dirc0 == "LONG" else float(t) < float(entry))]
+            if len(_good) != len(tps):
+                log("   ↳ 剔除方向不对的止盈位：%s" % [t for t in tps if t not in _good])
+            tps = _good
         # ===== 止盈档位排序（关键）=====
         # 必须按【离入场价由近到远】排，不能按数值大小排：
         # 做空的「第一止盈74500 / 第二止盈70500」按数值升序会变成 70500 在先，
@@ -1760,6 +1793,17 @@ def main():
                             continue
                         if _act:
                             notify("【博主指令】%s\n群：%s  时间：%s\n动作：%s\n原文：%s" % (coin or "?", g, when, _act, txt[:200]))
+                            continue
+                        # ===== 结单/止盈止损通报：只回报自己的持仓，【绝不开新仓】=====
+                        # 博主常把「Trade Closed / Stop loss hit at X」当成一条消息发出来，
+                        # 里面既有币种也有方向也有价格，很容易被当成开单信号 —— 必须挡在这里。
+                        if _CLOSE_ANNOUNCE.search(txt):
+                            log("   ↳ 判定为【结单/止损通报】，不建仓：%s" % txt[:90])
+                            if coin and coin in open_pos:
+                                try:
+                                    pos_report(coin, open_pos[coin])
+                                except Exception as _e:
+                                    log("   持仓汇报失败 " + str(_e)[:80])
                             continue
                         if coin and dirc in ("LONG", "SHORT"):
                             # 开单信号 -> 进待确认池，等同一条信号的后续消息（卡片/图）补齐
