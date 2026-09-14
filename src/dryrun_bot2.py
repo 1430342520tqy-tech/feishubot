@@ -123,6 +123,90 @@ def _be_mode():
         return "影子"
 
 
+# ===== 成交监听（用户 2026-09-14：明天要进实盘）=====
+# 限价入场是【异步】的：挂上去要等价格回踩才知道成交，而**没持仓时挂止盈/止损会被币安拒**。
+# 所以：限价入场 → 只下入场腿 → 登记到 ENTRY_WATCH → 轮询成交 → 成交后挂止盈(限价)+止损(Algo)。
+ENTRY_WATCH = {}          # coin -> {sym, dir, order_ids, tps, stop, deadline, assumed_entry}
+FILL_TIMEOUT = 1800       # 30 分钟没成交 → 撤单并通知你
+_WATCH_NOTIFIED = set()   # 通知去重
+
+
+def watch_entries():
+    """轮询限价入场的成交情况。只在【实盘模式】有意义（影子模式没有真实委托）。"""
+    if not _BEXEC_OK or not bexec.LIVE[0] or not ENTRY_WATCH:
+        return
+    now = time.time()
+    for coin in list(ENTRY_WATCH):
+        w = ENTRY_WATCH[coin]
+        try:
+            filled_qty, filled_notional, any_live = 0.0, 0.0, False
+            for oid in w.get("order_ids") or []:
+                st, err = bexec.order_status(w["sym"], oid)
+                if err or not st:
+                    any_live = True
+                    continue
+                fq = float(st.get("executedQty") or 0)
+                ap = float(st.get("avgPrice") or 0)
+                if fq > 0:
+                    filled_qty += fq
+                    filled_notional += fq * (ap or w.get("assumed_entry") or 0)
+                if st.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                    any_live = True
+            avg_px = (filled_notional / filled_qty) if filled_qty else 0.0
+
+            if filled_qty > 0 and not any_live:
+                # ===== 成交完成 → 挂止盈 + 止损 =====
+                _tps = [t for t in (w.get("tps") or [])]
+                for t in _tps:      # 数量按实际成交量重算
+                    try:
+                        t["qty"] = bexec.fmt_qty(w["sym"], filled_qty / max(len(_tps), 1))
+                    except Exception:
+                        pass
+                bexec.after_entry_filled(w["sym"], w["dir"], _tps, w.get("stop"), filled_qty)
+                _tr = open_pos_ref.get(coin)
+                if _tr is not None:
+                    _tr["entry"] = avg_px or _tr.get("entry")
+                    _tr["pending_fill"] = False
+                    _tr["fill_qty"] = filled_qty
+                    _tr["fill_px"] = avg_px
+                    STATE_DIRTY[0] = True
+                notify("【实盘·成交】%s %s 限价单已成交\n成交均价 %.8g ｜ 数量 %s\n"
+                       "已挂：止盈 %d 档（限价）+ 止损 %s（Algo STOP_MARKET）"
+                       % (coin, w["dir"], avg_px, filled_qty,
+                          len(_tps), w.get("stop")))
+                log("   ✅ [实盘成交] %s 均价 %.8g 数量 %s → 已挂止盈/止损" % (coin, avg_px, filled_qty))
+                ENTRY_WATCH.pop(coin, None)
+            elif filled_qty > 0 and any_live and now > w["deadline"]:
+                # 部分成交且超时：保留已成交部分，撤掉剩余，并告知
+                try:
+                    bexec.cancel_all(w["sym"])
+                except Exception:
+                    pass
+                notify("【实盘·部分成交】%s 数量 %s 已成交（均价 %.8g），剩余挂单已撤销。\n"
+                       "止盈止损将按已成交量挂出。" % (coin, filled_qty, avg_px))
+                bexec.after_entry_filled(w["sym"], w["dir"], w.get("tps"),
+                                         w.get("stop"), filled_qty)
+                ENTRY_WATCH.pop(coin, None)
+            elif now > w["deadline"]:
+                # 完全没成交 → 撤单并通知
+                try:
+                    bexec.cancel_all(w["sym"])
+                except Exception:
+                    pass
+                ENTRY_WATCH.pop(coin, None)
+                _tr = open_pos_ref.get(coin)
+                if _tr is not None:
+                    open_pos_ref.pop(coin, None)
+                    STATE_DIRTY[0] = True
+                notify("【实盘·未成交】%s %s 的限价单挂了 %d 分钟仍未成交，已自动撤单（未开仓）。\n"
+                       "挂单价：%s ｜ 期间市价未回踩"
+                       % (coin, w["dir"], FILL_TIMEOUT // 60,
+                          [l.get("price") for l in (w.get("legs") or [])] or w.get("assumed_entry")))
+                log("   ⏰ [实盘未成交] %s 超时撤单" % coin)
+        except Exception as e:
+            log("   成交监听异常 %s: %s" % (coin, str(e)[:120]))
+
+
 def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
     """开仓 → 交给真实下单层生成完整计划（市价/限价腿 + 各档止盈 + Algo 止损）"""
     if not _BEXEC_OK:
@@ -868,12 +952,30 @@ def fallback_tp_2r(entry, stop, dirc, mult=R_FALLBACK_MULT):
     t = float(entry) + mult * r if str(dirc).upper() == "LONG" else float(entry) - mult * r
     return round(t, 10)
 
+def strip_sender_prefix(txt):
+    """去掉飞书行首的【发送者显示名 + 时间】。
+    事故（2026-09-14）：SCAN_JS 抓的是整行 innerText，开头是发送者名「自定义机器人 BOT」，
+    而 BOT 恰好是币安真实交易对 → 被 find_all_coins 当成第 3 个币种，误判成"多币种总结"。
+    所以解析前必须把发送者名剥掉。"""
+    t = txt or ""
+    # ① 本群转发机器人固定显示名
+    t = re.sub(r"^\s*自定义机器人\s*BOT\s*", "", t)
+    # ② 通过 webhook 转发时带的那句话
+    t = re.sub(r"^\s*通过webhook将自定义服务的消息推送至飞书\s*", "", t)
+    # ③ 通用：昵称(2~16个非空白字符) + 时间
+    t = re.sub(r"^\s*\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", t, flags=re.I)
+    t = re.sub(r"^[^\s]{2,16}\s+(?=\d{1,2}:\d{2}\s*(AM|PM)?)", "", t, flags=re.I)
+    # ④ 再兜一次时间前缀
+    t = re.sub(r"^\s*\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", t, flags=re.I)
+    return t.strip()
+
+
 def find_all_coins(txt):
     """找出文本里出现的【所有】币安 USDT-M 币种 —— 用来识别"一条消息混了多个币"的笼统总结。
     事故教训：暴富龙的「9.14视频总结」里 BTC/以太坊/Giggle 混在一起，fast_parse 把
     以太坊的区间、Giggle 的止盈都算到了 BTC 头上。"""
     hits = set()
-    t = txt or ""
+    t = strip_sender_prefix(txt)
     for k, v in _NAME_MAP.items():
         if len(k) >= 2 and k in t:
             hits.add(v)
@@ -884,10 +986,34 @@ def find_all_coins(txt):
     return hits
 
 
-def ask_user(coin, p, reason):
-    """把握不准 → 挂起并询问用户。回「开」才开单，回「不开」作废。"""
+def split_by_coin(txt):
+    """把一条多币种消息按句切成【每币一段】—— 「原油Cl跌破97空…。 Sol突破102.5多…。」
+    返回 [(币种, 该段原文), ...]"""
+    t = strip_sender_prefix(txt)
+    out, seen = [], set()
+    for seg in re.split(r"[。；;！!？?\n]+", t):
+        seg = seg.strip()
+        if not seg:
+            continue
+        cs = sorted(find_all_coins(seg))
+        if not cs:
+            continue
+        c = cs[0]                      # 一句话里只认第一个币（其余交给 AI 兜）
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append((c, seg))
+    return out
+
+
+def ask_user(coin, p, reason, quiet=False):
+    """把握不准 → 挂起并询问用户。回「开」才开单，回「不开」作废。
+    quiet=True 时只挂起、不发单独通知（多币种消息由调用方汇总成一条）。"""
     ASKING[coin] = {"p": p, "reason": reason, "ask_ts": time.time(),
                     "txt": (p["texts"][0][:300] if p.get("texts") else "")}
+    if quiet:
+        log("   ❓ 已挂起等用户确认：%s（%s）" % (coin, reason))
+        return
     d = 1 if (p.get("dir") or "LONG").upper() == "LONG" else -1
     tps = sorted(set(p.get("tps") or []))
     notify("\n".join([
@@ -1158,6 +1284,17 @@ def finalize_pending(open_pos):
         tr["real_layer"] = _be_mode()
         _rplan = real_plan_open(coin, dirc, entry, p["stop"], tps)   # 影子模式：只生成计划
         tm["order"] = time.time() - t_order
+        # 实盘 + 限价入场 → 登记成交监听（没成交前不跟踪止盈止损）
+        if _rplan and _rplan.get("watch_fill"):
+            ENTRY_WATCH[coin] = {"sym": coin.upper() + "USDT", "dir": dirc,
+                                 "order_ids": _rplan.get("order_ids") or [],
+                                 "tps": _rplan.get("tps") or [], "stop": p["stop"],
+                                 "legs": _rplan.get("entry_legs") or [],
+                                 "assumed_entry": entry,
+                                 "deadline": time.time() + FILL_TIMEOUT}
+            tr["pending_fill"] = True
+            log("   ↳ [实盘] 限价单已挂出，等待成交（%d 分钟内未成交会自动撤单并通知）"
+                % (FILL_TIMEOUT // 60))
         if _rplan:
             log("   ↳ [真实下单层·%s] 已生成下单计划（市价/限价腿 + %d 档止盈 + Algo 止损）"
                 % (_be_mode(), len(_rplan.get("tps") or [])))
@@ -1468,37 +1605,119 @@ def close_position(coin, pct=100.0, why="手动指令"):
         notify("【已减仓·纸面】%s %s（%s）@%.8g\n本次平掉 %.0f%% · 盈亏 %+.1fU · 剩余 %.0f%%"
                % (coin, tr["dir"], why, px, part * 100, pnl, tr["remaining"] * 100))
 
-def _handle_ask(verb, coin_hint=""):
-    """处理用户的「开 / 不开」回复。返回 True 表示这是一条指令。"""
-    # 找出要处理的待确认信号：指定币种优先，否则取最近挂起的那一个
-    coin = None
-    if coin_hint:
-        for c in ASKING:
-            if c.upper() == coin_hint or c.upper().startswith(coin_hint):
-                coin = c
-                break
-        if coin is None:
-            notify("【指令】没有 %s 的待确认信号。当前待确认：%s"
-                   % (coin_hint, "、".join(ASKING) or "无"))
-            return True
-    elif ASKING:
-        coin = max(ASKING, key=lambda c: ASKING[c].get("ask_ts", 0))
-    else:
-        notify("【指令】当前没有待确认的信号")
+def _reply_coins(s):
+    """从用户回复里找出币种（英文大小写 + 中文俗称都认）"""
+    found = []
+    for sym in _SYMS:
+        if len(sym) >= 2 and not sym.isdigit() and re.search(
+                r"(?<![A-Za-z0-9])" + re.escape(sym) + r"(?![A-Za-z0-9])", s, re.I):
+            found.append(sym)
+    for k, v in _NAME_MAP.items():
+        if len(k) >= 2 and k in s and v not in found:
+            found.append(v)
+    return found
+
+
+def _open_asking(coin):
+    """把待确认信号放回待确认池，立刻出单"""
+    it = ASKING.pop(coin, None)
+    if not it:
+        return False
+    p = it["p"]
+    p["deadline"] = 0
+    PENDING[coin] = p
+    return True
+
+
+def _waiting_batch():
+    """当前挂在待确认里的币种（同一批）"""
+    return sorted(ASKING)
+
+
+def _handle_ask_reply(t):
+    """处理「开 / 不开 / 只开X和Y / 只开X，不开Y和Z / 全部开 / 全部不开」。
+    用户 2026-09-14 要求：多币种消息要能【单独分开】指定开哪些。"""
+    if not ASKING:
+        notify("【指令】当前没有待你确认的信号")
+        return True
+    s = re.sub(r"\s+", " ", t).strip()
+    pend = _waiting_batch()
+
+    # ① 全部作废
+    if re.search(r"全部不开|全不开|都不开|都不要|全部作废|都作废", s):
+        n = len(pend)
+        for c in list(ASKING):
+            ASKING.pop(c, None)
+        notify("【指令】已作废全部 %d 个待确认信号（未下单）：%s" % (n, "、".join(pend)))
+        log("   ❌ 用户选择全部不开：%s" % pend)
         return True
 
-    item = ASKING.pop(coin)
-    p = item["p"]
-    if verb in ("不开", "作废"):
-        notify("【指令】已作废 %s 的待确认信号（未下单）" % coin)
-        log("   ❌ 用户选择不开：%s" % coin)
+    # ② 全部开
+    if re.search(r"全部开|全开|都开|全买|都买", s) and not _reply_coins(s):
+        for c in list(ASKING):
+            _open_asking(c)
+        notify("【指令】收到「全部开」→ %d 个信号立刻按解析结果出单：%s" % (len(pend), "、".join(pend)))
+        log("   ✅ 用户确认全部开单：%s" % pend)
         return True
-    # 用户说「开」→ 把信号放回待确认池，走正常出单流程
-    p["deadline"] = 0                 # 立刻处理，不再等合并窗口
-    PENDING[coin] = p
-    notify("【指令】收到「开」→ %s 立刻按解析结果出单（保证金 %.0fU × %d倍）" % (coin, MARGIN, LEV))
-    log("   ✅ 用户确认开单：%s，放回待确认池立即出单" % coin)
+
+    only = bool(re.search(r"只开|只买|只要|仅开|仅买", s))
+    excl = bool(re.search(r"不开|不要|别开|作废", s))
+    _parts = re.split(r"不开|不要|别开|作废", s, maxsplit=1)
+    head_list = _reply_coins(_parts[0])
+    tail_list = _reply_coins(_parts[1]) if len(_parts) > 1 else []
+
+    if only:
+        open_list = head_list
+        close_list = list(tail_list) + [c for c in pend if c not in open_list and c not in tail_list]
+    elif excl:
+        close_list = tail_list or head_list
+        open_list = []
+    else:
+        open_list = head_list
+        close_list = []
+
+    # 没点名币种：单条待确认时按「开」处理
+    if not open_list and not close_list:
+        if len(pend) == 1:
+            _open_asking(pend[0])
+            notify("【指令】收到「开」→ %s 立刻按解析结果出单" % pend[0])
+            return True
+        notify("【指令】当前有 %d 个待确认信号，请指明币种。例如：\n"
+               "· 只开 %s 和 %s\n· 只开 %s，不开 %s\n· 全部不开"
+               % (len(pend), pend[0], pend[1] if len(pend) > 1 else "XXX",
+                  pend[0], pend[1] if len(pend) > 1 else "XXX"))
+        return True
+
+    # 执行
+    opened, closed, unknown = [], [], []
+    for c in open_list:
+        if c in ASKING:
+            _open_asking(c); opened.append(c)
+        else:
+            unknown.append(c)
+    for c in close_list:
+        if c in ASKING:
+            ASKING.pop(c, None); closed.append(c)
+        elif c not in unknown:
+            unknown.append(c)
+    _msg = ["【指令】已按你的回复处理："]
+    if opened:
+        _msg.append("✅ 开单 %d 个：%s（按解析结果、保证金 %.0fU × %d倍）"
+                    % (len(opened), "、".join(opened), MARGIN, LEV))
+    if closed:
+        _msg.append("❌ 作废 %d 个：%s" % (len(closed), "、".join(closed)))
+    if unknown:
+        _msg.append("⚠️ 待确认里没有这些币：%s" % "、".join(unknown))
+    if ASKING:
+        _msg.append("仍待确认：%s" % "、".join(_waiting_batch()))
+    notify("\n".join(_msg))
+    log("   🎛 用户回复处理：开=%s 不开=%s 未知=%s" % (opened, closed, unknown))
     return True
+
+
+def _handle_ask(verb, coin_hint=""):
+    """兼容旧的「开 / 不开 [币种]」写法（现在统一走 _handle_ask_reply）"""
+    return _handle_ask_reply(("%s %s" % (verb, coin_hint)).strip())
 
 
 def handle_command(txt):
@@ -1513,13 +1732,17 @@ def handle_command(txt):
     # 去掉可能的昵称/时间前缀后，指令必须在消息开头（防止转发内容被误当指令）
     nick = lambda x: re.sub(r"^[^\s]{2,16}\s+", "", x)
     tm = lambda x: re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x, flags=re.I).strip()
-    # ===== 「开 / 不开」确认（用户 2026-09-14 要求：把握不准必须问他）=====
-    # 用**严格全匹配**且要求极短，避免"开单记录"这类正常文字被误当指令。
+    # ===== 「开 / 不开 / 只开X和Y」确认（用户 2026-09-14 要求：把握不准必须问他）=====
+    # 判定条件收紧，避免"开单记录""开始监控"这类正常文字被误当指令：
+    #   ① 回复里点出了币种名 + 含开/买/作废等动词，或
+    #   ② 整条就是「开/不开/全部开/全部不开/作废」这种极短词
     _ct = (tm(t) or t).strip()
-    if len(_ct) <= 16:
-        _m = re.fullmatch(r"(不开|作废|开单|开)[\s:：]*([A-Za-z0-9]{2,12})?", _ct)
-        if _m:
-            return _handle_ask(_m.group(1), (_m.group(2) or "").upper())
+    if len(_ct) <= 48:
+        _co = _reply_coins(_ct)
+        _is_reply = bool(_co and re.search(r"开|买|作废|不要", _ct)) or bool(re.fullmatch(
+            r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)", _ct))
+        if _is_reply:
+            return _handle_ask_reply(_ct)
     body = None
     for cand in (t, tm(t), nick(t), tm(nick(t)), nick(tm(t))):
         if any(cand.startswith(k) for k in KEY):
@@ -2024,7 +2247,7 @@ def main():
                         mid = r["id"]
                         t_sig = int(mid) >> 32
                         when = datetime.datetime.fromtimestamp(t_sig, CST).strftime("%m-%d %H:%M:%S")
-                        txt = r["text"]
+                        txt = strip_sender_prefix(r["text"])   # 去掉行首的发送者名（"自定义机器人 BOT" 里的 BOT 是真实交易对，会误导币种识别）
                         log("[%s] 发现新消息 | 发出=%s | %s" % (g, when, txt[:110]))
                         if int(mid) in SEEN:
                             log("   ↳ 该消息此前已处理过，跳过（防重复开单）")
@@ -2068,6 +2291,48 @@ def main():
                                 log("   媒体: 元素=%d 已加载=%d 抓到图=%d" % (r.get("nimg", 0), r.get("loaded", 0), len(imgs)))
                         t_img = time.time()
                         # ===== 方案C+D：本地正则先解析；需要 AI 时才调，且与读图并行 =====
+                        # ===== 多币种消息：按币拆开、各自解析，然后逐个问用户（用户 2026-09-14 要求）=====
+                        # 例：「原油Cl跌破97空，100.7止损，93止盈。 Sol突破102.5多，止损100，止盈107到110。」
+                        # 不再整条当成"笼统总结"丢掉，而是拆成 CL / SOL 两条独立信号请你逐个确认。
+                        _segs = split_by_coin(txt)
+                        if len(_segs) >= 2:
+                            log("   ↳ 多币种消息，按币拆开：%s" % [c for c, _ in _segs])
+                            _names = []
+                            for _c, _seg in _segs:
+                                _ci = fast_parse(_seg) or {}
+                                if (not _ci.get("direction")) or fast_parse_suspect(_seg, _ci):
+                                    _ai = parse_text(_seg) or {}
+                                    _ci = {**(_ci or {}), **{k: v for k, v in _ai.items()
+                                                             if v not in (None, [], "")}}
+                                _dir_ = (_ci.get("direction") or "").upper() or None
+                                if not _dir_:
+                                    log("   ↳ %s 段没解析出方向 → 只记录不询问" % _c)
+                                    continue
+                                PENDING.pop(_c, None)
+                                _pp = merge_pending(_c, g, info=_ci, txt=_seg,
+                                                    t_sig=t_sig, stamps={"found": t_found, "img": 0.0,
+                                                                         "parse": time.time(), "chart": 0.0})
+                                _pp["dir"] = _dir_
+                                _pp["group"] = g
+                                PENDING.pop(_c, None)
+                                _tt = sorted(set(_pp.get("tps") or []))
+                                ask_user(_c, _pp, "多币种消息，已按币拆开；本条解析结果如上，请你单独确认",
+                                         quiet=True)
+                                notify("· %s %s：开仓=%s 止损=%s 止盈=%s"
+                                       % (_c, "做多" if _dir_ == "LONG" else "做空",
+                                          _pp.get("entry") if _pp.get("entry") is not None else "未读到",
+                                          _pp.get("stop") if _pp.get("stop") is not None else "未读到",
+                                          _tt or "未读到"))
+                                _names.append(_c)
+                            if _names:
+                                _ex = ("、".join(_names[:2]))
+                                notify("【信号·多币种待确认】这条消息里有 %d 个币种，已分别解析（见上）。\n"
+                                       "请回复要开哪些，例如：\n"
+                                       "· 只开 %s\n· 只开 %s，不开 %s\n· 全部不开"
+                                       % (len(_names),
+                                          " 和 ".join(_names[:2]) if len(_names) > 1 else _names[0],
+                                          _names[0], _names[1] if len(_names) > 1 else "XXX"))
+                            continue
                         info = fast_parse(txt)
                         _fast = info
                         _suspect = fast_parse_suspect(txt, info)
@@ -2253,6 +2518,11 @@ def main():
                     notify("【跟单机器人】配置已热加载（未重启，无盲窗）\n监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s%s"
                            % (_new[0], _new[1], _new[2], _new[3],
                               ("\n" + "；".join(_chg)) if _chg else ""))
+            # 实盘限价入场的成交监听
+            try:
+                watch_entries()
+            except Exception as e:
+                log("成交监听异常 " + str(e)[:100])
             # 待确认信号超时作废
             try:
                 expire_asking()
@@ -2266,6 +2536,8 @@ def main():
             # 纸面持仓监控：分批止盈（每档平 1/3）+ TP1 后止损移保本
             try:
                 for coin, tr in list(open_pos.items()):
+                    if tr.get("pending_fill"):
+                        continue          # 实盘限价单还没成交 → 不跟踪止盈止损（等成交监听接管）
                     px = price_of(coin)
                     if px is None:
                         continue

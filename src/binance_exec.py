@@ -223,6 +223,14 @@ def open_orders(symbol=None):
     return _req("GET", "/fapi/v1/openOrders", p, signed=True)
 
 
+def order_status(symbol, order_id):
+    """查单笔订单状态（成交监听用）。返回 (订单dict, 错误字符串)"""
+    try:
+        return _req("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, signed=True), None
+    except BinanceError as e:
+        return None, str(e)
+
+
 def set_leverage(symbol, lev=LEV):
     return _req("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": lev}, signed=True)
 
@@ -466,16 +474,50 @@ def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=L
         plan["sl_note"] = "无止损 → 按底线规则不下单"
     audit("open_full_position_plan", plan)
     if LIVE[0]:
+        # ===== 先下入场腿 =====
+        _oids = []
+        _has_limit = any(l["kind"] != "market" for l in plan["entry_legs"])
         for leg in plan["entry_legs"]:
-            if leg["kind"] == "market":
-                market_open(symbol, dir_, leg["notional"], lev)
-            else:
-                limit_open(symbol, dir_, float(leg["price"]), leg["notional"], lev)
+            try:
+                if leg["kind"] == "market":
+                    r = market_open(symbol, dir_, leg["notional"], lev)
+                else:
+                    r = limit_open(symbol, dir_, float(leg["price"]), leg["notional"], lev)
+                if isinstance(r, dict) and r.get("orderId"):
+                    _oids.append(r["orderId"])
+            except BinanceError as e:
+                audit("entry_leg_fail", {"leg": leg}, str(e))
+        plan["order_ids"] = _oids
+        if _has_limit:
+            # ⚠️ 限价入场必须【先等成交】再挂止盈止损：
+            #    没持仓时挂止损/止盈会被币安拒（或语义错误），所以交给成交监听接管。
+            plan["watch_fill"] = True
+            audit("await_fill", {"symbol": symbol, "order_ids": _oids,
+                                 "note": "等成交后再挂止盈/止损"})
+            return plan
         for t in plan["tps"]:
             place_tp_limit(symbol, dir_, float(t["price"]), float(t["qty"]))
         if plan.get("sl"):
             place_sl_stop_market(symbol, dir_, float(plan["sl"]["triggerPrice"]), tot_qty)
     return plan
+
+
+def after_entry_filled(symbol, dir_, tps, stop, qty):
+    """成交监听专用：入场成交后再挂止盈（限价）+ 止损（Algo STOP_MARKET）"""
+    out = {"tps": [], "sl": None}
+    for t in (tps or [])[:3]:
+        try:
+            out["tps"].append(place_tp_limit(symbol, dir_, float(t["price"]), float(t["qty"])))
+        except BinanceError as e:
+            out["tps"].append(str(e))
+    if stop:
+        try:
+            out["sl"] = place_sl_stop_market(symbol, dir_, float(stop), qty)
+        except BinanceError as e:
+            out["sl"] = str(e)
+    audit("after_entry_filled", {"symbol": symbol, "dir": dir_, "tps": tps,
+                                 "stop": stop, "qty": qty}, out)
+    return out
 
 
 # ============================ 自检 / 命令行 ============================
