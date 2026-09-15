@@ -254,6 +254,30 @@ def _risk_on_close(tr):
     return _hits
 
 
+# ===== 失联看门狗（2026-09-15，评估 M7）=====
+# 信号源是网页爬虫：飞书一次改版、登录态失效、页面异常，都可能让机器人"看起来在跑但什么都收不到"。
+# 之前没有任何机制告诉你"今天怎么没通知"。现在超过阈值没抓到任何新消息就主动告警。
+LAST_MSG_TS = [0.0]
+_SILENCE_ALERTED = [0.0]
+SILENCE_ALERT_H = 6.0     # 小时；可用 runtime_config 的 silence_alert_hours 改
+
+
+def watch_silence():
+    if not LAST_MSG_TS[0]:
+        return
+    silent = time.time() - LAST_MSG_TS[0]
+    if silent < SILENCE_ALERT_H * 3600:
+        return
+    if time.time() - _SILENCE_ALERTED[0] < 3600:      # 每小时最多提醒一次
+        return
+    _SILENCE_ALERTED[0] = time.time()
+    notify("⚠️【失联看门狗】已经 **%.1f 小时**没抓到任何新消息（阈值 %.0f 小时）。\n"
+           "可能是：① 这几个群真的安静 ② **飞书登录态失效 / 页面异常**（那就会漏信号）。\n"
+           "建议发一次「状态」看机器人是否还活着；不确定就重启一次机器人。"
+           % (silent / 3600.0, SILENCE_ALERT_H))
+    log("   ⚠️ 失联看门狗：%.1f 小时无新消息" % (silent / 3600.0))
+
+
 def startup_reconcile():
     """启动对账闸门：把纸面 state.json 的持仓与币安真实持仓逐条比对。
     不一致 → **阻止真实下单**（但继续监控 + 大声告警），需人工处理后再发「重新对账」清除。
@@ -1754,7 +1778,7 @@ HELP_TEXT = """【机器人指令】在「开单记录」或「机器人开单�
 
 def load_runtime():
     global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE, STRICT_LIMIT_GROUPS, MAX_OPEN
-    global MAX_CONSEC_LOSS, DAILY_LOSS_LIMIT, MAX_TOTAL_MARGIN
+    global MAX_CONSEC_LOSS, DAILY_LOSS_LIMIT, MAX_TOTAL_MARGIN, SILENCE_ALERT_H
     try:
         if os.path.exists(RUNTIME):
             cfg = json.load(open(RUNTIME, encoding="utf-8"))
@@ -1770,6 +1794,8 @@ def load_runtime():
                 DAILY_LOSS_LIMIT = float(cfg["daily_loss_limit"])
             if cfg.get("max_total_margin") is not None:
                 MAX_TOTAL_MARGIN = float(cfg["max_total_margin"])
+            if cfg.get("silence_alert_hours") is not None:
+                SILENCE_ALERT_H = float(cfg["silence_alert_hours"])
             if cfg.get("margin"):
                 MARGIN = float(cfg["margin"])
             if cfg.get("leverage"):
@@ -2597,6 +2623,7 @@ def main():
                         t_sig = int(mid) >> 32
                         when = datetime.datetime.fromtimestamp(t_sig, CST).strftime("%m-%d %H:%M:%S")
                         txt = strip_sender_prefix(r["text"])   # 去掉行首的发送者名（"自定义机器人 BOT" 里的 BOT 是真实交易对，会误导币种识别）
+                        LAST_MSG_TS[0] = time.time()           # 失联看门狗用：只要抓到任何一条消息就刷新
                         log("[%s] 发现新消息 | 发出=%s | %s" % (g, when, txt[:110]))
                         if int(mid) in SEEN:
                             log("   ↳ 该消息此前已处理过，跳过（防重复开单）")
@@ -2879,6 +2906,10 @@ def main():
                     watch_naked()
                 except Exception as e:
                     log("裸仓看门狗异常 " + str(e)[:100])
+                try:
+                    watch_silence()
+                except Exception as e:
+                    log("失联看门狗异常 " + str(e)[:100])
             # 待确认信号超时作废
             try:
                 expire_asking()
