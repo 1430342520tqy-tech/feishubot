@@ -200,8 +200,13 @@ def watch_naked():
 
 # ===== 风控闸门（2026-09-15，评估 P1）=====
 RISK = {"consec_loss": 0, "day": "", "day_pnl": 0.0, "day_trades": 0}
-MAX_CONSEC_LOSS = 3        # 连亏多少笔自动熔断（暂停交易并告警）
-DAILY_LOSS_LIMIT = 300.0   # 单日已实现净亏损上限（U），达到即熔断
+# ⚠️ 用户 2026-09-15 明确要求：熔断**按金额**，不按笔数 → MAX_CONSEC_LOSS 默认 0（=不启用）
+MAX_CONSEC_LOSS = 0           # 连亏笔数熔断：0 = 关闭（仅保留计数用于展示）
+# 单日净亏熔断（绝对金额）。**默认关闭**：用户 09-15 选了"按总敞口的百分比熔断"，
+# 若这里再留 300U，它会在 420U 之前先触发、让你选的规则失效（我实测踩到过）。要用就填数字。
+DAILY_LOSS_LIMIT = 0.0
+# **主熔断线**：总敞口上限（max_open × 保证金）的 20%。现在 7×300=2100U → 熔断线 420U
+LOSS_LIMIT_PCT = [0.20]
 MAX_TOTAL_MARGIN = 0.0     # 总敞口上限（U）；0 = 用 MAX_OPEN × MARGIN 推导
 
 # 启动对账闸门：state.json 与交易所不一致 → 阻止真实下单（但仍继续监控 + 告警）
@@ -245,10 +250,20 @@ def _risk_on_close(tr):
     else:
         RISK["consec_loss"] = 0
     _hits = []
+    # ===== 用户 2026-09-15 明确要求：熔断**按金额**，不按笔数 =====
+    # 基准 = 总敞口上限（max_open × 保证金，现在 7 × 300 = 2100U），亏到它的 20%（=420U）即熔断。
+    # 连亏笔数熔断已关闭（MAX_CONSEC_LOSS 默认 0 → 下面那个分支不再触发），
+    # 但计数仍保留用于「状态」展示。
     if MAX_CONSEC_LOSS > 0 and RISK["consec_loss"] >= MAX_CONSEC_LOSS:
         _hits.append("连续亏损 %d 笔（上限 %d）" % (RISK["consec_loss"], MAX_CONSEC_LOSS))
     if DAILY_LOSS_LIMIT > 0 and RISK["day_pnl"] <= -abs(DAILY_LOSS_LIMIT):
         _hits.append("今日已实现净亏损 %.2fU（上限 %.0fU）" % (RISK["day_pnl"], DAILY_LOSS_LIMIT))
+    _cap = _exposure_cap()
+    if LOSS_LIMIT_PCT[0] > 0 and _cap > 0:
+        _line = -abs(_cap * float(LOSS_LIMIT_PCT[0]))
+        if RISK["day_pnl"] <= _line:
+            _hits.append("今日已实现净亏损 %.2fU ｜ 熔断线 = 总敞口上限 %.0fU 的 %.0f%% = %.0fU"
+                         % (RISK["day_pnl"], _cap, float(LOSS_LIMIT_PCT[0]) * 100, abs(_line)))
     if _hits and not PAUSED[0]:
         PAUSED[0] = True
         STATE_DIRTY[0] = True
@@ -1261,16 +1276,28 @@ def verify_ai_numbers(txt, d):
     这是 AI 优先方案能成立的前提 —— 没有它，AI 编一个点位就会变成一笔真单。
     返回"在原文里找不到"的数字列表（空列表 = 全部有据可查）。"""
     t = (txt or "").replace(",", "").replace("$", "").replace("，", "")
-    bad = []
-    for v in _ai_numbers(d):
-        cands = set()
+    # ⚠️ 原文里的「74K」「1.2M」这类缩写也要算"有据可查"。
+    #    实测：原文写「74K」，AI 返回 74000，旧校验因为找不到 "74000" 而误判成"编造"。
+    #    ⚠️ 注意：展开值**不在原文里**（原文是"74K"），所以不能用"子串"判，必须用"数值相等"判。
+    _exp = []
+    for m in re.finditer(r"([0-9]*\.?[0-9]+)\s*([KkMm])", t):
         try:
-            cands.add(("%.8g" % v))
-            if abs(v - round(v)) < 1e-9:
-                cands.add(str(int(round(v))))
+            _exp.append(float(m.group(1)) * (1000.0 if m.group(2).lower() == "k" else 1000000.0))
         except Exception:
             pass
-        if not any(c and c in t for c in cands):
+    bad = []
+    for v in _ai_numbers(d):
+        _hit = False
+        for c in ("%.8g" % v, (str(int(round(v))) if abs(v - round(v)) < 1e-9 else None)):
+            if c and c in t:
+                _hit = True
+                break
+        if not _hit:
+            for e in _exp:                       # 74K → 74000 这类缩写
+                if abs(float(v) - e) <= max(abs(e) * 1e-9, 1e-9):
+                    _hit = True
+                    break
+        if not _hit:
             bad.append(v)
     return bad
 
@@ -1665,6 +1692,10 @@ def finalize_pending(open_pos):
         entry_note = ""
         _grp = p.get("group") or ""
         _legs = list(p.get("legs") or [])
+        if p.get("entry_is_cmp") and not _legs:
+            signal_entry = None
+            entry_note = "文本写的是 CMP/现价 → 入场价取**当前市价** %.8g（不用图上的标签）" % mkt
+            log("   ↳ CMP 语义：入场价取当前市价 %.8g" % mkt)
         if len(_legs) >= 2:
             # ① 分批建仓
             _each = MARGIN / len(_legs)
@@ -2256,6 +2287,9 @@ def load_runtime():
             # AI 优先解析开关：默认 True；设为 false 即回退到"本地正则优先"
             if "ai_first_parse" in cfg:
                 AI_FIRST[0] = bool(cfg["ai_first_parse"])
+            # 熔断线：总敞口上限的百分比（用户 2026-09-15 要求按金额熔断）
+            if cfg.get("loss_limit_pct") is not None:
+                LOSS_LIMIT_PCT[0] = float(cfg["loss_limit_pct"])
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
@@ -2279,7 +2313,8 @@ def save_runtime():
         out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE,
                "max_open": MAX_OPEN, "max_consec_loss": MAX_CONSEC_LOSS,
                "daily_loss_limit": DAILY_LOSS_LIMIT, "max_total_margin": MAX_TOTAL_MARGIN,
-               "require_approval": REQUIRE_APPROVAL[0], "ai_first_parse": AI_FIRST[0]}
+               "require_approval": REQUIRE_APPROVAL[0], "ai_first_parse": AI_FIRST[0],
+               "loss_limit_pct": LOSS_LIMIT_PCT[0]}
         # ⚠️ 必须保留 live_trading / strict_limit_groups：否则任何一条指令都会把它们悄悄抹掉
         if "live_trading" in _old:
             out["live_trading"] = _old["live_trading"]
