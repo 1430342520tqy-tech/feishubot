@@ -192,6 +192,118 @@ def watch_naked():
             _live_alert("裸仓看门狗补挂", coin, e, "该仓位止损 %s 仍未挂上" % sl)
 
 
+# ===== 风控闸门（2026-09-15，评估 P1）=====
+RISK = {"consec_loss": 0, "day": "", "day_pnl": 0.0, "day_trades": 0}
+MAX_CONSEC_LOSS = 3        # 连亏多少笔自动熔断（暂停交易并告警）
+DAILY_LOSS_LIMIT = 300.0   # 单日已实现净亏损上限（U），达到即熔断
+MAX_TOTAL_MARGIN = 0.0     # 总敞口上限（U）；0 = 用 MAX_OPEN × MARGIN 推导
+
+# 启动对账闸门：state.json 与交易所不一致 → 阻止真实下单（但仍继续监控 + 告警）
+RECONCILE = {"checked": False, "ok": None, "diffs": [], "blocked": False, "ts": 0.0}
+
+
+def _today():
+    return datetime.datetime.now(CST).strftime("%Y-%m-%d")
+
+
+def _exposure_cap():
+    return MAX_TOTAL_MARGIN if MAX_TOTAL_MARGIN > 0 else (MAX_OPEN * MARGIN)
+
+
+def _current_exposure(open_pos):
+    """当前总敞口（按各仓剩余比例折算保证金）"""
+    try:
+        return sum(MARGIN * float(t.get("remaining", 1.0)) for t in open_pos.values())
+    except Exception:
+        return 0.0
+
+
+def _risk_roll_day():
+    """跨日重置当日统计"""
+    d = _today()
+    if RISK.get("day") != d:
+        RISK["day"] = d
+        RISK["day_pnl"] = 0.0
+        RISK["day_trades"] = 0
+
+
+def _risk_on_close(tr):
+    """每笔结单后更新风控计数，并在触线时熔断（暂停交易 + 告警）"""
+    _risk_roll_day()
+    net = float(tr.get("pnl_net") if tr.get("pnl_net") is not None
+                else (float(tr.get("realized") or 0) - float(tr.get("fee") or 0)))
+    RISK["day_pnl"] = round(RISK["day_pnl"] + net, 4)
+    RISK["day_trades"] = int(RISK.get("day_trades", 0)) + 1
+    if net < 0:
+        RISK["consec_loss"] = int(RISK.get("consec_loss", 0)) + 1
+    else:
+        RISK["consec_loss"] = 0
+    _hits = []
+    if MAX_CONSEC_LOSS > 0 and RISK["consec_loss"] >= MAX_CONSEC_LOSS:
+        _hits.append("连续亏损 %d 笔（上限 %d）" % (RISK["consec_loss"], MAX_CONSEC_LOSS))
+    if DAILY_LOSS_LIMIT > 0 and RISK["day_pnl"] <= -abs(DAILY_LOSS_LIMIT):
+        _hits.append("今日已实现净亏损 %.2fU（上限 %.0fU）" % (RISK["day_pnl"], DAILY_LOSS_LIMIT))
+    if _hits and not PAUSED[0]:
+        PAUSED[0] = True
+        STATE_DIRTY[0] = True
+        notify("🛑【风控熔断·已暂停交易】\n%s\n"
+               "· 机器人【仍在监控和记录】，但不会再开新仓\n"
+               "· 已持仓的止盈止损【继续正常管理】\n"
+               "· 你确认要继续后，发指令「继续」即可恢复" % "\n".join("· " + h for h in _hits))
+        log("   🛑 风控熔断：%s" % "；".join(_hits))
+    return _hits
+
+
+def startup_reconcile():
+    """启动对账闸门：把纸面 state.json 的持仓与币安真实持仓逐条比对。
+    不一致 → **阻止真实下单**（但继续监控 + 大声告警），需人工处理后再发「重新对账」清除。
+    评估 G3：文件丢了/状态乱了就拒绝开真单，而不是瞎开。"""
+    RECONCILE.update({"checked": True, "ok": None, "diffs": [], "blocked": False, "ts": time.time()})
+    if not _BEXEC_OK:
+        log("   [对账] 真实下单层未加载 → 跳过")
+        return False
+    try:
+        real = {}
+        for x in (bexec.positions() or []):
+            amt = float(x.get("positionAmt") or 0)
+            if amt != 0:
+                real[x["symbol"]] = x
+    except Exception as e:
+        RECONCILE["ok"] = None
+        log("   [对账] ❌ 读交易所持仓失败：%s" % str(e)[:120])
+        if bexec.LIVE[0]:
+            RECONCILE["blocked"] = True
+            notify("🔴【启动对账失败】读不到币安真实持仓：%s\n"
+                   "已**阻止真实下单**（仍在监控记录）。确认网络/权限正常后发「重新对账」。" % str(e)[:160])
+        return False
+    paper = {"%sUSDT" % c.upper() for c in open_pos_ref.keys()}
+    rsyms = set(real)
+    only_paper = sorted(paper - rsyms)
+    only_real = sorted(rsyms - paper)
+    diffs = []
+    for s in only_paper:
+        # 纸面有仓、真实无仓：纸面模式下正常；实盘模式下说明记录与交易所脱节
+        diffs.append("纸面有仓、交易所无仓：%s" % s)
+    for s in only_real:
+        diffs.append("⚠️ 交易所有仓、纸面无记录（孤儿仓/手工仓）：%s 数量 %s"
+                     % (s, real[s].get("positionAmt")))
+    RECONCILE["diffs"] = diffs
+    consistent = (not only_real) and (bexec.LIVE[0] is False or not only_paper)
+    RECONCILE["ok"] = consistent
+    log("   [对账] 纸面 %d 笔 ｜ 交易所 %d 笔 ｜ 差异 %d 条 ｜ 结论=%s"
+        % (len(paper), len(rsyms), len(diffs), "一致" if consistent else "不一致"))
+    for d in diffs:
+        log("      · %s" % d)
+    if not consistent and bexec.LIVE[0]:
+        RECONCILE["blocked"] = True
+        notify("🔴【启动对账不一致·已阻止真实下单】\n%s\n\n"
+               "机器人【仍在监控和记录】，但**不会向币安发任何真单**，避免双倍敞口或孤儿仓。\n"
+               "请人工核对后发指令「重新对账」清除这个闸门。" % "\n".join("· " + d for d in diffs[:8]))
+    elif diffs:
+        log("   [对账] 差异仅记录（当前影子模式，不影响）")
+    return consistent
+
+
 def watch_entries():
     """轮询限价入场的成交情况。只在【实盘模式】有意义（影子模式没有真实委托）。"""
     if not _BEXEC_OK or not bexec.LIVE[0] or not ENTRY_WATCH:
@@ -288,6 +400,15 @@ def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
     """开仓 → 交给真实下单层生成完整计划（市价/限价腿 + 各档止盈 + Algo 止损）"""
     if not _BEXEC_OK:
         return None
+    # ===== 启动对账闸门：不一致时禁止开新真仓（评估 G3）=====
+    try:
+        if bexec.LIVE[0] and RECONCILE.get("blocked"):
+            log("   🚫 [对账闸门] 已阻止真实开仓（%s）：state.json 与交易所有差异" % coin)
+            notify("🚫【对账闸门】%s 的真实开仓被拒绝：启动对账发现纸面与交易所不一致。\n"
+                   "请先核对币安持仓，然后发「重新对账」清除闸门。" % coin)
+            return None
+    except Exception:
+        pass
     try:
         return bexec.open_full_position(coin.upper() + "USDT", dirc, entry, stop,
                                         list(tps or []), margin=margin or MARGIN)
@@ -425,6 +546,10 @@ def _stat_close(tr):
         % (trade_stats._hold_text(tr["hold_sec"]) if _STATS_OK else "%ds" % tr["hold_sec"],
            float(tr.get("realized") or 0), float(tr.get("fee") or 0), tr["pnl_net"],
            (tr["pnl_net"] / MARGIN * 100) if MARGIN else 0, MARGIN))
+    try:      # 风控：更新连亏/当日盈亏计数，触线则熔断
+        _risk_on_close(tr)
+    except Exception as _e:
+        log("   ⚠️ 风控计数异常：%s" % str(_e)[:100])
     if not _STATS_OK:
         log("   ⚠️ 统计模块未加载（%s）→ 本单不写表（数据已存在本地记录里，可事后补录）" % _STATS_ERR)
         return
@@ -1316,6 +1441,15 @@ def finalize_pending(open_pos):
                 log("   ↳ 博主未给止盈 → 启用 2R 兜底：入场 %s 止损 %s → 2R 目标 %s（到价全平）"
                     % (entry, p["stop"], _ft, ))
         over_cap = (len(open_pos) >= MAX_OPEN and coin not in open_pos)
+        # ===== 总敞口上限（2026-09-15 风控）=====
+        _exp = _current_exposure(open_pos)
+        if (not over_cap) and coin not in open_pos and _exp + MARGIN > _exposure_cap() + 1e-6:
+            notify("【信号·熔断】%s 未开：加上它总敞口将达 %.0fU，超过上限 %.0fU\n"
+                   "（当前敞口 %.0fU ｜ 要放宽可发「修改持仓上限 N」或调 max_total_margin）"
+                   % (coin, _exp + MARGIN, _exposure_cap(), _exp))
+            log("   🛑 总敞口超限：%.0f + %.0f > %.0f" % (_exp, MARGIN, _exposure_cap()))
+            PENDING.pop(coin, None)
+            continue
         # 用户 2026-09-15：达到持仓上限时【询问我】是否提高上限开单，不再直接跳过
         if over_cap and not p.get("cap_override"):
             ask_user(coin, p,
@@ -1620,6 +1754,7 @@ HELP_TEXT = """【机器人指令】在「开单记录」或「机器人开单�
 
 def load_runtime():
     global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE, STRICT_LIMIT_GROUPS, MAX_OPEN
+    global MAX_CONSEC_LOSS, DAILY_LOSS_LIMIT, MAX_TOTAL_MARGIN
     try:
         if os.path.exists(RUNTIME):
             cfg = json.load(open(RUNTIME, encoding="utf-8"))
@@ -1629,6 +1764,12 @@ def load_runtime():
                 STRICT_LIMIT_GROUPS = [g for g in (cfg.get("strict_limit_groups") or []) if g]
             if cfg.get("max_open"):
                 MAX_OPEN = max(1, int(cfg["max_open"]))     # 用户可用指令改（4~8…）
+            if cfg.get("max_consec_loss") is not None:
+                MAX_CONSEC_LOSS = int(cfg["max_consec_loss"])
+            if cfg.get("daily_loss_limit") is not None:
+                DAILY_LOSS_LIMIT = float(cfg["daily_loss_limit"])
+            if cfg.get("max_total_margin") is not None:
+                MAX_TOTAL_MARGIN = float(cfg["max_total_margin"])
             if cfg.get("margin"):
                 MARGIN = float(cfg["margin"])
             if cfg.get("leverage"):
@@ -1654,7 +1795,8 @@ def save_runtime():
         except Exception:
             pass
         out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE,
-               "max_open": MAX_OPEN}
+               "max_open": MAX_OPEN, "max_consec_loss": MAX_CONSEC_LOSS,
+               "daily_loss_limit": DAILY_LOSS_LIMIT, "max_total_margin": MAX_TOTAL_MARGIN}
         # ⚠️ 必须保留 live_trading / strict_limit_groups：否则任何一条指令都会把它们悄悄抹掉
         if "live_trading" in _old:
             out["live_trading"] = _old["live_trading"]
@@ -1868,7 +2010,7 @@ def handle_command(txt):
     KEY = ["帮助", "状态", "持仓情况", "持仓", "全部平仓", "确认全部平仓", "平仓", "减仓",
            "修改止损", "移保本", "暂停", "继续", "修改监控群", "修改金额", "修改杠杆", "测试模式",
            "实盘模式", "挂单情况", "挂单", "待确认", "修改持仓上限", "持仓上限", "进入测试模式",
-           "进入实盘模式"]
+           "进入实盘模式", "重新对账", "对账"]
     # 去掉可能的昵称/时间前缀后，指令必须在消息开头（防止转发内容被误当指令）
     nick = lambda x: re.sub(r"^[^\s]{2,16}\s+", "", x)
     tm = lambda x: re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x, flags=re.I).strip()
@@ -1907,9 +2049,32 @@ def handle_command(txt):
     if cmd.startswith("帮助"):
         notify(HELP_TEXT)
     elif cmd.startswith("状态"):
-        notify("【机器人状态】\n监控群：%s\n持仓：%d 笔（%s）\n单笔：保证金 %.0fU × %d倍 = 名义 %.0fU\n测试模式：%s\n暂停：%s"
-               % ("、".join(GROUPS), len(open_pos_ref), "、".join(open_pos_ref) or "-",
-                  MARGIN, LEV, NOTIONAL, "开" if TEST_MODE else "关", "是" if PAUSED[0] else "否"))
+        _risk_roll_day()
+        _exp = _current_exposure(open_pos_ref)
+        _rec = ("未检查" if RECONCILE.get("ok") is None and not RECONCILE.get("checked")
+                else ("一致" if RECONCILE.get("ok") else "❌不一致" + ("（已阻止真实下单）" if RECONCILE.get("blocked") else "")))
+        notify("【机器人状态】\n"
+               "监控群：%s\n"
+               "持仓：%d 笔 / 上限 %d 笔（%s）\n"
+               "总敞口：%.0fU / 上限 %.0fU\n"
+               "单笔：保证金 %.0fU × %d倍 = 名义 %.0fU\n"
+               "模式：%s ｜ 测试模式：%s ｜ 暂停：%s\n"
+               "风控：连亏 %s 笔（熔断线 %s）｜ 今日 %s 笔 / 净 %+.2fU（熔断线 -%.0fU）\n"
+               "对账：%s"
+               % ("、".join(GROUPS), len(open_pos_ref), MAX_OPEN, "、".join(open_pos_ref) or "-",
+                  _exp, _exposure_cap(), MARGIN, LEV, NOTIONAL,
+                  _be_mode(), "开" if TEST_MODE else "关", "是" if PAUSED[0] else "否",
+                  RISK.get("consec_loss", 0), MAX_CONSEC_LOSS,
+                  RISK.get("day_trades", 0), RISK.get("day_pnl", 0.0), DAILY_LOSS_LIMIT, _rec))
+    elif cmd.startswith("重新对账") or cmd.startswith("对账"):
+        startup_reconcile()
+        if RECONCILE.get("blocked"):
+            notify("【指令】重新对账：**仍有差异，真实下单继续被阻止**\n%s\n"
+                   "请在币安核对后再次发送「重新对账」" % "\n".join("· " + d for d in (RECONCILE.get("diffs") or [])[:8]))
+        elif RECONCILE.get("ok"):
+            notify("【指令】✅ 重新对账通过：纸面与交易所一致，真实下单闸门已解除。")
+        else:
+            notify("【指令】重新对账未能完成（读不到交易所持仓），真实下单仍被阻止。")
     elif cmd.startswith("持仓情况") or cmd.startswith("持仓"):
         m = re.search(r"(?:持仓情况|持仓)\s*([A-Za-z0-9]{2,12})", cmd)
         if m:
@@ -2263,8 +2428,19 @@ def main():
                 log("已恢复持仓 %d 笔：%s" % (len(_op), "、".join(_op) or "-"))
             if last_id:
                 log("已载入上次进度：" + ", ".join("%s→%s" % (k, datetime.datetime.fromtimestamp(last_id[k] >> 32, CST).strftime("%m-%d %H:%M")) for k in last_id))
+            _rk = sv.get("risk")
+            if isinstance(_rk, dict):
+                RISK.update(_rk)
+                _risk_roll_day()
+                log("已恢复风控计数：连亏 %s 笔 ｜ 今日 %s 笔 / 净 %+.2fU"
+                    % (RISK.get("consec_loss", 0), RISK.get("day_trades", 0), RISK.get("day_pnl", 0.0)))
         except Exception:
             pass
+    # ===== 启动对账闸门（评估 G3）：放在开页之前，避免带着不一致状态开始跑 =====
+    try:
+        startup_reconcile()
+    except Exception as _e:
+        log("启动对账异常：%s" % str(_e)[:120])
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(user_data_dir=BASE + "/fs_bot", headless=False,
                                                   args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
@@ -2320,7 +2496,7 @@ def main():
                 log("[%s] 打开失败（未读到消息）" % g)
         log("==== 开始实时监控（%d 个页面）====" % len(pages))
         # ⚠️ 不要在这里写 {"open": []}，会把已恢复的持仓清空（曾经踩过这个坑）
-        json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:],
+        json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
                    "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
         try:
@@ -2802,7 +2978,7 @@ def main():
             hb += 1
             if STATE_DIRTY[0]:
                 STATE_DIRTY[0] = False
-            json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:],
+            json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
                        "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
