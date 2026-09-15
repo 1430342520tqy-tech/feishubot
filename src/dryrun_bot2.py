@@ -861,6 +861,20 @@ try:
 except Exception:
     pass
 
+# ===== B10：这些代码同时是【英文常用词】（或极易误撞），二遍（大小写不敏感）匹配时跳过 =====
+# 它们写大写时仍会被第一遍【区分大小写】认出来，所以不会漏掉真实信号。
+# 反面教材（2026-09-15 实测）：一句「Going long on UNI here at CMP」被判成 AT/ON/THE/UNI 四个币。
+_AMBIG_TICKERS = {
+    "ON", "AT", "THE", "IN", "SO", "ONE", "TWO", "FOR", "AND", "NOT", "NOW", "TOP",
+    "NEW", "OLD", "BIG", "MAX", "MIN", "KEY", "ALL", "ANY", "OUT", "UP", "DOWN",
+    "IF", "IS", "IT", "BE", "TO", "OF", "MY", "WE", "HE", "DO", "NO", "BY", "OR",
+    "AS", "AN", "ME", "US", "BUT", "CAN", "GET", "GOT", "LET", "PUT", "RUN", "SAY",
+    "SEE", "SET", "TOO", "USE", "WAY", "WHO", "WHY", "YES", "YET", "HIGH", "LOW",
+    "NEAR", "LINK", "SAND", "MASK", "GALA", "APE", "RUNE", "FLOW", "BAND", "STORJ",
+    "DOT", "KSM", "ICP", "SSV", "ID", "AI", "GO", "NFT", "DAO", "LONG", "SHORT",
+    "CLOSE", "OPEN", "STOP", "ENTRY", "TARGETS", "RISK", "PNL", "CMP", "SL", "TP",
+}
+
 def fast_parse(txt):
     """只匹配博主常用模板；命中即返回，未命中返回 None（交给 AI 解析）"""
     raw = None
@@ -901,8 +915,16 @@ def fast_parse(txt):
     if not dirc:
         return None
     stop = None
-    for pat in (r"close under\s*\$?([0-9]*\.?[0-9]+)", r"SL[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)",
-                r"stop[ -]?loss[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)", r"止损[^0-9]{0,14}([0-9]*\.?[0-9]+)"):
+    # ⚠️ B5 修复：原来用 `[^0-9]{0,14}` 当间隔，它会**跳过标点**去吃后面的数字 ——
+    #    实测「4250止损，4350到4450分批止盈」被读成 止损=4350（其实是止盈位）。
+    #    改成不允许跨越标点（，。；,;、！？换行），并补上【数字在关键词前】的写法（「4250止损」）。
+    _GAP = r"[^0-9，。；;、！!？?\n]{0,10}"
+    for pat in (r"close under\s*\$?([0-9]*\.?[0-9]+)",
+                r"\bSL\s*[:：=]?\s*\$?([0-9]*\.?[0-9]+)",
+                r"stop[ -]?loss\s*[:：=]?\s*\$?([0-9]*\.?[0-9]+)",
+                r"\bstop\s*[:：=]?\s*\$?([0-9]*\.?[0-9]+)",
+                r"止损\s*[:：=]?\s*" + _GAP + r"([0-9]*\.?[0-9]+)",
+                r"([0-9]*\.?[0-9]+)\s*" + _GAP + r"(?:止损|stop)"):      # 「4250止损」
         mm = re.search(pat, txt, re.I)
         if mm:
             try:
@@ -958,10 +980,12 @@ def fast_parse(txt):
     # 再截断到 3 档就会把【最近的止盈】丢掉。最终档位顺序在 finalize_pending 里按"离入场近→远"再规整一次。
     tps = list(dict.fromkeys(tps))[:TP_TIERS]
     # 区间开仓价（如「在4360到4310区间多」/「4310-4360 区间」）—— 一律取中间值
+    # ⚠️ 必须在【遮掉止盈段和止损段】的文本里找，否则会把止盈区间/止损区间当成开仓区间
     rng = None
-    m = re.search(r"([0-9]*\.?[0-9]+)\s*(?:到|至|~|～|—|–)\s*([0-9]*\.?[0-9]+)", txt)
+    _mt = _mask_segments(txt, mask_tp=True, mask_sl=True)
+    m = re.search(r"([0-9]*\.?[0-9]+)\s*(?:到|至|~|～|—|–)\s*([0-9]*\.?[0-9]+)", _mt)
     if not m:
-        m = re.search(r"([0-9]*\.?[0-9]+)\s*-\s*([0-9]*\.?[0-9]+)\s*(?:区间|之间)", txt)
+        m = re.search(r"([0-9]*\.?[0-9]+)\s*-\s*([0-9]*\.?[0-9]+)\s*(?:区间|之间)", _mt)
     if m:
         try:
             a, b = float(m.group(1)), float(m.group(2))
@@ -1355,18 +1379,87 @@ def strip_sender_prefix(txt):
     return t.strip()
 
 
+def _mask_segments(txt, mask_tp=True, mask_sl=False):
+    """把【某类关键词之后、下一个任意关键词之前】那一段用等长空格遮掉。
+    用途：防止「4350到4450分批止盈」里的区间被当成**开仓区间**、
+    或里面的数字被当成止损（实测 2026-09-15 标准答案集 [9]：
+    「黄金xau 突破4300，回调过程做多，4250止损，4350到4450分批止盈」
+    → 旧代码把 4350~4450 当成入场区间，还把止损读成 4350）。"""
+    _B = re.compile(r"(?:止盈|目标位?|targets?|(?:TP|Tp|tp)\s?\d?|止损|stop[ -]?loss|SL|"
+                    r"加仓|DCA|入场|进场|Entry)")
+    ks = list(_B.finditer(txt))
+    out = list(txt)
+    for i, m in enumerate(ks):
+        g = m.group(0)
+        is_tp = bool(re.match(r"(?:止盈|目标位?|targets?|(?:TP|Tp|tp)\s?\d?)", g, re.I))
+        is_sl = bool(re.match(r"(?:止损|stop[ -]?loss|SL)", g, re.I))
+        if not ((is_tp and mask_tp) or (is_sl and mask_sl)):
+            continue
+        end = ks[i + 1].start() if i + 1 < len(ks) else len(txt)
+        for j in range(m.end(), end):
+            if out[j] != "\n":
+                out[j] = " "
+    return "".join(out)
+
+
+# 条件单/待触发措辞：这类信号"要等价格条件满足才进"，**绝不能自动开**，必须送审批
+_COND_RE = re.compile(r"等待|等到|跌破|站稳|收回|站上|突破|破位|若|如果|一旦|触及|达到|回到|"
+                      r"确认后|回调后|回踩后|等.{0,6}(?:再|后)")
+
+
+def _points_info(txt, value):
+    """判断某个数值在原文里是不是**点数**而不是价格。
+    实测病症（B5）：「止损带个30点左右」「止损35点」「止盈3000点以上」——
+    30/35/3000 都是**点数**，不是价格；旧代码直接当成价格，得到 止损=30 这种荒谬值。
+    判据用原文里的「点」字，确定性、不靠猜。返回 None 或点数。"""
+    if not isinstance(value, (int, float)) or not value:
+        return None
+    t = strip_sender_prefix(txt or "")
+    # ⚠️ 关键词和数字之间常有修饰词：「止盈**利润**3000点」「止损**带个**30点」，
+    #    所以不能要求数字紧跟关键词；但也不许跨越标点（否则又会去抓下一句的数字）。
+    for m in re.finditer(r"(?:止损|止盈|目标位?|stop|SL|TP)"
+                         r"[^0-9，。；;、！!？?\n]{0,10}([0-9]*\.?[0-9]+)\s*(?:个)?\s*点", t, re.I):
+        try:
+            if abs(float(m.group(1)) - float(value)) < 1e-9:
+                return float(m.group(1))
+        except Exception:
+            pass
+    return None
+
+
+def _conditional_order(txt):
+    """这条消息是不是"条件触发才进"（等跌破/站稳/突破…）？"""
+    return bool(_COND_RE.search(strip_sender_prefix(txt or "")))
+
+
 def find_all_coins(txt):
     """找出文本里出现的【所有】币安 USDT-M 币种 —— 用来识别"一条消息混了多个币"的笼统总结。
     事故教训：暴富龙的「9.14视频总结」里 BTC/以太坊/Giggle 混在一起，fast_parse 把
-    以太坊的区间、Giggle 的止盈都算到了 BTC 头上。"""
+    以太坊的区间、Giggle 的止盈都算到了 BTC 头上。
+
+    ⚠️ B10 修复（2026-09-15 实测）：原来这一遍用了 `re.I`（大小写不敏感）+ 词边界，
+    于是英文句子里的 **on / at / the** 撞上了真实合约 ONUSDT / ATUSDT / THEUSDT，
+    把单币信号误判成「4 个币种」。实测现场：一句「Going long on UNI here at CMP…」
+    被判成 AT/ON/THE/UNI 四个币，凭空多出三个待确认单。
+    现在分两遍：
+      第一遍 **区分大小写**（博主写币种都是大写）——杀掉 on/at/the 这类小写词；
+      第二遍 大小写不敏感，但**只用在不歧义的币种上**（长度≥3 且不在歧义词表里），
+             这样 "btc"/"sol" 这种小写写法仍然认得出来。"""
     hits = set()
     t = strip_sender_prefix(txt)
     for k, v in _NAME_MAP.items():
         if len(k) >= 2 and k in t:
             hits.add(v)
+    # 第一遍：严格区分大小写
     for s in _SYMS:
         if len(s) >= 2 and not s.isdigit() and re.search(
-                r"(?<![A-Za-z0-9])" + re.escape(s) + r"(?![A-Za-z0-9])", t, re.I):
+                r"(?<![A-Za-z0-9])" + re.escape(s) + r"(?![A-Za-z0-9])", t):
+            hits.add(s)
+    # 第二遍：大小写不敏感，但排除"英文常用词/歧义词"，且只认 ≥3 位
+    for s in _SYMS:
+        if len(s) < 3 or s.isdigit() or s in _AMBIG_TICKERS:
+            continue
+        if re.search(r"(?<![A-Za-z0-9])" + re.escape(s) + r"(?![A-Za-z0-9])", t, re.I):
             hits.add(s)
     return hits
 
@@ -1533,6 +1626,44 @@ def finalize_pending(open_pos):
             notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
                    % (coin, (p["texts"][0][:180] if p["texts"] else "")))
             PENDING.pop(coin, None); continue
+        # ===== B5-① 点数 vs 价格（2026-09-15 新增）=====
+        # 「止损带个30点左右」「止损35点」「止盈3000点以上」里的数字是**点数**不是价格。
+        # 旧行为：直接当成价格 → 止损=30 这种荒谬值（实测现场：BTC 止损读成 74，因为「74K」）。
+        # 新行为：识别为点数 → 按入场价换算成价格 → **一律送人工审批**（绝不自动开）。
+        _t0 = p["texts"][0] if p.get("texts") else ""
+        _pt_why = []
+        _sp = _points_info(_t0, p.get("stop"))
+        if _sp and isinstance(entry, (int, float)) and entry:
+            _new_stop = round(entry - _d0 * _sp, 10)
+            _pt_why.append("止损「%s点」是**点数**不是价格 → 按入场 %s 换算为 %s（原样照抄会得到 %s）"
+                           % (_fmt_num(_sp), _fmt_num(entry), _fmt_num(_new_stop), _fmt_num(p["stop"])))
+            p["stop"] = _new_stop
+            p["stop_src"] = "点数换算(%s点)" % _fmt_num(_sp)
+        _tps_new, _tp_pt_why = [], []
+        for _t in tps:
+            _tp_ = _points_info(_t0, _t)
+            if _tp_ and isinstance(entry, (int, float)) and entry:
+                _nv = round(entry + _d0 * _tp_, 10)
+                _tp_pt_why.append("止盈「%s点」是点数 → 换算为 %s" % (_fmt_num(_tp_), _fmt_num(_nv)))
+                _tps_new.append(_nv)
+            else:
+                _tps_new.append(_t)
+        if _tp_pt_why:
+            tps = _tps_new
+        else:
+            # 整条消息只给了一个「止盈 N 点以上」，而 fast_parse 可能把它读成了一个价格
+            _tp_any = re.search(r"(?:止盈|目标位?)\s*[:：=]?\s*([0-9]*\.?[0-9]+)\s*点", _t0)
+            if _tp_any and isinstance(entry, (int, float)) and entry:
+                try:
+                    _v = float(_tp_any.group(1))
+                    if _v and not any(abs(_v - x) < 1e-9 for x in tps):
+                        tps = [round(entry + _d0 * _v, 10)]
+                        _tp_pt_why.append("止盈「%s点」是点数 → 换算为 %s"
+                                          % (_fmt_num(_v), _fmt_num(tps[0])))
+                except Exception:
+                    pass
+        if _pt_why or _tp_pt_why:
+            log("   ↳ [点数换算] " + "；".join(_pt_why + _tp_pt_why))
         # ===== 止损/止盈【方向合理性校验】（2026-09-14 新增；对真单是保命检查）=====
         # 实例：08:00 UA 群博主发的是「Trade Closed — DOGE/USDT LONG ... Stop loss hit at $0.08280」，
         #   从这句话里被抽出 方向=LONG、止损=0.0828，而市价是 0.08238 →
@@ -1589,6 +1720,15 @@ def finalize_pending(open_pos):
             if re.search(r"头仓|首仓|底仓|试仓", _t0):
                 _why = ("同时出现「头仓/首仓」和「分批」，机器人无法确定总共分几笔、每笔多少保证金"
                         "（识别到 %d 个点位 %s）" % (len(p["legs"]), p["legs"]))
+        # ===== B5-③ 条件单（2026-09-15 新增）=====
+        # 「等待76000跌破收回，站稳76200多」「跌破2465可以追空」= **要等价格条件满足才进**。
+        # 机器人不能替你盯条件，也不该按"现在"的点位直接开 → 一律送人工审批。
+        if _why is None and _conditional_order(_t0):
+            _why = ("这条消息是【条件触发】型的（等跌破/站稳/突破/收回…才进），"
+                    "机器人不能替你盯价格条件 —— 得你自己判断现在能不能进")
+        # ===== B5-① 点数换算已发生 → 必须人工确认（绝不自动开）=====
+        if _why is None and (_pt_why or _tp_pt_why):
+            _why = "数字被识别为【点数】并已换算：" + "；".join(_pt_why + _tp_pt_why)
         if _why:
             ask_user(coin, p, _why)
             PENDING.pop(coin, None)
@@ -2760,6 +2900,68 @@ def _tp_wrong_side(dirc, entry, tps, ref=None):
             and (float(t) <= base if d == "LONG" else float(t) >= base)]
 
 
+def validate_plan(coin, dirc, entry, stop, tps, mkt, texts=None):
+    """**公共合理性校验**（B3 修复）。
+
+    背景：原来的「多币种分支」(`split_by_coin` → `ask_user`) **完全绕过**了
+    `finalize_pending` 里那套校验（止损方向、价格合理性、点数换算）。
+    实测事故：DOGE 做多、入场 0.079、**止损 0.09（在入场价上方）** ——
+    按已有校验本该被拒绝，但因为走的是多币种分支，直接发给你审批了。
+
+    返回 `(问题字符串 or None, 修正后的 tps)`。两条路径（单币 / 多币）共用同一套判断，
+    避免"改了一条忘了另一条"。问题字符串是**面向用户**的，可直接放进审批原因。
+    """
+    t0 = (texts[0] if texts else "") or ""
+    tps = [t for t in (tps or []) if isinstance(t, (int, float))]
+    d = 1 if (str(dirc or "LONG").upper() == "LONG") else -1
+    # ① 止损方向
+    if isinstance(stop, (int, float)) and stop and isinstance(entry, (int, float)) and entry:
+        if d == 1 and float(stop) >= float(entry):
+            return ("止损价 %.8g **不低于** 入场价 %.8g —— 做多的止损必须在下方，判为解析错误"
+                    % (stop, entry)), tps
+        if d == -1 and float(stop) <= float(entry):
+            return ("止损价 %.8g **不高于** 入场价 %.8g —— 做空的止损必须在上方，判为解析错误"
+                    % (stop, entry)), tps
+    # ② 止盈方向：方向不对的档位剔除
+    if tps and isinstance(entry, (int, float)) and entry:
+        tps = [t for t in tps if (float(t) > float(entry) if d == 1 else float(t) < float(entry))]
+    # ③ 开仓价与市价严重不符
+    if isinstance(entry, (int, float)) and entry and mkt:
+        dev = abs(float(entry) - float(mkt)) / float(mkt)
+        if dev > MAX_ENTRY_DEV:
+            return ("解析出的开仓价 %.8g 与当前市价 %.8g 相差 %.0f%%（超过 %.0f%%），"
+                    "像是把别的币的价格串过来了" % (entry, mkt, dev * 100, MAX_ENTRY_DEV * 100)), tps
+    # ④ 止损距离是否荒谬
+    if isinstance(stop, (int, float)) and stop and isinstance(entry, (int, float)) and entry:
+        sp = abs(float(stop) - float(entry)) / float(entry)
+        if sp > MAX_STOP_PCT:
+            return "止损距入场价 %.0f%%（超过 %.0f%%，不像真的止损）" % (sp * 100, MAX_STOP_PCT * 100), tps
+        if sp < MIN_STOP_PCT:
+            return "止损几乎等于入场价（距离仅 %.3f%%），等于没设止损" % (sp * 100), tps
+    # ⑤ 止盈是否已被当前市价越过
+    if tps and isinstance(mkt, (int, float)) and mkt:
+        crossed = [t for t in tps if (float(t) <= float(mkt) if d == 1 else float(t) >= float(mkt))]
+        if crossed:
+            return ("止盈位 %s 已被当前市价 %.8g 越过 —— 信号已过期，或价格张冠李戴"
+                    % (crossed, mkt)), tps
+    # ⑥ 条件触发型（等跌破/站稳/突破…才进）见 soft_ask_reason：那类不是"解析错误"，
+    #    而是"需要人来判断现在能不能进"，所以不在这里硬拒，改由调用方转成审批原因。
+    return None, tps
+
+
+def soft_ask_reason(txt, stop=None, entry=None):
+    """"不是解析错误、但必须让人来判断"的原因（B5 的 ③条件单 / ①点数）。
+    这类不能硬拒（否则丢信号），也不该自动开 → 由调用方拼进审批原因。返回 None 或字符串。"""
+    why = []
+    if _conditional_order(txt or ""):
+        why.append("这条消息是【条件触发】型的（等跌破/站稳/突破/收回…才进），"
+                   "机器人不能替你盯价格条件")
+    _p = _points_info(txt or "", stop)
+    if _p:
+        why.append("止损「%s点」是**点数**不是价格，不能直接当止损价用" % _fmt_num(_p))
+    return "；".join(why) if why else None
+
+
 def position_sanity(open_pos, notify_user=True):
     """持仓健康自检（B14 配套）：找出**止盈落在持仓错误一侧**的仓位。
     这类仓位一旦存在，监控循环会立刻把当前价判成"止盈成交" —— 19:20 那笔假亏损就是这么来的。
@@ -3212,7 +3414,28 @@ def main():
                                 _pp["group"] = g
                                 PENDING.pop(_c, None)
                                 _tt = sorted(set(_pp.get("tps") or []))
-                                ask_user(_c, _pp, "多币种消息，已按币拆开；本条解析结果如上，请你单独确认",
+                                # ===== B3 修复：多币种分支必须过【同一套】公共校验 =====
+                                # 原来这里直接 ask_user，完全绕过校验 → 实测把「DOGE 做多、入场 0.079、
+                                # 止损 0.09（在入场价上方）」这种解析错误直接发给了用户审批。
+                                _mk = price_of(_c)
+                                _ent = _pp.get("entry")
+                                if not isinstance(_ent, (int, float)) or not _ent:
+                                    _lg = [float(x) for x in (_pp.get("legs") or []) if isinstance(x, (int, float))]
+                                    _ent = (sum(_lg) / len(_lg)) if _lg else None
+                                _bad_why, _tt2 = validate_plan(_c, _dir_, _ent, _pp.get("stop"), _tt, _mk,
+                                                               texts=[_seg])
+                                _soft = soft_ask_reason(_seg, _pp.get("stop"), _ent)
+                                if _tt2:
+                                    _tt = _tt2
+                                if _bad_why:
+                                    log("   ⛔ [%s] 多币种分支公共校验未通过：%s" % (_c, _bad_why))
+                                    notify("【信号·拒绝】%s %s\n%s\n**不下单**\n原文：%s"
+                                           % (_c, "做多" if _dir_ == "LONG" else "做空",
+                                              _bad_why, _seg[:160]))
+                                    continue
+                                ask_user(_c, _pp,
+                                         "多币种消息，已按币拆开；本条解析结果如上，请你单独确认"
+                                         + (("；另外：" + _soft) if _soft else ""),
                                          quiet=True)
                                 notify("· %s %s：开仓=%s 止损=%s 止盈=%s"
                                        % (_c, "做多" if _dir_ == "LONG" else "做空",
@@ -3971,6 +4194,82 @@ if __name__ == "__main__":
                 print("   ✗ %s" % _f)
             sys.exit(1)
         print("第3项自检：全部通过 ✅")
+        sys.exit(0)
+
+    if "--selftest-b5" in sys.argv:
+        # ===== 第4项自检：B5 解析体系 + B10 词撞币种 + B3 多币种校验 =====
+        # 用例全部取自【真实生产原文】（标准答案集 /tmp/golden_set.json 与交接文档里的错单）
+        print("=" * 72)
+        print("B5 / B10 / B3 自检（用例均为真实生产原文）")
+        print("=" * 72)
+        _fail = []
+
+        def _ck(name, got, want):
+            _ok = (got == want)
+            print("  %s %-54s got=%s want=%s" % ("[ OK ]" if _ok else "[FAIL]", name, got, want))
+            if not _ok:
+                _fail.append(name)
+
+        # ---------- B10：英文常用词不得撞成币种 ----------
+        print("\n[1] B10 词撞币种（实测：一句 UNI 被读成 AT/ON/THE/UNI 四个币）")
+        _b10 = "Going long on UNI here at CMP. TPs above, 4H close under 6.39 for stops."
+        _ck("单币 UNI 句子 → 只认出 UNI", sorted(find_all_coins(_b10)), ["UNI"])
+        _ck("小写英文常用词不再误命中 on/at/the",
+             [c for c in find_all_coins(_b10) if c in ("ON", "AT", "THE")], [])
+        _ck("真·多币种仍要认出（Sol 小写也认）",
+             "SOL" in find_all_coins("原油CL跌破97空，Sol突破102.5多"), True)
+        _ck("大写歧义词仍认得（写 NEAR 时）", "NEAR" in find_all_coins("做多 NEAR 止损2"), True)
+
+        # ---------- B5-① 点数 vs 价格 ----------
+        print("\n[2] B5-① 点数 vs 价格（「止损带个30点左右」的 30 是点数）")
+        _ck("_points_info 认出「止损35点」", _points_info("以太现价到2465多，止损35点", 35.0), 35.0)
+        _ck("_points_info 不误判正常止损价", _points_info("BTC 做多 止损74000", 74000.0), None)
+        _ck("_points_info 认出「止盈3000点以上」", _points_info("止盈利润3000点以上", 3000.0), 3000.0)
+        _p_eth = fast_parse("以太坊空单 在2465跌破可以追空，止损带个30点左右，止盈就30点以上分批止盈")
+        print("     ↳ 原文解析：%s" % json.dumps(
+            {k: (_p_eth or {}).get(k) for k in ("coin", "direction", "entry", "stop", "targets")},
+            ensure_ascii=False))
+
+        # ---------- B5-② 数字在关键词前 ----------
+        print("\n[3] B5-② 数字写在关键词前面（「4250止损」旧代码读不到）")
+        _p9 = fast_parse("黄金xau 突破4300，回调过程做多，4250止损，4350到4450分批止盈。")
+        _ck("读到止损 4250", (_p9 or {}).get("stop"), 4250.0)
+        _ck("不再把止盈区间 4350~4450 当成入场区间", (_p9 or {}).get("entryRange"), None)
+        _p_doge = fast_parse("狗狗币在0.078到0.08接多，左侧轻仓，0.075止损，止盈0.09附近")
+        _ck("「0.075止损」读到 0.075", (_p_doge or {}).get("stop"), 0.075)
+        _ck("不再把后面的止盈 0.09 当成止损", (_p_doge or {}).get("stop") != 0.09, True)
+
+        # ---------- B5-③ 条件单 ----------
+        print("\n[4] B5-③ 条件触发型（等跌破/站稳才进）必须能识别")
+        _ck("「等待76000跌破收回，站稳76200多」判为条件单",
+             _conditional_order("比特币等待76000跌破收回，站稳76200多，74000止损"), True)
+        _ck("「跌破2465可以追空」判为条件单",
+             _conditional_order("在2465跌破可以追空"), True)
+        _ck("普通直接开仓不误判为条件单",
+             _conditional_order("比特币77065价格做空 止损77500 第一止盈74500"), False)
+
+        # ---------- B3：多币种分支必须过公共校验 ----------
+        print("\n[5] B3 公共校验（实测事故：DOGE 做多 入场0.079 止损0.09 在入场价上方）")
+        _w, _t = validate_plan("DOGE", "LONG", 0.079, 0.09, [0.1], 0.079)
+        _ck("止损方向错 → 必须被判为解析错误", bool(_w), True)
+        print("     ↳ 原因：%s" % _w)
+        _w2, _t2 = validate_plan("BTC", "LONG", 77765.0, 74000.0, [79000.0], 77760.0)
+        _ck("正常单子 → 不报错", _w2, None)
+        _w3, _t3 = validate_plan("BTC", "LONG", 2540.0, 38.0, [7582.1], 77760.0)
+        _ck("开仓价离谱（BTC 市价 77760 却解析出 2540）→ 报错", bool(_w3), True)
+        _w4, _t4 = validate_plan("ETH", "LONG", 2465.0, 2400.0, [2500.0], 2400.0)
+        _ck("止盈方向不对的档位被剔除", _t4, [2500.0])
+        _sft = soft_ask_reason("在2465跌破可以追空，止损带个30点左右", 30.0, 2465.0)
+        _ck("点数/条件单 → 转成审批原因（不硬拒、也不自动开）", bool(_sft), True)
+        print("     ↳ 审批原因：%s" % _sft)
+
+        print("\n" + "-" * 72)
+        if _fail:
+            print("B5/B10/B3 自检：%d 项失败" % len(_fail))
+            for _f in _fail:
+                print("   ✗ %s" % _f)
+            sys.exit(1)
+        print("B5/B10/B3 自检：全部通过 ✅")
         sys.exit(0)
 
     main()
