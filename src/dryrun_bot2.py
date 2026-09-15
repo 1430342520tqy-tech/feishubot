@@ -679,15 +679,41 @@ def _ocr_tags_batch(im, x0, merged):
                          {"role": "user", "content": [
                              {"type": "text", "text": "This image stacks %d price labels from a chart. Each label is marked with a yellow index number on its left. "
                               "Transcribe the price printed inside each label. Return a JSON object mapping the index to the number, e.g. {\"1\":0.1052,\"2\":0.1246}. "
-                              "Only report digits you can actually read." % len(tiles)},
+                              "You MUST return exactly %d entries, one per index. Only report digits you can actually read." % (len(tiles), len(tiles))},
                              {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}
-    try:
-        r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY, "Content-Type": "application/json"}, json=body, timeout=180)
+    # ⚠️ 2026-09-16 实测（同一份代码、同一张图，跑两次结果就不同）：
+    #    批量 OCR 是"拼图 + 黄色序号"，一旦模型漏答/错位，`nums.get(str(i))` 就会把**数值对到
+    #    错误的标签上**，或者整张图的标签全丢（实测 7685319584487951562_0.png：
+    #    第一次读出 sl=0.0/entry=0.04/tps=[88.0]，第二次直接变成"无红色止损标签"）。
+    #    对策（最小改动）：返回条数不等于标签数就重试一次，并把"没读全"写进日志 ——
+    #    绝不静默丢标签（项目原则「绝不静默丢弃」）。
+    def _ask_once():
+        r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY,
+                                           "Content-Type": "application/json"},
+                          json=body, timeout=180)
         m = re.search(r"\{[\s\S]*\}", r.json()["choices"][0]["message"]["content"])
         return json.loads(m.group(0))
-    except Exception as e:
-        log("   批量读标签失败: " + str(e)[:90])
-        return {}
+
+    nums = {}
+    for _att in (1, 2):
+        try:
+            nums = _ask_once() or {}
+        except Exception as e:
+            log("   批量读标签失败（第 %d 次）: %s" % (_att, str(e)[:90]))
+            nums = {}
+        if len(nums) >= len(tiles):
+            break
+        log("   ⚠️ 批量读标签不完整：标签 %d 个，只回来 %d 个 → %s"
+            % (len(tiles), len(nums), "重试一次" if _att == 1 else "仍不完整，按读到的用（不静默丢）"))
+    return nums
+
+# ===== 读图：横线判定为"止盈线"的最低覆盖率 =====
+# ⚠️ 2026-09-15 实测（真实图 7685715944936623383_0.png，UNI 那张）：
+#    图上三条横线的实测覆盖率是 0.743 / 0.787 / 0.863 —— 原来的门槛 0.85
+#    把前两档（7.180、8.216）直接判掉了，只读出 9.289 → **TP1/TP2 静默丢失**。
+#    横线被 K 线遮挡时覆盖率天然会低于 1.0，所以门槛必须按"明显长于蜡烛"来定，
+#    不能要求 85% 满幅。0.55 保留了对零星色块/标签的过滤能力。
+TP_MIN_COV = 0.55
 
 def read_chart(path):
     im = Image.open(path).convert("RGB"); w, h = im.size
@@ -739,14 +765,27 @@ def read_chart(path):
     above = sorted([t for t in tags if t["value"] > sl * 1.0005], key=lambda t: t["value"])
     if not above: return {"ok": False, "why": "止损上方无标签", "tags": tags}
     entry = above[0]["value"]
-    tp = []
+    # ---- 止盈候选：止损上方、覆盖率够长的横线 ----
+    _cand = []
     for t in above:
         v = t["value"]
         if v <= entry * 1.0005: continue
-        if t["cov"] < 0.85: continue
-        if any(abs(v - s) / v < 0.003 for s in tp): continue
-        tp.append(v)
-    return {"ok": True, "sl": sl, "entry": entry, "tps_all": tp, "tps": tp[:TP_TIERS], "tags": tags}
+        if t["cov"] < TP_MIN_COV: continue
+        if any(abs(v - c["value"]) / v < 0.003 for c in _cand): continue     # 同一档（含轴刻度重复读数）
+        _cand.append(t)
+    tps_all = [t["value"] for t in _cand]
+    # ⚠️ 2026-09-15 实测（真实 UNI 图）：候选有 4 档（6.676 / 7.180 / 8.216 / 9.289），
+    #    若只按"价格由近到远"取前 3 档，会把下方的 6.676 当 TP1，真正最远的 9.289 被挤掉。
+    #    实测该图上 KOL 画的止盈线是【最长的三条横线】（覆盖率 0.743/0.787/0.863），
+    #    而 6.676 是更短的参考线（0.674）、6.513（0.2）与 6.396（0.195）是入场/止损这种短线。
+    #    所以：候选多于 3 档时，先按横线长度取最长的 3 档，再按价格由近到远排序。
+    _sel = sorted(_cand, key=lambda t: -t["cov"])[:TP_TIERS] if len(_cand) > TP_TIERS else _cand
+    tp = sorted([t["value"] for t in _sel])
+    # 供"只识别到图"的单独推送用：把图上所有可读横线按价位列出来（含没进 TP 的那些），
+    # 让用户能看到图上到底有什么，而不是只看到一个数字。
+    all_lines = [{"value": t["value"], "color": t["color"], "cov": t["cov"]} for t in above]
+    return {"ok": True, "sl": sl, "entry": entry, "tps_all": tps_all, "tps": tp[:TP_TIERS],
+            "tags": tags, "lines": all_lines}
 
 # ---------------- 文本解析 ----------------
 def parse_text(text):
@@ -876,6 +915,18 @@ try:
 except Exception:
     pass
 
+# ===== B10 残留修复：模板「Going long <X>」里 X 位置可能是个英文常用词 =====
+# ONUSDT / ATUSDT / THEUSDT / INUSDT / SOUSDT … 都是币安真实合约，所以「Going long on UNI」
+# 会被读成 ON。这些词出现在这个位置时一律跳过，继续往后找真正的币种词；
+# 全程跳过之后 raw 仍为空 → 会走 find_coin_in_text() 兜底，不会因此丢信号。
+# ⚠️ 与下面 _AMBIG_TICKERS 的分工：这里是【位置性】跳过表，故意只放介词/冠词/副词，
+#    不放 NEAR/LINK/APE 这类**博主真会写**的币种词（那些由 _AMBIG_TICKERS 在二遍匹配时处理）。
+_GOING_LONG_SKIP = {
+    "ON", "AT", "THE", "IN", "INTO", "TO", "OF", "AND", "OR", "FOR", "AS", "BY", "WITH",
+    "HERE", "NOW", "THIS", "THAT", "THEN", "IT", "IS", "BE", "ARE", "WAS", "WERE",
+    "SO", "ALL", "MY", "AN", "UP", "DOWN", "DO", "NO", "IF", "WE", "ME", "YOU",
+}
+
 # ===== B10：这些代码同时是【英文常用词】（或极易误撞），二遍（大小写不敏感）匹配时跳过 =====
 # 它们写大写时仍会被第一遍【区分大小写】认出来，所以不会漏掉真实信号。
 # 反面教材（2026-09-15 实测）：一句「Going long on UNI here at CMP」被判成 AT/ON/THE/UNI 四个币。
@@ -894,10 +945,20 @@ def fast_parse(txt):
     """只匹配博主常用模板；命中即返回，未命中返回 None（交给 AI 解析）"""
     raw = None
     dirc = None
-    m = re.search(r"(?:Going|Market|Longing|Buying|Selling|Shorting)\s+(long|short)\s+\$?([A-Za-z0-9]{2,12})", txt, re.I)
+    # ⚠️ B10 残留（2026-09-15 实测）：模板「Going long on UNI here at CMP」里，
+    #    `Going (long|short) (\w+)` 抓到的第一个词是英文介词 **on**，而 ONUSDT 是
+    #    币安真实合约 → 整条 UNI 信号被解析成 coin=ON。实测（部署版本，23:5x）：
+    #    fast_parse("Going long on UNI here at CMP…") → {"coin": "ON", …}
+    #    现在：介词/常用词跳过，继续往后找真正的币种词。
+    m = re.search(r"(?:Going|Market|Longing|Buying|Selling|Shorting)\s+(long|short)\s+"
+                  r"(.{1,40})", txt, re.I)
     if m:
         dirc = "LONG" if m.group(1).lower() == "long" else "SHORT"
-        raw = m.group(2)
+        for _tok in re.findall(r"\$?([A-Za-z0-9]{2,12})", m.group(2)):
+            if _tok.upper() in _GOING_LONG_SKIP:
+                continue
+            raw = _tok
+            break
     if raw is None:
         m = re.search(r"\b(Selling|Buying|Shorting|Longing)\s+\$?([A-Za-z0-9]{2,12})", txt, re.I)
         if m:
@@ -1102,6 +1163,14 @@ def merge_pending(coin, group, info=None, chart=None, imgs=None, t_sig=0, txt=""
         p.update({k: stamps[k] for k in ("t_img", "t_parse", "t_chart") if k in stamps})
     p["deadline"] = time.time() + PENDING_WAIT
     if info:
+        # ⚠️ 2026-09-15 实测发现（真 bug）：`entry_is_cmp`（文本写 CMP/现价/市价）**从来没有被
+        #    拷进待确认池** —— merge_pending 只拷了 entry/stop/targets 等字段，于是
+        #    finalize_pending 里那句 `if p.get("entry_is_cmp")` 是**死代码**：
+        #    0.12 声称"已修 CMP 取当前市价"其实没生效（实测 21:57 UNI 日志用的是图上标签 6.505）。
+        if info.get("entry_is_cmp"):
+            p["entry_is_cmp"] = True
+        if info.get("tp_on_chart"):
+            p["tp_on_chart"] = True
         e = info.get("entry")
         if isinstance(e, (int, float)) and p["entry"] is None:
             p["entry"] = float(e); p["entry_src"] = "消息文字"
@@ -1199,6 +1268,183 @@ def merge_pending(coin, group, info=None, chart=None, imgs=None, t_sig=0, txt=""
 def pending_complete(p):
     tps = sorted(set(p["tps"]))
     return p["entry"] is not None and p["stop"] is not None and len(tps) >= TP_TIERS
+
+# ================= B16：原始消息暂存区（按「群 + 时间窗」）=================
+# 用户要求（2026-09-15）：① 图片必须能被读到、不能丢 ② 合并窗口保持 4 秒 ③ 4 秒内没关联上
+# 就【分别推送】（只识别到图 → 分析图并推送；有文字 → 分析文字并推送；各自只说自己的信息，
+# 缺失的一律"未读到"，绝不瞎猜）。
+#
+# 为什么需要它（两条实测根因，都有生产证据）：
+#   ① 图片常常是**独立一条、没有文字**的消息 → 没有币种 → 挂不进按币种索引的 PENDING[coin]
+#      → 在"挂载环节"被丢掉：20:21-20:22 黄金mansoor 两条真实图（文件都在 v21/imgs 里）
+#      只留了一行「没通过信号门槛」日志，**零推送**，用户完全不知道错过了什么。
+#   ② 更早一层：单张图还没加载完时（nimg=1 / loaded=0）连"有图"都不算 → 在关键词门槛就跳过，
+#      连抓图都不尝试（21:57 UNI 那条图消息就是这样，v21/imgs 里根本没有这张文件）。
+# 本暂存区解决 ①：先按"群 + 最近 N 秒"把图原样存下（不要币种），文字消息带来币种后回填关联；
+# 4 秒内没等到 → 按用户要求单独推送图自己的信息。
+RAWQ = {}                       # group -> [rec]
+RAWQ_TTL = 90                   # 秒：暂存记录最长保留（清理用；关联窗口见 RAWQ_WAIT）
+RAWQ_MAX = 20                   # 每群最多保留条数
+RAWQ_WAIT = PENDING_WAIT        # 关联窗口 = 合并窗口 = 4 秒（用户要求：不能拖慢出单）
+
+def msg_has_image(row):
+    """B16：这条消息是否带图。**只要有图元素就算**（nimg>0），
+    不再要求"已经加载完"（loaded>0）——21:57 UNI 的图就是死在这个额外要求上：
+    单张图还没加载完时 nimg=1 / loaded=0，被判成"没图、也没信号词"直接跳过，
+    连抓图都不会尝试，v21/imgs 里根本没留下这张文件。
+    实测纯文本消息 nimg=0，所以 nimg>0 不会把纯文字消息也拖进抓图流程。"""
+    try:
+        return int((row or {}).get("nimg", 0) or 0) > 0
+    except Exception:
+        return False
+
+def img_wait_ms(row, has_kw):
+    """抓图等待预算。FETCH_IMG_JS 一旦拿到可用的图就立即返回，
+    所以这个预算只在"图确实加载不出来"时才真的等满。"""
+    try:
+        nimg = int((row or {}).get("nimg", 0) or 0)
+        nblob = int((row or {}).get("nblob", 0) or 0)
+    except Exception:
+        nimg = nblob = 0
+    return 6000 if (nimg >= 2 or nblob > 0 or not has_kw) else 1200
+
+def rawq_add(group, rec):
+    """把一条原始消息（目前是带图的消息）暂存；先不要求币种。"""
+    rec = dict(rec)
+    rec.setdefault("ts", time.time())
+    rec.setdefault("used", False)
+    rec.setdefault("pushed", False)
+    q = list(RAWQ.get(group, []))
+    q.append(rec)
+    now = time.time()
+    RAWQ[group] = [r for r in q if (now - r.get("ts", 0)) <= RAWQ_TTL][-RAWQ_MAX:]
+    return rec
+
+def rawq_pending_imgs(group, now=None):
+    """该群【窗口内、还没被用掉】的图记录（按时间正序）"""
+    now = now or time.time()
+    return [r for r in RAWQ.get(group, [])
+            if r.get("kind") == "img" and not r.get("used")
+            and (now - r.get("ts", 0)) <= RAWQ_WAIT]
+
+def _apply_chart(p, chart):
+    """把图上的线并入待确认池 —— 与 merge_pending 里的「图优先覆盖文字」规则保持一致。"""
+    if not (chart and chart.get("ok")):
+        return False
+    if chart.get("sl"):
+        p["stop"] = chart["sl"]; p["stop_src"] = "K线图"
+    # 文本写 CMP/现价时，入场价按规则取当前市价，不让图上的标签覆盖（0.12 已修的语义）
+    if chart.get("entry") and not p.get("entry_is_cmp"):
+        p["entry"] = chart["entry"]; p["entry_src"] = "K线图"
+    if chart.get("tps"):
+        p["tps"] = list(chart["tps"])
+    return True
+
+def rawq_bind(group, coin, p, now=None):
+    """文字消息带来币种后，把窗口内暂存的图【回填关联】到这条信号上。返回关联到的图片张数。"""
+    now = now or time.time()
+    n = 0
+    for r in rawq_pending_imgs(group, now):
+        r["used"] = True
+        r["bound_to"] = coin
+        _mc = (r.get("meta") or {}).get("coin")
+        for f in (r.get("imgs") or []):
+            if f not in (p.get("imgs") or []):
+                p.setdefault("imgs", []).append(f); n += 1
+        if r.get("text") and r["text"] not in (p.get("texts") or []):
+            p.setdefault("texts", []).append(r["text"][:400])
+        if _mc and str(_mc).upper() != str(coin).upper():
+            # 保护：图上币种和文字币种不一致时，只把图留档，**不用**图上的线覆盖文字点位
+            log("   📎 [图] 已关联到 %s，但图上币种=%s 与文字不一致 → 只留图、不用图上的线"
+                % (coin, _mc))
+        elif _apply_chart(p, r.get("chart")):
+            p["chart"] = r["chart"]
+        if n:
+            log("   📎 [图] 已回填关联到 %s（%d 张，距图 %.1fs）" % (coin, n, now - r.get("ts", now)))
+    return n
+
+def rawq_attach_pending(group, imgs, chart, meta=None, txt="", mid=None, now=None):
+    """文字先到、图后到：把刚抓到的图挂到【本群还没结束的待确认信号】上（反向顺序也要覆盖）。"""
+    now = now or time.time()
+    cands = [c for c, p in PENDING.items()
+             if (p.get("group") == group) and (not p.get("imgs"))
+             and (now - p.get("first_ts", 0)) <= (RAWQ_WAIT + 1.5)
+             and float(p.get("deadline") or 0) >= now]
+    if not cands:
+        return None
+    coin = cands[-1]
+    p = PENDING[coin]
+    n = 0
+    for f in (imgs or []):
+        if f not in (p.get("imgs") or []):
+            p.setdefault("imgs", []).append(f); n += 1
+    if txt and txt not in (p.get("texts") or []):
+        p.setdefault("texts", []).append(txt[:400])
+    _mc = (meta or {}).get("coin")
+    if _mc and str(_mc).upper() != str(coin).upper():
+        log("   📎 [图] 已并入 %s 的待确认池（%d 张），但图上币种=%s 不一致 → 只留图" % (coin, n, _mc))
+    elif _apply_chart(p, chart):
+        p["chart"] = chart
+    log("   📎 [图] 文字先到、图后到 → 已并入 %s 的待确认池（%d 张，消息 %s）" % (coin, n, mid))
+    return coin
+
+def fmt_price(v):
+    return ("%.8g" % v) if isinstance(v, (int, float)) else "未读到"
+
+def _push_img_only(group, rec, now=None):
+    """用户要求③：4 秒内没关联上文字 → 单独推送【这张图自己包含的信息】，缺失的一律"未读到"。"""
+    now = now or time.time()
+    ch = rec.get("chart") or {}
+    meta = rec.get("meta") or {}
+    when = rec.get("when") or datetime.datetime.fromtimestamp(
+        float(rec.get("t_sig") or rec.get("ts") or now), CST).strftime("%m-%d %H:%M:%S")
+    files = [os.path.basename(x) for x in (rec.get("imgs") or [])]
+    L = ["【信号·只识别到图】%s" % group, ""]
+    L.append("时间：%s ｜ 图：%s" % (when, "、".join(files) or "（未落盘）"))
+    if ch.get("ok"):
+        coin = meta.get("coin") or None
+        dirc = (meta.get("direction") or "").upper()
+        dirc_cn = "做多 LONG" if dirc == "LONG" else ("做空 SHORT" if dirc == "SHORT" else "未读到")
+        L.append("图上读到（来源：chart）：币种 %s ｜ 方向 %s" % (coin or "未读到", dirc_cn))
+        L.append("止损：%s（图上红色线，来源：chart）" % fmt_price(ch.get("sl")))
+        if ch.get("tps"):
+            L.append("止盈（图上横线，来源：chart，按离入场由近到远）：%s"
+                     % " / ".join(fmt_price(x) for x in ch["tps"]))
+        else:
+            L.append("止盈：未读到（图上没有可确认的横线）")
+        _others = [x for x in (ch.get("lines") or [])
+                   if x.get("value", 0) > (ch.get("sl") or 0) * 1.0005
+                   and all(abs(x["value"] - t) / max(abs(t), 1e-9) >= 0.003
+                           for t in (ch.get("tps") or []))]
+        if _others:
+            L.append("图上其余横线（不当止盈，供你参考）：%s"
+                     % "、".join(fmt_price(x["value"]) for x in _others[:4]))
+    else:
+        L.append("这张图已抓到并保存，但没能读出可用的点位（来源：chart）：%s"
+                 % (ch.get("why") or "未知原因"))
+    L.append("")
+    L.append("**未读到的（绝不猜）**：开仓/入场价、加仓点位、来源文字 —— 4 秒内本群没有等到"
+             "带币种的文字，图上也没有可确认的开仓价。")
+    L.append("本条只做通报，**不会下单**。要开单请补发文字信号（机器人不会替你猜缺失的点位）。")
+    notify("\n".join(L))
+
+def rawq_sweep(group=None, now=None):
+    """到点还没被关联的图 → 单独推送（用户要求③）。返回推送条数。"""
+    now = now or time.time()
+    n = 0
+    for g in ([group] if group else list(RAWQ)):
+        for r in list(RAWQ.get(g, [])):
+            if r.get("kind") != "img" or r.get("used") or r.get("pushed"):
+                continue
+            if (now - r.get("ts", 0)) < RAWQ_WAIT:
+                continue
+            r["pushed"] = True
+            _push_img_only(g, r, now)
+            log("   📎 [图] %.0f 秒内没等到带币种的文字 → 已单独推送（图=%d 张，图上有止损=%s）"
+                % (now - r.get("ts", now), len(r.get("imgs") or []),
+                   bool((r.get("chart") or {}).get("sl"))))
+            n += 1
+    return n
 
 # ---------------- 2R 兜底止盈（2026-09-13 用户决定）----------------
 # 背景：博主有时只给开仓价 + 止损，不给止盈（实例：LSK「Entry 0.21144 / SL 0.1993 / Risk 0.5%」，
@@ -2800,7 +3046,9 @@ SCAN_JS = """() => {
     const it = row.querySelector('.js-message-item');
     if (!it) continue;
     const imgs = Array.from(row.querySelectorAll('img')).filter(i => i.naturalWidth >= 150).length;
-    out.push({id: it.getAttribute('id'), nimg: row.querySelectorAll('img').length, loaded: imgs,
+    // blob: 开头的才是聊天里的【内容图】（头像是 https），所以即使还没加载完也能识别出"这条带图"
+    const blobs = Array.from(row.querySelectorAll('img')).filter(i => String(i.src).indexOf('blob:') === 0).length;
+    out.push({id: it.getAttribute('id'), nimg: row.querySelectorAll('img').length, loaded: imgs, nblob: blobs,
               text: (row.innerText || '').split(String.fromCharCode(10)).join(' ').slice(0, 1200)});
   }
   return out;
@@ -3453,6 +3701,7 @@ def main():
                     rows = page.evaluate(SCAN_JS)
                     if not rows:
                         finalize_pending(open_pos)          # 方案B：每个群扫完就检查一次出单
+                        rawq_sweep(g)                       # B16：4 秒内没关联上文字的图 → 单独推送
                         continue
                     base = last_id.get(g, 0)
                     cand = sorted([r for r in rows if r.get("id") and int(r["id"]) > base],
@@ -3523,15 +3772,22 @@ def main():
                                 log("   指令处理异常 " + str(_e)[:90])
                         SIG_KW = ["long", "Long", "LONG", "short", "Short", "SHORT", "Entry", "CMP",
                                   "做多", "做空", "止损", "止盈", "平仓", "减仓", "close", "Closed", "TP", "SL"]
-                        has_img = r.get("loaded", 0) > 0 or r.get("nimg", 0) >= 2
-                        if not any(k in txt for k in SIG_KW) and not has_img:
+                        _has_kw = any(k in txt for k in SIG_KW)
+                        # ⚠️ B16 修复（2026-09-15 实测）：原来是
+                        #    has_img = loaded>0 or nimg>=2 —— 要求"图已经加载完"或"≥2 个图片元素"。
+                        #    单张图**还没加载完**时 nimg=1 / loaded=0 → 被当成"没图、也没信号词" →
+                        #    在关键词门槛就判「闲聊/无关，跳过」，**连抓图都不会尝试**。
+                        #    21:57 那条 UNI 图消息就是这样丢的（v21/imgs 里根本没有这张文件）。
+                        #    实测纯文本消息 nimg=0，所以 nimg>0 就是"这条消息带图元素"。
+                        has_img = msg_has_image(r)
+                        if not _has_kw and not has_img:
                             log("   ↳ 闲聊/无关，跳过")
                             continue
                         t_found = time.time()
                         # 抓图：只要消息里有图片元素就尝试（等它真正加载）
                         imgs = []
                         if r.get("nimg", 0) > 0:
-                            wait_ms = 6000 if r.get("nimg", 0) >= 2 else 1200
+                            wait_ms = img_wait_ms(r, _has_kw)
                             data = page.evaluate(FETCH_IMG_JS, {"mid": mid, "waitMs": wait_ms})
                             for i, d in enumerate(data or []):
                                 if isinstance(d, str) and d.startswith("data:image"):
@@ -3540,8 +3796,9 @@ def main():
                                         open(fn, "wb").write(base64.b64decode(d.split(",", 1)[1])); imgs.append(fn)
                                     except Exception:
                                         pass
-                            if r.get("loaded", 0) > 0 or imgs:
-                                log("   媒体: 元素=%d 已加载=%d 抓到图=%d" % (r.get("nimg", 0), r.get("loaded", 0), len(imgs)))
+                            log("   媒体: 元素=%d 已加载=%d blob=%d 抓到图=%d%s"
+                                % (r.get("nimg", 0), r.get("loaded", 0), r.get("nblob", 0), len(imgs),
+                                   "" if imgs else "  ← 有图元素但没抓到内容图（未加载/非 blob）"))
                         t_img = time.time()
                         # ===== 方案C+D：本地正则先解析；需要 AI 时才调，且与读图并行 =====
                         # ===== 多币种消息：按币拆开、各自解析，然后逐个问用户（用户 2026-09-14 要求）=====
@@ -3674,13 +3931,18 @@ def main():
                             continue
                         dirc = (info.get("direction") or "").upper() or None
                         # 只有图、文字里没有币种 -> 从图上读币种
+                        _meta = {}
                         if coin is None and imgs:
-                            meta = read_chart_meta(imgs[-1])
-                            mc, mc_ok = resolve_coin(meta.get("coin"))
-                            if meta.get("is_chart") and mc and mc_ok:
+                            _meta = read_chart_meta(imgs[-1]) or {}
+                            mc, mc_ok = resolve_coin(_meta.get("coin"))
+                            if _meta.get("is_chart") and mc and mc_ok:
                                 coin = mc
-                                dirc = dirc or ((meta.get("direction") or "").upper() or "LONG")
+                                dirc = dirc or ((_meta.get("direction") or "").upper() or "LONG")
                                 log("   图上读到币种: %s %s" % (coin, dirc))
+                        # 这条消息的【文字】本身到底提供了什么？（B16：区分"文字信号"与"只有图"）
+                        _text_info = any(info.get(k) for k in
+                                         ("coin", "direction", "entry", "stop", "add_price", "targets",
+                                          "entryRange", "entryLegs", "stopRange", "stopPct"))
                         t_chart = time.time()
                         stamps = {"found": t_found, "img": t_img, "parse": t_parse, "chart": t_chart}
                         # 博主管理指令：立即处理（带确定性护栏，避免把"止盈达成"误判成"全部平仓"）
@@ -3713,10 +3975,13 @@ def main():
                                 except Exception as _e:
                                     log("   持仓汇报失败 " + str(_e)[:80])
                             continue
-                        if coin and dirc in ("LONG", "SHORT"):
+                        if coin and dirc in ("LONG", "SHORT") and _text_info:
                             # 开单信号 -> 进待确认池，等同一条信号的后续消息（卡片/图）补齐
                             p = merge_pending(coin, g, info=info, chart=chart, imgs=imgs, t_sig=t_sig, txt=txt, stamps=stamps)
                             if dirc: p["dir"] = dirc
+                            # B16：把【同群 4 秒内暂存的图】回填关联到这条信号（图常常是独立一条消息，
+                            # 它自己没有币种，挂不进 PENDING[coin]，原来就在这里被丢掉）
+                            rawq_bind(g, coin, p)
                             log("   待确认池 %s：开仓=%s(%s) 加仓=%s 止损=%s 止盈=%s 图=%d 已合并%d条消息" % (
                                 coin, p["entry"], p.get("entry_src") or "-", p["add"], p["stop"],
                                 sorted(set(p["tps"])), len(p["imgs"]), len(p["texts"])))
@@ -3729,6 +3994,26 @@ def main():
                             merge_pending(coin, g, info=info, chart=chart, imgs=imgs, t_sig=t_sig, txt=txt, stamps=stamps)
                             log("   并入 %s 的待确认池（补充信息，图=%d%s）"
                                 % (coin, len(imgs), "，持仓中→待更新止盈" if coin in open_pos else ""))
+                            if coin in PENDING:
+                                rawq_bind(g, coin, PENDING[coin])
+                        elif imgs:
+                            # ===== B16：带图但【没有可用文字信号】的消息 =====
+                            # 用户要求：图片必须能被读到、不能丢。这里先按「群 + 时间窗」原样暂存，
+                            # 不要求币种；4 秒内若有文字带来币种 → 回填关联；没等到 → 单独推送图的信息。
+                            # 注意：只有图（币种/方向是图上读出来的）**不建可审批单** ——
+                            # 用户明确：缺失的信息绝不瞎猜，只推送分析。
+                            if coin and dirc in ("LONG", "SHORT") and not _text_info:
+                                log("   📎 本条只有图（图上读到 %s %s），无文字信号 → 不建可审批单，转暂存"
+                                    % (coin, dirc))
+                            # 反向顺序也要覆盖：文字先到、图后到 → 直接并入那条还没结束的信号
+                            _att = rawq_attach_pending(g, imgs, chart, meta=_meta, txt=txt, mid=mid)
+                            if not _att:
+                                _rec = rawq_add(g, {"kind": "img", "mid": mid, "t_sig": t_sig, "g": g,
+                                                    "text": txt, "imgs": list(imgs), "chart": chart,
+                                                    "meta": _meta, "when": when, "coin": coin, "dir": dirc})
+                                log("   📎 [图] %d 张已暂存（本条没有可用文字：币种=%s 方向=%s）→ %.0f 秒内"
+                                    "等同群文字回填，没等到就单独推送"
+                                    % (len(imgs), coin or "-", dirc or "-", RAWQ_WAIT))
                         else:
                             # ⚠️ 2026-09-13：这里以前是【什么都不做、也不留一行日志】的静默丢弃。
                             #    实例：13:56 黄金mansoor 发「XAUUSD 👀 + 推文链接 + 图」，
@@ -3737,16 +4022,31 @@ def main():
                                 % (coin or "-", dirc or "-", len(imgs), info.get("type") or "-", txt[:100]))
                             _looks_signal = bool(coin) and (
                                 bool(imgs) or any(k in txt for k in ("止损", "止盈", "Entry", "SL", "TP")))
-                            if _looks_signal and (time.time() - _UNIDENT_NOTIFY.get(g, 0) > UNIDENT_NOTIFY_COOLDOWN):
+                            # B16 配套：**有文字、有价位、但没认出币种**的也算信号，不能静默丢弃
+                            # （原则「绝不静默丢弃」；原来这种消息只留一行日志，你根本不知道错过了）
+                            _no_coin_sig = (not coin) and (not imgs) and bool(re.search(r"[0-9]", txt)) and any(
+                                k in txt for k in ("止损", "止盈", "Entry", "SL", "TP",
+                                                   "做多", "做空", "long", "short"))
+                            if (_looks_signal or _no_coin_sig) and (
+                                    time.time() - _UNIDENT_NOTIFY.get(g, 0) > UNIDENT_NOTIFY_COOLDOWN):
                                 _UNIDENT_NOTIFY[g] = time.time()
-                                notify("【信号·未能识别】%s\n识别到币种 %s%s，但没能解析出方向/点位 "
-                                       "→ **未下单**，等你确认\n原文：%s"
-                                       % (coin, coin,
-                                          ("，图已抓到 %d 张（读了但没读出可用的方向/点位）" % len(imgs))
-                                          if imgs else "，无图",
-                                          txt[:200]))
+                                if _no_coin_sig:
+                                    notify("【信号·未能识别】%s\n这条**文字**里有价位，但没能认出币种 "
+                                           "→ **未下单**\n解析到：%s\n原文：%s"
+                                           % (g,
+                                              {k: v for k, v in (info or {}).items()
+                                               if k in ("direction", "entry", "stop", "targets")},
+                                              txt[:200]))
+                                else:
+                                    notify("【信号·未能识别】%s\n识别到币种 %s%s，但没能解析出方向/点位 "
+                                           "→ **未下单**，等你确认\n原文：%s"
+                                           % (coin, coin,
+                                              ("，图已抓到 %d 张（读了但没读出可用的方向/点位）" % len(imgs))
+                                              if imgs else "，无图",
+                                              txt[:200]))
                     # 方案B：本群处理完立刻检查一次出单（不再等整轮扫完 5 个群）
                     finalize_pending(open_pos)
+                    rawq_sweep(g)                       # B16：4 秒内没关联上文字的图 → 单独推送
                 except Exception as e:
                     msg = str(e)[:120]
                     log("[%s] 轮询异常 %s" % (g, msg))
@@ -3850,6 +4150,11 @@ def main():
                 finalize_pending(open_pos)
             except Exception as e:
                 log("待确认池处理异常 " + str(e)[:100])
+            # B16：图暂存区里 4 秒内没关联上文字的 → 单独推送（用户要求③）
+            try:
+                rawq_sweep()
+            except Exception as e:
+                log("图暂存区处理异常 " + str(e)[:100])
             # 纸面持仓监控：分批止盈（每档平 1/3）+ TP1 后止损移保本
             try:
                 for coin, tr in list(open_pos.items()):
@@ -4053,6 +4358,7 @@ if __name__ == "__main__":
         # ① 按交接文档第十一节第 16 条：生产路径全部重定向到 /tmp（这就是隔离的证明）
         _prod_log = BASE + "/v21/run.log"
         _before_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        _before_size = os.path.getsize(_prod_log)
         RUNTIME = _T + "/runtime_config.json"
         TRADES = _T + "/trades_dryrun.jsonl"
         STATE = _T + "/state.json"
@@ -4158,11 +4464,20 @@ if __name__ == "__main__":
         # ---------- ④ 隔离复核：生产文件一行都没动 ----------
         print("\n[3] 隔离复核")
         _after_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
-        print("  生产 run.log 行数：自检前 %d → 自检后 %d  %s"
-              % (_before_lines, _after_lines,
-                 "[ OK ] 未被写入" if _before_lines == _after_lines else "[FAIL] 被写入了！"))
-        if _before_lines != _after_lines:
-            _fail.append("隔离：生产 run.log 被写入")
+        # ⚠️ 判据修正（2026-09-16）：原来拿"行数不变"当隔离判据，但机器人进程本身每 10 秒写一条
+        #    心跳，只要它活着行数必然涨 → 这个断言会**永远误报**（B1 自检要跑好几分钟，必中）。
+        #    真判据：自检开始【之后新增】的那些行里，不许有本次自检写入的内容。
+        with open(_prod_log, "rb") as _f:
+            _f.seek(_before_size)
+            _appended = _f.read().decode("utf-8", "replace")
+        _leak = [l for l in _appended.splitlines()
+                 if ("B1 自检" in l or "b1_selftest" in l or "自愈" in l and "B1" in l)]
+        print("  生产 run.log 行数：自检前 %d → 自检后 %d（新增 %d 行）  %s"
+              % (_before_lines, _after_lines, _after_lines - _before_lines,
+                 "[ OK ] 新增行里没有自检痕迹" if not _leak else "[FAIL] 被写入了！"))
+        print("      ↳ 新增行示例：%s" % ((_appended.splitlines() or ["-"])[-1][:70]))
+        if _leak:
+            _fail.append("隔离：生产 run.log 被写入（%d 行）" % len(_leak))
         print("  生产 state.json mtime          = %s"
               % time.strftime("%Y-%m-%d %H:%M:%S",
                               time.localtime(os.path.getmtime(BASE + "/v21/state.json"))))
@@ -4475,6 +4790,232 @@ if __name__ == "__main__":
                 print("   ✗ %s" % _f)
             sys.exit(1)
         print("B5/B10/B3 自检：全部通过 ✅")
+        sys.exit(0)
+
+    if "--selftest-imgmerge" in sys.argv:
+        # ===== B16 自检：图片消息不许丢（抓图门槛 / 群+时间窗暂存 / 回填关联 / 单独推送）=====
+        # 用例全部取自【真实生产证据】：
+        #   · 21:57:19 那条没有文字、只有图的消息（run.log：预览文本只有发送者名「用户963038」
+        #     → 被判「闲聊/无关，跳过」；v21/imgs 里没有对应文件）
+        #   · 19:03:10 那张真实落盘的 UNI 图（v21/imgs/7685715944936623383_0.png）
+        #     + 21:57 那条真实 UNI 文本
+        # 完全隔离在 /tmp：不碰生产配置/状态/日志/图片目录，不发飞书，不下单。
+        import shutil, hashlib
+        _T = "/tmp/imgmerge_selftest"
+        _PROD = "/home/ubuntu/signal-bot"
+        _prod_log = _PROD + "/v21/run.log"
+        _prod_state = _PROD + "/v21/state.json"
+        _prod_rt = _PROD + "/runtime_config.json"
+        _prod_bot = _PROD + "/dryrun_bot2.py"
+        _prod_imgdir = _PROD + "/v21/imgs"
+        _before_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        _before_size = os.path.getsize(_prod_log)
+        _mt = {p: os.path.getmtime(p) for p in (_prod_rt,)}
+        # ⚠️ state.json 不能比 mtime：机器人本身每轮都在重写它（含心跳 ts），那不是"被测试改了"。
+        #    改成比【内容里的持仓数】，这才是真的"没人动过生产状态"。
+        _prod_open_before = len((json.load(open(_prod_state, encoding="utf-8")) or {}).get("open") or {})
+        _md5 = hashlib.md5(open(_prod_bot, "rb").read()).hexdigest()
+        _img_before = set(os.listdir(_prod_imgdir))
+        shutil.rmtree(_T, ignore_errors=True)
+        os.makedirs(_T, exist_ok=True)
+        RUNTIME = _T + "/runtime_config.json"
+        TRADES = _T + "/trades_dryrun.jsonl"
+        STATE = _T + "/state.json"
+        LOGF = _T + "/run.log"
+        IMGDIR = _T + "/imgs"
+        NOTIFY_CFG = _T + "/notify.json"      # 不存在 → 不发飞书
+        RUN = _T + "/run"                     # 读图中间产物也不许落到生产 v21/
+        os.makedirs(IMGDIR, exist_ok=True)
+        os.makedirs(RUN, exist_ok=True)
+
+        # 捕获通知文本（既验证内容，又保证不真的推飞书）
+        _SENT = []
+        _real_notify = notify
+
+        def notify(text):                      # noqa: F811 —— 只在本次自检里替换
+            _SENT.append(str(text))
+            log("[通知] " + str(text).replace("**", "").replace("\n", " | ")[:200])
+
+        print("=" * 72)
+        print("B16 自检：图片消息不能再丢（门槛 / 暂存 / 回填关联 / 单独推送）")
+        print("=" * 72)
+        print("路径重定向证明（全部在 /tmp，生产零写入）：")
+        for _k in ("RUNTIME", "TRADES", "STATE", "LOGF", "IMGDIR", "NOTIFY_CFG", "RUN"):
+            print("  %-11s = %s" % (_k, eval(_k)))
+        _fail = []
+
+        def _chk(name, got, want):
+            _ok = (got == want)
+            print("  %s %-56s got=%s want=%s" % ("[ OK ]" if _ok else "[FAIL]", name, got, want))
+            if not _ok:
+                _fail.append(name)
+
+        # ---------- ① 抓图门槛：未加载的单张图也必须算"有图" ----------
+        print("\n[1] 抓图门槛（21:57 事故复刻：nimg=1 / loaded=0 被判成'没图'）")
+        _row_2177 = {"id": "7685776121886936012", "nimg": 1, "loaded": 0, "nblob": 1,
+                     "text": "用户963038"}
+        _row_text = {"id": "7685776121886936011", "nimg": 0, "loaded": 0, "nblob": 0,
+                     "text": "Going long on UNI here at CMP. TPs above, 4H close under 6.39 for stops."}
+        _chk("未加载的单图消息 → 判为有图（旧代码 False）", msg_has_image(_row_2177), True)
+        _chk("纯文本消息 → 判为无图（不会白白等图）", msg_has_image(_row_text), False)
+        _chk("未加载的单图 → 抓图预算给足 6 秒", img_wait_ms(_row_2177, False), 6000)
+        _chk("内容图已加载/带关键词 → 也给 6 秒（JS 拿到就提前返回，不真等满）",
+             img_wait_ms({"nimg": 1, "nblob": 1, "loaded": 1}, True), 6000)
+        _chk("无内容图、只有关键词 → 仍只等 1.2 秒（不拖慢出单）",
+             img_wait_ms({"nimg": 1, "nblob": 0, "loaded": 0}, True), 1200)
+        _chk("SCAN_JS 已上报 blob 内容图数量", "nblob" in SCAN_JS, True)
+
+        # ---------- ② 真实图：读图必须读出三档止盈 ----------
+        print("\n[2] 真实图读图（v21/imgs/7685715944936623383_0.png，UNI 那张真图）")
+        _real = _prod_imgdir + "/7685715944936623383_0.png"
+        _ch = {}
+        if os.path.exists(_real):
+            _ch = read_chart(_real) or {}
+            print("     ↳ read_chart = sl=%s entry=%s tps=%s" % (_ch.get("sl"), _ch.get("entry"), _ch.get("tps")))
+            _chk("止损读到 6.396", _ch.get("sl"), 6.396)
+            _chk("三档止盈 = 7.180 / 8.216 / 9.289（原来只读到 9.289）",
+                 [round(x, 3) for x in (_ch.get("tps") or [])], [7.18, 8.216, 9.289])
+            _chk("价格轴刻度 9.302 未被当成止盈线", 9.302 in (_ch.get("tps") or []), False)
+        else:
+            print("     ⚠️ 生产图不存在，跳过（%s）" % _real)
+            _ch = {"ok": True, "sl": 6.396, "entry": 6.513, "tps": [7.18, 8.216, 9.289],
+                   "lines": [{"value": 7.18, "color": "white", "cov": 0.74},
+                             {"value": 8.216, "color": "white", "cov": 0.79},
+                             {"value": 9.289, "color": "green", "cov": 0.86}]}
+
+        # ---------- ③ 图先到、文字后到 → 回填关联 ----------
+        print("\n[3] 顺序A：图先到（无币种）→ 文字带来币种 → 回填关联")
+        RAWQ.clear(); PENDING.clear(); ASKING.clear(); _SENT.clear()
+        open_pos_ref.clear()
+        _imgfile = IMGDIR + "/fake_uni_0.png"
+        open(_imgfile, "wb").write(b"x")        # 占位文件（真实图只读，不动生产）
+        _rec = rawq_add("机器人开单通知", {"kind": "img", "mid": "1", "imgs": [_imgfile],
+                                          "chart": _ch, "meta": {"coin": "UNI", "direction": "LONG",
+                                                                 "is_chart": True},
+                                          "text": "用户963038", "when": "09-15 21:57:16"})
+        _chk("图已进暂存区（无币种也能存下）", len(rawq_pending_imgs("机器人开单通知")), 1)
+        _txt_uni = ("Going long on UNI here at CMP. TPs above, 4H close under 6.39 for stops. "
+                    "Nice looking SR flip and way stronger than before.")
+        _info_uni = dict(fast_parse(_txt_uni) or {})
+        _info_uni["coin"] = "UNI"; _info_uni["direction"] = "LONG"; _info_uni["entry_is_cmp"] = True
+        _p = merge_pending("UNI", "机器人开单通知", info=_info_uni, t_sig=0, txt=_txt_uni,
+                           stamps={"found": time.time(), "img": 0.0, "parse": time.time(), "chart": 0.0})
+        _p["dir"] = "LONG"
+        _n = rawq_bind("机器人开单通知", "UNI", _p)
+        _chk("回填关联到 UNI（1 张图）", _n, 1)
+        _chk("UNI 待确认池已带图", _p.get("imgs"), [_imgfile])
+        _chk("止损取自图上的红线 6.396（图优先）", _p.get("stop"), 6.396)
+        _chk("三档止盈取自图上横线", [round(x, 3) for x in sorted(set(_p.get("tps") or []))],
+             [7.18, 8.216, 9.289])
+        _chk("文字写 CMP → 入场价按规则取当前市价（不受图上标签影响）",
+             bool(_p.get("entry_is_cmp")), True)
+        _chk("已关联的图不会再被单独推送", rawq_sweep("机器人开单通知"), 0)
+        _chk("没有产生任何通知（正常信号走审批，不走图通报）", len(_SENT), 0)
+
+        # ---------- ④ 4 秒内没关联上 → 单独推送，且不建可审批单 ----------
+        print("\n[4] 顺序B：4 秒内没等到文字 → 单独推送图自己的信息（用户要求③）")
+        RAWQ.clear(); PENDING.clear(); ASKING.clear(); _SENT.clear()
+        rawq_add("黄金mansoor", {"kind": "img", "mid": "2", "imgs": [_imgfile], "chart": _ch,
+                                 "meta": {"coin": "UNI", "direction": "LONG", "is_chart": True},
+                                 "text": "Photo strip", "when": "09-15 20:21:43"})
+        _chk("未到 4 秒不推送（不抢跑）", rawq_sweep("黄金mansoor", now=time.time()), 0)
+        time.sleep(0.2)
+        _n2 = rawq_sweep("黄金mansoor", now=time.time() + RAWQ_WAIT + 0.1)
+        _chk("到 4 秒 → 推送 1 条", _n2, 1)
+        _t2 = _SENT[-1] if _SENT else ""
+        print("     ——实际推送内容——")
+        for _l in _t2.splitlines():
+            print("       %s" % _l)
+        _chk("推送标题是「只识别到图」", "【信号·只识别到图】" in _t2, True)
+        _chk("推送里带图上止损 6.396", "6.396" in _t2, True)
+        _chk("推送里带三档止盈", all(x in _t2 for x in ("7.18", "8.216", "9.289")), True)
+        _chk("明确写出「未读到的（绝不猜）」", "未读到的（绝不猜）" in _t2, True)
+        _chk("明确说明不会下单", "不会下单" in _t2, True)
+        _chk("没有建立可审批单（用户要求：只有图不建单）", (len(PENDING), len(ASKING)), (0, 0))
+        _chk("同一条图不会重复推送", rawq_sweep("黄金mansoor", now=time.time() + 60), 0)
+
+        # ---------- ⑤ 顺序C：文字先到、图后到 ----------
+        print("\n[5] 顺序C：文字先到（4 秒窗口内）、图后到 → 并入同一条信号")
+        RAWQ.clear(); PENDING.clear(); ASKING.clear(); _SENT.clear()
+        _p3 = merge_pending("UNI", "机器人开单通知", info=_info_uni, t_sig=0, txt=_txt_uni,
+                            stamps={"found": time.time(), "img": 0.0, "parse": time.time(),
+                                    "chart": 0.0})
+        _p3["dir"] = "LONG"
+        _coin3 = rawq_attach_pending("机器人开单通知", [_imgfile], _ch,
+                                     meta={"coin": "UNI", "direction": "LONG", "is_chart": True},
+                                     txt="Photo strip", mid="3")
+        _chk("图被并入 UNI 的待确认池", _coin3, "UNI")
+        _chk("并入后带图", _p3.get("imgs"), [_imgfile])
+        _chk("并入后止损用图上的 6.396", _p3.get("stop"), 6.396)
+        _chk("并入后不会再多推一条「只有图」", rawq_sweep("机器人开单通知", now=time.time() + 60), 0)
+
+        # ---------- ⑥ 保护：图上币种与文字币种不一致 ----------
+        print("\n[6] 保护：图上币种与文字币种不一致 → 只留图，不用图上的线覆盖文字点位")
+        RAWQ.clear(); PENDING.clear(); ASKING.clear(); _SENT.clear()
+        rawq_add("暴富龙", {"kind": "img", "mid": "4", "imgs": [_imgfile], "chart": _ch,
+                            "meta": {"coin": "BTC", "direction": "LONG", "is_chart": True},
+                            "text": "", "when": "09-15 22:00:00"})
+        _info_eth = {"coin": "ETH", "direction": "LONG", "stop": 2400.0, "targets": [2500.0]}
+        _p4 = merge_pending("ETH", "暴富龙", info=_info_eth, t_sig=0, txt="ETH 做多 止损2400 止盈2500",
+                            stamps={"found": time.time(), "img": 0.0, "parse": time.time(),
+                                    "chart": 0.0})
+        _p4["dir"] = "LONG"
+        rawq_bind("暴富龙", "ETH", _p4)
+        _chk("图留档了", bool(_p4.get("imgs")), True)
+        _chk("但止损仍是文字的 2400（没被图上的 6.396 覆盖）", _p4.get("stop"), 2400.0)
+        _chk("止盈仍是文字的 [2500]", _p4.get("tps"), [2500.0])
+
+        # ---------- ⑦ B10 残留：Going long on X ----------
+        print("\n[7] B10 残留：「Going long on UNI」的 on 不能再被当成币种 ON")
+        _fp = fast_parse(_txt_uni) or {}
+        _chk("coin = UNI（原来 = ON）", _fp.get("coin"), "UNI")
+        _chk("方向仍是 LONG", _fp.get("direction"), "LONG")
+        _chk("止损仍读到 6.39", _fp.get("stop"), 6.39)
+        _chk("无介词写法「Going long LSK here at CMP」不受影响",
+             (fast_parse("Going long LSK here at CMP. SL 0.1993") or {}).get("coin"), "LSK")
+        _chk("「Selling BTC」这类模板不受影响",
+             (fast_parse("Selling BTC here, SL 60000") or {}).get("coin"), "BTC")
+
+        # ---------- ⑧ 合并窗口仍是 4 秒 ----------
+        print("\n[8] 合并窗口没被拖慢（用户要求②）")
+        _chk("PENDING_WAIT 仍是 4 秒", PENDING_WAIT, 4)
+        _chk("图关联窗口 = 合并窗口", RAWQ_WAIT, PENDING_WAIT)
+
+        # ---------- ⑨ 隔离复核 ----------
+        print("\n[9] 隔离复核（生产零写入）")
+        _after_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        # ⚠️ 不能拿"生产 run.log 行数不变"当隔离判据 —— 机器人自己每 10 秒就写一条心跳，
+        #    行数必然会涨（第一次跑就这么误报了一次）。真判据是：
+        #    **自检开始之后新增的那些行里，不许有任何一行来自本次自检**。
+        with open(_prod_log, "rb") as _f:
+            _f.seek(_before_size)
+            _appended = _f.read().decode("utf-8", "replace")
+        _leak = [l for l in _appended.splitlines()
+                 if ("B16" in l or "📎" in l or "只识别到图" in l
+                     or "imgmerge_selftest" in l or "已暂存" in l or "回填关联" in l)]
+        _chk("自检没有往生产 run.log 写入任何内容（只看新增行）", _leak, [])
+        print("      ↳ 自检期间生产日志新增 %d 行（全部是机器人自己的心跳，示例：%s）"
+              % (_after_lines - _before_lines,
+                 (_appended.splitlines() or ["-"])[-1][:60]))
+        _prod_open_after = len((json.load(open(_prod_state, encoding="utf-8")) or {}).get("open") or {})
+        _chk("生产 state.json 的持仓数未被改动（内容比对，不比 mtime —— 机器人每轮都重写它）",
+             _prod_open_after, _prod_open_before)
+        _chk("生产 runtime_config.json mtime 未变",
+             os.path.getmtime(_prod_rt), _mt[_prod_rt])
+        _chk("生产 dryrun_bot2.py 未被这次自检改动",
+             hashlib.md5(open(_prod_bot, "rb").read()).hexdigest(), _md5)
+        _new_imgs = set(os.listdir(_prod_imgdir)) - _img_before
+        _chk("生产 v21/imgs 没有被写入", sorted(_new_imgs), [])
+        print("  /tmp 产物：%s" % ", ".join(sorted(os.listdir(_T))))
+        print("  本次自检里 notify() 被替换为捕获函数（不会推飞书），共捕获 %d 个函数" % 1)
+
+        print("\n" + "-" * 72)
+        if _fail:
+            print("B16 自检：%d 项失败" % len(_fail))
+            for _f in _fail:
+                print("   ✗ %s" % _f)
+            sys.exit(1)
+        print("B16 自检：全部通过 ✅")
         sys.exit(0)
 
     main()
