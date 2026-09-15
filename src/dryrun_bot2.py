@@ -7,7 +7,7 @@
 - 只处理开单信号；闲聊直接跳过；博主管理指令单独处理
 - 全链路计时：信号发出 → 发现 → 抓图 → 解析 → 读图 → 下单(纸面) → 推送
 """
-import os, re, sys, json, time, base64, datetime, threading, hashlib, math
+import os, re, sys, json, time, base64, datetime, threading, hashlib, math, itertools
 os.environ.setdefault("DISPLAY", ":99")
 import requests
 from PIL import Image
@@ -1190,6 +1190,134 @@ MIN_STOP_PCT = 0.0005    # 止损距离小于 0.05% → 等于没设止损
 # ===== 待人工确认（用户 2026-09-14：把握不准必须问我，回「开」才开）=====
 ASKING = {}              # coin -> {p, reason, ask_ts, txt}
 ASK_TIMEOUT = 1800       # 30 分钟没回复自动作废
+# 用户 2026-09-15 第 12 条硬要求：**所有订单在开之前都必须经我审批**（不再只问"把握不准"的）。
+# 默认 True；可用 runtime_config.json 的 require_approval 关掉（关掉后恢复"只在把握不准时问"）。
+REQUIRE_APPROVAL = [True]
+
+
+def _jsonable(o, depth=0):
+    """把任意结构安全地变成能 json.dump 的东西 —— 用于把待确认池落盘（B11）。
+    绝不允许因为某个字段不可序列化而让整个 state.json 落盘失败（那会连带弄丢持仓）。"""
+    if depth > 4:
+        return str(o)[:200]
+    if o is None or isinstance(o, (str, int, float, bool)):
+        return o
+    if isinstance(o, dict):
+        return {str(k): _jsonable(v, depth + 1) for k, v in list(o.items())[:40]}
+    if isinstance(o, (list, tuple, set)):
+        return [_jsonable(x, depth + 1) for x in list(o)[:200]]
+    return str(o)[:200]
+
+
+def _asking_dump():
+    """待确认池的可落盘形式（B11：原来只存在内存里，机器人一重启就静默丢失）"""
+    out = {}
+    for c, v in ASKING.items():
+        if not isinstance(v, dict):
+            continue
+        out[c] = {"reason": _jsonable(v.get("reason")), "ask_ts": v.get("ask_ts"),
+                  "txt": _jsonable(v.get("txt")), "p": _jsonable(v.get("p") or {})}
+    return out
+
+
+def _fmt_num(x):
+    try:
+        return "%.8g" % float(x)
+    except Exception:
+        return str(x)
+
+
+def _plan_score(p):
+    """待确认参数的「完整度」打分 —— 用来防止**更差的解析覆盖掉更好的解析**（B11 实测事故）。
+    19:03 UNI：先由图读到好的（开仓=6.513 止损=6.396 止盈=[9.289]），
+    随后一条纯文字的差解析（开仓=None 止损=6.39 止盈=[6.39]，止盈还等于止损）把它整体覆盖了。"""
+    s = 0
+    if isinstance(p.get("entry"), (int, float)) and p.get("entry"):
+        s += 3
+    if p.get("legs"):
+        s += 3
+    if isinstance(p.get("stop"), (int, float)) and p.get("stop"):
+        s += 2
+    s += min(len([t for t in (p.get("tps") or []) if isinstance(t, (int, float))]), 3)
+    return s
+
+
+def _approval_lines(coin, p, d):
+    """审批通知里的详细清单 —— 用户第 8 条硬要求：币种 / 时间 / 开单金额 / 杠杆 /
+    止损位 / **止损点数（不含杠杆）** / 各档止盈位 / **各档预期收益率（含杠杆）**。"""
+    entry = p.get("entry")
+    _lg = [float(x) for x in (p.get("legs") or []) if isinstance(x, (int, float))]
+    if (not isinstance(entry, (int, float)) or not entry) and _lg:
+        entry = sum(_lg) / len(_lg)
+    stop = p.get("stop")
+    tps = set(t for t in (p.get("tps") or []) if isinstance(t, (int, float)))
+    if entry:
+        tps = sorted(tps, key=lambda t: abs(float(t) - float(entry)))
+    else:
+        tps = sorted(tps)
+    out = ["币种：%s ｜ 方向：%s ｜ 来源群：%s"
+           % (coin, "做多 LONG" if d == 1 else "做空 SHORT", p.get("group") or "-"),
+           "时间：%s" % datetime.datetime.now(CST).strftime("%m-%d %H:%M:%S")]
+    if isinstance(entry, (int, float)) and entry:
+        out.append("入场：%s%s" % (_fmt_num(entry),
+                                 ("（%s）" % p["entry_src"]) if p.get("entry_src") else ""))
+    else:
+        out.append("入场：**未读到**")
+    if _lg:
+        out.append("分批建仓：%d 个点位 %s（保证金等分）"
+                   % (len(_lg), "、".join(_fmt_num(x) for x in _lg)))
+    out.append("保证金：%.0fU ｜ 杠杆：%d 倍 ｜ 名义：%.0fU" % (MARGIN, LEV, MARGIN * LEV))
+    if isinstance(stop, (int, float)) and stop:
+        out.append("止损位：%s" % _fmt_num(stop))
+        if isinstance(entry, (int, float)) and entry:
+            _pt = abs(float(entry) - float(stop))
+            _pct = _pt / float(entry)
+            out.append("止损点数（不含杠杆）：%s ｜ 占入场 %.2f%%" % (_fmt_num(_pt), _pct * 100))
+            out.append("若打止损：亏 %.1fU（保证金 %.0fU 的 %.1f%%）" % (MARGIN * _pct * LEV, MARGIN, _pct * LEV * 100))
+    else:
+        out.append("止损位：**未读到**")
+    if tps:
+        for i, t in enumerate(list(tps)[:TP_TIERS], 1):
+            _seg = ["止盈%d：%s" % (i, _fmt_num(t))]
+            if isinstance(entry, (int, float)) and entry:
+                _rr = (float(t) - float(entry)) / float(entry) * (1 if d == 1 else -1)
+                _seg.append("预期收益 %+.1f%%（含 %d 倍杠杆）" % (_rr * LEV * 100, LEV))
+                if isinstance(stop, (int, float)) and stop and abs(float(entry) - float(stop)) > 0:
+                    _seg.append("盈亏比 %.2f:1"
+                                % (abs(float(t) - float(entry)) / abs(float(entry) - float(stop))))
+            out.append(" ｜ ".join(_seg))
+    else:
+        out.append("止盈：**未读到**")
+    return out
+
+
+def _combo_options(names):
+    """多币种审批要给出**完整组合**（用户 2026-09-15 指出 B4：原来只给两个示例，
+    而且「只开A和B」与「只开A，不开B」语义重复）。
+    n 个币 → 2^n-1 种非空组合；n≥4 时列表太长，退化成"逐个单选 + 全部开"，并提示可自由回复。"""
+    names = list(dict.fromkeys(names))
+    n = len(names)
+    if n < 2:
+        return ["· 全部不开"]
+    if n <= 3:
+        opts = []
+        for k in range(1, n + 1):
+            for cb in itertools.combinations(names, k):
+                _j = " 和 ".join(cb)
+                if k == n:
+                    opts.append("· 全部开（%s）" % _j)
+                elif k == 1:
+                    opts.append("· 只开 %s" % _j)
+                else:
+                    opts.append("· 只开 %s" % _j)
+        opts.append("· 全部不开")
+        return opts
+    opts = ["· 只开 %s" % c for c in names]
+    opts.append("· 全部开（%s）" % " 和 ".join(names))
+    opts.append("· 全部不开")
+    opts.append("（%d 个币组合太多，也支持自由回复，例如「只开 %s 和 %s」）"
+                % (n, names[0], names[1]))
+    return opts
 
 
 def fallback_tp_2r(entry, stop, dirc, mult=R_FALLBACK_MULT):
@@ -1258,26 +1386,39 @@ def split_by_coin(txt):
 
 
 def ask_user(coin, p, reason, quiet=False):
-    """把握不准 → 挂起并询问用户。回「开」才开单，回「不开」作废。
-    quiet=True 时只挂起、不发单独通知（多币种消息由调用方汇总成一条）。"""
+    """需要用户审批 / 把握不准 → 挂起并询问用户。回「开」才开单，回「不开」作废。
+    quiet=True 时只挂起、不发单独通知（多币种消息由调用方汇总成一条）。
+
+    ⚠️ B11 修复（2026-09-15）：**更差的解析不许覆盖更完整的待确认参数**。
+       实测事故：UNI 先由图读到好的（开仓=6.513 止损=6.396 止盈=[9.289]），
+       随后一条纯文字的差解析（开仓=None 止损=6.39 止盈=[6.39]，止盈还等于止损）
+       把它整体覆盖掉了 —— 用户看到并差点批准的是一条坏参数。
+       现在：新参数完整度更低 → 保留原参数、只记一行日志、不重新打扰用户。"""
+    old = ASKING.get(coin)
+    if old and _plan_score(p or {}) < _plan_score(old.get("p") or {}):
+        _op, _np = (old.get("p") or {}), (p or {})
+        log("   ↺ %s 待确认参数：本次解析更差（完整度 %d < %d）→ **不覆盖**，保留原参数"
+            % (coin, _plan_score(_np), _plan_score(_op)))
+        log("     保留：开仓=%s 止损=%s 止盈=%s ｜ 丢弃：开仓=%s 止损=%s 止盈=%s"
+            % (_op.get("entry"), _op.get("stop"), _op.get("tps"),
+               _np.get("entry"), _np.get("stop"), _np.get("tps")))
+        return
     ASKING[coin] = {"p": p, "reason": reason, "ask_ts": time.time(),
                     "txt": (p["texts"][0][:300] if p.get("texts") else "")}
     if quiet:
         log("   ❓ 已挂起等用户确认：%s（%s）" % (coin, reason))
         return
     d = 1 if (p.get("dir") or "LONG").upper() == "LONG" else -1
-    tps = sorted(set(p.get("tps") or []))
-    notify("\n".join([
-        "【信号·待你确认】%s %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"),
-        "⚠️ 把握不准的原因：%s" % reason,
-        "解析结果：开仓=%s ｜ 止损=%s ｜ 止盈=%s"
-        % (p.get("entry") if p.get("entry") is not None else "未读到",
-           p.get("stop") if p.get("stop") is not None else "未读到",
-           tps if tps else "未读到"),
-        "原文：%s" % (p["texts"][0][:180] if p.get("texts") else ""),
-        "",
-        "**回复「开」= 按上面这组参数开单；回复「不开」= 作废。**",
-        "（%d 分钟内没回复自动作废）" % (ASK_TIMEOUT // 60)]))
+    notify("\n".join(
+        ["【信号·待你确认】%s %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"),
+         "⚠️ 要你确认的原因：%s" % reason,
+         "──────────────"]
+        + _approval_lines(coin, p, d)
+        + ["──────────────",
+           "原文：%s" % (p["texts"][0][:180] if p.get("texts") else ""),
+           "",
+           "**回复「开」= 按上面这组参数开单；回复「不开」= 作废。**",
+           "（%d 分钟内没回复自动作废）" % (ASK_TIMEOUT // 60)]))
     log("   ❓ 已挂起等用户确认：%s（%s）" % (coin, reason))
 
 
@@ -1474,16 +1615,64 @@ def finalize_pending(open_pos):
             log("   🛑 总敞口超限：%.0f + %.0f > %.0f" % (_exp, MARGIN, _exposure_cap()))
             PENDING.pop(coin, None)
             continue
-        # 用户 2026-09-15：达到持仓上限时【询问我】是否提高上限开单，不再直接跳过
+        # ===== 审批闸门（用户 2026-09-15 第 12/13 条硬要求）=====
+        # ① 所有**新开仓**在开之前都必须经用户审批（不再只问"把握不准"的）；
+        # ② 达到持仓上限时一并询问是否提高上限。
+        # 两件事**合成一次询问**，避免同一个信号被问两遍（旧代码会把达上限问一次，
+        # 用户回「开」把信号放回 PENDING 后，审批闸门又问一次）。
+        # 注意：已有持仓的止盈/止损更新不是"开新单"，不在这里拦。
+        _ask_why = []
         if over_cap and not p.get("cap_override"):
-            ask_user(coin, p,
-                     "当前已持 %d 笔，达到持仓上限 %d 笔。"
-                     "回复「开」= 把上限**提高**到 %d 笔并开这一单；回「不开」= 放弃"
-                     % (len(open_pos), MAX_OPEN, len(open_pos) + 1))
+            _ask_why.append("当前已持 %d 笔，达到持仓上限 %d 笔；回「开」= 把上限提高到 %d 笔并开这一单"
+                            % (len(open_pos), MAX_OPEN, len(open_pos) + 1))
+        if REQUIRE_APPROVAL[0] and not p.get("approved") and coin not in open_pos:
+            _ask_why.append("按你的要求：所有订单在开之前都要经你审批（本次已通过全部机器校验）")
+        if _ask_why:
+            ask_user(coin, p, "；".join(_ask_why))
             PENDING.pop(coin, None)
             continue
         if coin in open_pos:
             _ex = open_pos[coin]
+            # ===== B14 修复（2026-09-15 生产实测事故）：更新已有持仓的止盈之前，
+            #   必须按【持仓自己的方向 + 持仓自己的入场价】重新校验，
+            #   **绝不能沿用新信号的方向**（上面的方向过滤是按新信号做的，这里语境完全不同）。
+            #   事故：ETH 持仓是 SHORT（入场 2503.49），新信号是「ETH 做多、分批 2465/2466、止盈 2520」；
+            #   2520 相对新信号入场 2465.5 合法（在上方）→ 于是被无条件写到 SHORT 持仓上
+            #   → 空单的止盈落在入场价上方 → 当前价本就满足 → **19:20:32 瞬间假成交**，
+            #   还把 -5.94U（净 -6.57U）的亏损记成 exit_why="全部止盈"，并污染连亏计数（0→1）。
+            _exd = (_ex.get("dir") or "LONG").upper()
+            _exe = _ex.get("entry")
+            _tp_rejected = False
+            if tps and isinstance(_exe, (int, float)) and _exe:
+                _wrong = _tp_wrong_side(_exd, _exe, tps)
+                if _wrong:
+                    tps = [t for t in tps if t not in _wrong]
+                    _tp_rejected = True
+                    log("   ⛔ %s 止盈更新被拒：%s 相对**持仓**方向不合法（持仓 %s 入场 %.8g，"
+                        "止盈应在入场价%s）" % (coin, _wrong, _exd, _exe,
+                                          "上方" if _exd == "LONG" else "下方"))
+                    notify("【信号·拒绝】%s 止盈更新被拒（方向不对）\n"
+                           "持仓：%s 入场 %.8g ｜ 现有止盈 %s\n"
+                           "本次要挂的止盈 %s 落在持仓的错误一侧（%s 的止盈应在入场价%s）"
+                           "→ 挂上去会**立刻被判为成交**，已拒绝\n原文：%s"
+                           % (coin, _exd, _exe, _ex.get("tps"), _wrong, _exd,
+                              "上方" if _exd == "LONG" else "下方",
+                              p["texts"][0][:120] if p["texts"] else ""))
+            if tps:
+                _cur = None
+                try:
+                    _cur = price_of(coin)
+                except Exception:
+                    pass
+                if isinstance(_cur, (int, float)) and _cur:
+                    _crossed = _tp_wrong_side(_exd, _exe, tps, ref=_cur)
+                    if _crossed:
+                        tps = [t for t in tps if t not in _crossed]
+                        _tp_rejected = True
+                        log("   ⛔ %s 止盈更新被拒：%s 已被当前价 %.8g 越过" % (coin, _crossed, _cur))
+                        notify("【信号·拒绝】%s 止盈更新被拒（已被越过）\n"
+                               "本次要挂的止盈 %s 已被当前价 %.8g 越过 —— 挂上去会立刻成交，已拒绝\n"
+                               "现有止盈保留：%s" % (coin, _crossed, _cur, _ex.get("tps")))
             # ===== 博主后来补了真实止盈位 → 撤掉 2R 兜底那档，按真实档位重挂 =====
             if _ex.get("tp_fallback") and tps:
                 _old_tps = list(_ex.get("tps") or [])
@@ -1516,6 +1705,11 @@ def finalize_pending(open_pos):
                        % (coin, _ex.get("dir"),
                           "、".join("%.8g" % t for t in _old_tps),
                           "、".join("%.8g" % t for t in tps)))
+                PENDING.pop(coin, None)
+                continue
+            if _ex.get("tp_fallback") and not tps and _tp_rejected:
+                log("   ↳ %s 止盈更新被全部拒绝 → 保留原 2R 兜底档 %s，不动仓位"
+                    % (coin, _ex.get("tps")))
                 PENDING.pop(coin, None)
                 continue
             notify("【信号·跳过】%s 已有持仓，不重复开单\n现有：%s 入场 %.8g · 止损 %.8g · 剩余 %.0f%%\n本次信号原文：%s"
@@ -1771,9 +1965,13 @@ HELP_TEXT = """【机器人指令】在「开单记录」或「机器人开单�
 · 进入实盘模式 确认 —— 切到实盘（需二次确认）
 
 — 回答机器人的询问 —
+⚠️ 按你的要求：**所有订单在开之前都会先问过你**，回「开」才开、回「不开」作废（30 分钟不回复自动作废）。
 · 开 / 不开 —— 单条信号
 · 只开 SOL 和 CL ｜ 只开 CL，不开 SOL ｜ 不开 BTC ｜ 全部开 ｜ 全部不开 —— 多币种
-· 持仓达上限时机器人会问你要不要提高上限，回「开」即提高并开单"""
+  （多币种会列出**全部非空组合**，3 个币就是 6 种两两/单个组合 + 「全部开」）
+· 回复时机器人会带上：保证金/杠杆/止损位/**止损点数（不含杠杆）**/各档止盈/**各档预期收益率（含杠杆）**
+· 持仓达上限时机器人会一并问你要不要提高上限，回「开」即提高并开单
+· 待你确认的信号会**落盘保存**，机器人意外重启也不会丢"""
 
 
 def load_runtime():
@@ -1803,13 +2001,17 @@ def load_runtime():
             NOTIONAL = MARGIN * LEV
             if "test_mode" in cfg:
                 TEST_MODE = bool(cfg["test_mode"])
+            # 审批闸门开关（用户 2026-09-15 第 12 条）：默认 True=所有新开仓都要经用户审批
+            if "require_approval" in cfg:
+                REQUIRE_APPROVAL[0] = bool(cfg["require_approval"])
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
                 bexec.LEV = LEV
-            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s"
+            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s ｜ 开单需审批=%s"
                 % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE,
-                   "、".join(STRICT_LIMIT_GROUPS) or "无", _be_mode()))
+                   "、".join(STRICT_LIMIT_GROUPS) or "无", _be_mode(),
+                   "是" if REQUIRE_APPROVAL[0] else "否"))
     except Exception as e:
         log("读取运行配置失败: " + str(e)[:80])
 
@@ -1822,12 +2024,16 @@ def save_runtime():
             pass
         out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE,
                "max_open": MAX_OPEN, "max_consec_loss": MAX_CONSEC_LOSS,
-               "daily_loss_limit": DAILY_LOSS_LIMIT, "max_total_margin": MAX_TOTAL_MARGIN}
+               "daily_loss_limit": DAILY_LOSS_LIMIT, "max_total_margin": MAX_TOTAL_MARGIN,
+               "require_approval": REQUIRE_APPROVAL[0]}
         # ⚠️ 必须保留 live_trading / strict_limit_groups：否则任何一条指令都会把它们悄悄抹掉
         if "live_trading" in _old:
             out["live_trading"] = _old["live_trading"]
         if "strict_limit_groups" in _old:
             out["strict_limit_groups"] = _old["strict_limit_groups"]
+        # 同理保留 silence_alert_hours：它不在 out 的默认键里，不显式带回就会被指令抹掉
+        if "silence_alert_hours" in _old:
+            out["silence_alert_hours"] = _old["silence_alert_hours"]
         json.dump(out, open(RUNTIME, "w"), ensure_ascii=False, indent=1)
         STATE_DIRTY[0] = True
     except Exception as e:
@@ -1928,6 +2134,7 @@ def _open_asking(coin):
         return False
     p = it["p"]
     p["deadline"] = 0
+    p["approved"] = True        # 用户已回「开」→ 过审批闸门，不再重复问（2026-09-15 第 12 条）
     # 若是因"持仓上限"被拦下的：回「开」即视为同意把上限提高（到当前持仓数+1）
     if len(open_pos_ref) >= MAX_OPEN and coin not in open_pos_ref:
         p["cap_override"] = True
@@ -2531,6 +2738,52 @@ def clear_singleton_locks(profile):
     return gone
 
 
+def _tp_wrong_side(dirc, entry, tps, ref=None):
+    """返回**相对给定方向/入场价落在错误一侧**的止盈位。
+    ref 给定时（一般是当前市价）用 ref 作为比较基准，否则用 entry。
+    B14 公共校验：新开仓、更新已有持仓、持仓健康自检三处共用同一套判断。"""
+    if not isinstance(entry, (int, float)) or not entry:
+        return []
+    base = float(ref) if isinstance(ref, (int, float)) and ref else float(entry)
+    d = (dirc or "LONG").upper()
+    return [t for t in (tps or []) if isinstance(t, (int, float))
+            and (float(t) <= base if d == "LONG" else float(t) >= base)]
+
+
+def position_sanity(open_pos, notify_user=True):
+    """持仓健康自检（B14 配套）：找出**止盈落在持仓错误一侧**的仓位。
+    这类仓位一旦存在，监控循环会立刻把当前价判成"止盈成交" —— 19:20 那笔假亏损就是这么来的。
+    这里只**报告**、不擅自改仓位（改仓位是你的决策）；启动时跑一次，之后按轮次定期跑。
+    返回问题清单。"""
+    bad = []
+    for c, v in list(open_pos.items()):
+        d = (v.get("dir") or "LONG").upper()
+        e = v.get("entry")
+        if not isinstance(e, (int, float)) or not e:
+            continue
+        wrong = _tp_wrong_side(d, e, v.get("tps"))
+        if wrong:
+            bad.append((c, d, e, wrong, v.get("tps")))
+        s = v.get("sl")
+        # ⚠️ 止损用**严格**不等式：TP1 成交后止损会被移到**正好等于开仓价**（保本损），
+        #    那是合法的，不能用 >= / <= 判成"错误一侧"（我自己第一版就写错、会误报）。
+        if isinstance(s, (int, float)) and s:
+            if (d == "LONG" and float(s) > float(e) + 1e-12) or \
+               (d == "SHORT" and float(s) < float(e) - 1e-12):
+                bad.append((c, d, e, ["止损在错误一侧：%s" % s], v.get("sl")))
+    if bad:
+        _ls = ["· %s %s 入场 %.8g ｜ 止盈 %s ｜ 问题：%s"
+               % (c, d, e, tps_all, w) for (c, d, e, w, tps_all) in bad]
+        log("   ⚠️ 持仓健康自检发现 %d 处异常（止盈/止损落在错误一侧，会被误判成交）：" % len(bad))
+        for _x in _ls:
+            log("      " + _x)
+        if notify_user:
+            notify("【跟单机器人·持仓自检】⚠️ 发现 %d 处**止盈/止损落在错误一侧**的持仓，"
+                   "监控循环会把它当场判成成交（19:20 那笔 -6.57U 假亏损就是这个原因）：\n%s\n"
+                   "建议：发「修改止损/平仓」指令处理，或告诉我怎么改。" % (len(bad), "\n".join(_ls)))
+    return bad
+
+
 def main():
     log("==== dryRun 机器人 v2 启动（每群独立标签页）====")
     last_id = {}
@@ -2564,6 +2817,26 @@ def main():
                 _risk_roll_day()
                 log("已恢复风控计数：连亏 %s 笔 ｜ 今日 %s 笔 / 净 %+.2fU"
                     % (RISK.get("consec_loss", 0), RISK.get("day_trades", 0), RISK.get("day_pnl", 0.0)))
+            # ===== B11：恢复待确认池（原实现只存在内存里，机器人一重启就静默丢失）=====
+            _ak = sv.get("asking")
+            if isinstance(_ak, dict) and _ak:
+                _now = time.time()
+                _keep, _drop = 0, []
+                for _c, _v in _ak.items():
+                    if not isinstance(_v, dict) or not isinstance(_v.get("p"), dict):
+                        continue
+                    _ts = float(_v.get("ask_ts") or 0)
+                    if _now - _ts > ASK_TIMEOUT:
+                        _drop.append(_c)
+                        continue
+                    ASKING[_c] = {"p": _v["p"], "reason": _v.get("reason") or "(重启前挂起)",
+                                  "ask_ts": _ts or _now, "txt": _v.get("txt") or ""}
+                    _keep += 1
+                if _keep:
+                    log("已恢复 %d 个待确认信号（重启前挂起、未超时的）：%s"
+                        % (_keep, "、".join(sorted(ASKING))))
+                if _drop:
+                    log("   ↳ 丢弃 %d 个已超时的待确认信号：%s" % (len(_drop), "、".join(sorted(_drop))))
         except Exception:
             pass
     # ===== 启动对账闸门（评估 G3）：放在开页之前，避免带着不一致状态开始跑 =====
@@ -2571,6 +2844,11 @@ def main():
         startup_reconcile()
     except Exception as _e:
         log("启动对账异常：%s" % str(_e)[:120])
+    # ===== 持仓健康自检（B14 配套）：止盈/止损落在错误一侧的仓位会被误判成交 =====
+    try:
+        position_sanity(open_pos, notify_user=True)
+    except Exception as _e:
+        log("持仓自检异常：%s" % str(_e)[:120])
     with sync_playwright() as p:
         try:
             ctx = launch_persistent(p, BASE + "/fs_bot")
@@ -2636,6 +2914,7 @@ def main():
         log("==== 开始实时监控（%d 个页面）====" % len(pages))
         # ⚠️ 不要在这里写 {"open": []}，会把已恢复的持仓清空（曾经踩过这个坑）
         json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
+                   "asking": _asking_dump(),
                    "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
         try:
@@ -2922,13 +3201,10 @@ def main():
                                           _tt or "未读到"))
                                 _names.append(_c)
                             if _names:
-                                _ex = ("、".join(_names[:2]))
                                 notify("【信号·多币种待确认】这条消息里有 %d 个币种，已分别解析（见上）。\n"
-                                       "请回复要开哪些，例如：\n"
-                                       "· 只开 %s\n· 只开 %s，不开 %s\n· 全部不开"
-                                       % (len(_names),
-                                          " 和 ".join(_names[:2]) if len(_names) > 1 else _names[0],
-                                          _names[0], _names[1] if len(_names) > 1 else "XXX"))
+                                       "请回复要开哪些（%d 个币共 %d 种非空组合）：\n%s"
+                                       % (len(_names), len(_names), 2 ** len(_names) - 1,
+                                          "\n".join(_combo_options(_names))))
                             continue
                         info = fast_parse(txt)
                         _fast = info
@@ -3137,6 +3413,11 @@ def main():
                     watch_silence()
                 except Exception as e:
                     log("失联看门狗异常 " + str(e)[:100])
+                try:
+                    # B14 配套：定期只记日志不打扰（启动时已完整通报过一次）
+                    position_sanity(open_pos, notify_user=False)
+                except Exception as e:
+                    log("持仓自检异常 " + str(e)[:100])
             # 待确认信号超时作废
             try:
                 expire_asking()
@@ -3237,6 +3518,7 @@ def main():
             if STATE_DIRTY[0]:
                 STATE_DIRTY[0] = False
             json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
+                       "asking": _asking_dump(),      # B11：待确认池落盘，重启不再静默丢失
                        "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
@@ -3473,6 +3755,185 @@ if __name__ == "__main__":
                 print("   ✗ %s" % _f)
             sys.exit(1)
         print("B1 自检：全部通过 ✅")
+        sys.exit(0)
+
+    if "--selftest-approval" in sys.argv:
+        # ===== 第3项自检：审批闸门 + B4 完整组合 + B11 待确认池健壮性 =====
+        # 完全隔离在 /tmp：不碰生产配置/状态/日志，不发飞书，不下单
+        import shutil
+        _T = "/tmp/approval_selftest"
+        _prod_log = BASE + "/v21/run.log"
+        _before = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        shutil.rmtree(_T, ignore_errors=True)
+        os.makedirs(_T, exist_ok=True)
+        RUNTIME = _T + "/runtime_config.json"
+        TRADES = _T + "/trades_dryrun.jsonl"
+        STATE = _T + "/state.json"
+        LOGF = _T + "/run.log"
+        IMGDIR = _T + "/imgs"
+        NOTIFY_CFG = _T + "/notify.json"
+        os.makedirs(IMGDIR, exist_ok=True)
+        print("=" * 70)
+        print("第3项自检：审批闸门 / B4 组合 / B11 健壮性（隔离在 /tmp，不碰生产）")
+        print("=" * 70)
+        print("路径重定向证明：")
+        for _k in ("RUNTIME", "TRADES", "STATE", "LOGF", "NOTIFY_CFG"):
+            print("  %-11s = %s" % (_k, eval(_k)))
+        _fail = []
+
+        def _chk(name, got, want):
+            _ok = (got == want)
+            print("  %s %-52s got=%s want=%s" % ("[ OK ]" if _ok else "[FAIL]", name, got, want))
+            if not _ok:
+                _fail.append(name)
+
+        # ---------- ① 审批闸门：默认开启 ----------
+        print("\n[1] 审批闸门开关")
+        _chk("默认 REQUIRE_APPROVAL", REQUIRE_APPROVAL[0], True)
+
+        # ---------- ② B4：多币种完整组合 ----------
+        print("\n[2] B4 多币种审批要给出【完整组合】")
+        _o3 = _combo_options(["BTC", "ETH", "DOGE"])
+        _opens = [x for x in _o3 if x.startswith("· 只开")]
+        print("  3 个币的选项（共 %d 条，含 全部开/全部不开）：" % len(_o3))
+        for _x in _o3:
+            print("     %s" % _x)
+        _chk("3 个币的 2 币组合数（应为 3）", len([x for x in _opens if " 和 " in x]), 3)
+        _chk("3 个币的单币组合数（应为 3）", len([x for x in _opens if " 和 " not in x]), 3)
+        _chk("含「全部开」（1 条）", len([x for x in _o3 if "全部开" in x]), 1)
+        _chk("含「全部不开」（1 条）", len([x for x in _o3 if "全部不开" in x]), 1)
+        _chk("3 个币非空组合总数 = 2^3-1 = 7", len(_o3) - 1, 7)
+        _o2 = _combo_options(["BTC", "SOL"])
+        _chk("2 个币非空组合数 = 3", len([x for x in _o2 if "不开" not in x]), 3)
+        _o5 = _combo_options(["A", "B", "C", "D", "E"])
+        _chk("5 个币退化（不爆长列表，<=9 条）", len(_o5) <= 9, True)
+
+        # ---------- ③ 审批清单必须含用户第 8 条要求的字段 ----------
+        print("\n[3] 审批通知必须带全参数（用户第 8 条）：止损点数(不含杠杆)/各档收益率(含杠杆)")
+        _p = {"entry": 100.0, "stop": 95.0, "tps": [110.0, 120.0], "group": "测试群",
+              "dir": "LONG", "texts": ["测试原文"], "legs": [], "entry_src": "消息文字"}
+        _txt = "\n".join(_approval_lines("TEST", _p, 1))
+        for _kw in ("保证金：300U", "杠杆：3 倍", "止损位：95", "止损点数（不含杠杆）：5",
+                    "止盈1：110", "预期收益 +30.0%（含 3 倍杠杆）", "盈亏比 2.00:1"):
+            _chk("审批清单含 %r" % _kw, _kw in _txt, True)
+        print("  ——实际生成的审批清单——")
+        for _l in _txt.splitlines():
+            print("     %s" % _l)
+
+        # ---------- ④ B11-a：更差的解析不许覆盖更好的解析 ----------
+        print("\n[4] B11-a 坏解析不得覆盖好解析（19:03 UNI 实测事故复刻）")
+        ASKING.clear()
+        PENDING.clear()
+        _good = {"entry": 6.513, "stop": 6.396, "tps": [9.289], "group": "UA-nurseneil2",
+                 "dir": "LONG", "texts": ["K线图"], "legs": [], "entry_src": "K线图"}
+        _bad = {"entry": None, "stop": 6.39, "tps": [6.39], "group": "UA-nurseneil2",
+                "dir": "LONG", "texts": ["Going long on UNI"], "legs": []}
+        _chk("好解析打分 > 坏解析打分", _plan_score(_good) > _plan_score(_bad), True)
+        ask_user("UNI", _good, "上限")
+        ask_user("UNI", _bad, "多币种总结")          # 应该被拒绝覆盖
+        _kept = ASKING.get("UNI", {}).get("p", {})
+        _chk("保留的是好解析的开仓价 6.513", _kept.get("entry"), 6.513)
+        _chk("保留的是好解析的止盈 [9.289]", _kept.get("tps"), [9.289])
+        print("     ↳ 覆盖被拒绝，保留原参数（日志已记录）")
+
+        # ---------- ⑤ B11-a 反向：更好的解析可以覆盖 ----------
+        print("\n[5] B11-a 反向：更好的解析**应当**覆盖")
+        ASKING.clear()
+        ask_user("UNI", _bad, "先差")
+        ask_user("UNI", _good, "后好")
+        _kept2 = ASKING.get("UNI", {}).get("p", {})
+        _chk("后到的好解析已生效（开仓 6.513）", _kept2.get("entry"), 6.513)
+
+        # ---------- ⑥ B11-b：待确认池落盘 + 重启恢复 ----------
+        print("\n[6] B11-b 待确认池落盘与重启恢复（原来重启即静默丢失）")
+        _dump = _asking_dump()
+        _chk("落盘结构含 UNI", "UNI" in _dump, True)
+        _chk("落盘后能 json.dump（不会连带弄丢持仓）",
+             bool(json.dumps({"open": {"BTC": {}}, "asking": _dump}, ensure_ascii=False)), True)
+        json.dump({"open": {}, "asking": _dump}, open(STATE, "w", encoding="utf-8"), ensure_ascii=False)
+        ASKING.clear()
+        _sv = json.load(open(STATE, encoding="utf-8"))
+        _now = time.time()
+        for _c, _v in (_sv.get("asking") or {}).items():
+            if isinstance(_v.get("p"), dict):
+                ASKING[_c] = {"p": _v["p"], "reason": _v.get("reason"),
+                              "ask_ts": float(_v.get("ask_ts") or _now), "txt": _v.get("txt")}
+        _chk("重启后恢复出 UNI", "UNI" in ASKING, True)
+        _chk("恢复的参数仍是好的（6.513）", ASKING.get("UNI", {}).get("p", {}).get("entry"), 6.513)
+
+        # 超时的应当被丢弃
+        ASKING.clear()
+        ASKING["OLD"] = {"p": _good, "reason": "x", "ask_ts": time.time() - ASK_TIMEOUT - 10, "txt": ""}
+        _dump2 = _asking_dump()
+        _kept3, _drop3 = 0, 0
+        for _c, _v in _dump2.items():
+            if _now - float(_v.get("ask_ts") or 0) > ASK_TIMEOUT:
+                _drop3 += 1
+            else:
+                _kept3 += 1
+        _chk("超时的待确认被丢弃", (_kept3, _drop3), (0, 1))
+
+        # ---------- ⑦ 审批闸门：回「开」后不再重复问 ----------
+        print("\n[7] 审批闸门：用户回「开」后不再重复询问")
+        ASKING.clear()
+        PENDING.clear()
+        open_pos_ref.clear()
+        _p2 = {"entry": 100.0, "stop": 95.0, "tps": [110.0], "group": "g", "dir": "LONG",
+               "texts": ["t"], "legs": [], "deadline": 0, "first_ts": time.time() - 10}
+        PENDING["AAA"] = dict(_p2)
+        ask_user("AAA", dict(_p2), "按你的要求：所有订单在开之前都要经你审批")
+        PENDING.pop("AAA", None)
+        _chk("信号已挂起等审批", "AAA" in ASKING, True)
+        _open_asking("AAA")                          # 等价于用户回「开」
+        _chk("回「开」后 approved 标记已置位", PENDING.get("AAA", {}).get("approved"), True)
+        _chk("回「开」后 deadline 归零（立刻处理）", PENDING.get("AAA", {}).get("deadline"), 0)
+
+        # ---------- ⑧ B14：止盈方向校验 + 持仓健康自检 ----------
+        print("\n[8] B14 止盈方向校验（19:20 ETH 假亏损事故复刻）")
+        _chk("事故复刻：SHORT 入场2503.49 挂 2520 判为错误一侧",
+             _tp_wrong_side("SHORT", 2503.49, [2520.0]), [2520.0])
+        _chk("正常：SHORT 入场2503.49 挂 2214.47 合法",
+             _tp_wrong_side("SHORT", 2503.49, [2214.47]), [])
+        _chk("正常：LONG 入场100 挂 [110,120] 合法",
+             _tp_wrong_side("LONG", 100, [110.0, 120.0]), [])
+        _chk("LONG 入场100 挂 95 判为错误一侧", _tp_wrong_side("LONG", 100, [95.0]), [95.0])
+        _chk("混合：LONG 入场100 挂 [95,110] 只剔 95",
+             _tp_wrong_side("LONG", 100, [95.0, 110.0]), [95.0])
+        _chk("以当前价为基准：LONG 入场100 现价120 挂110 已被越过",
+             _tp_wrong_side("LONG", 100, [110.0], ref=120.0), [110.0])
+        _chk("无入场价时不误判", _tp_wrong_side("LONG", None, [110.0]), [])
+
+        print("\n[9] B14 配套：持仓健康自检 position_sanity")
+        _pos = {
+            "ETH_BAD": {"dir": "SHORT", "entry": 2503.49, "tps": [2520.0], "sl": 2648.0},   # 事故：应报
+            "ETH_OK":  {"dir": "SHORT", "entry": 2503.49, "tps": [2214.47], "sl": 2648.0},  # 正常
+            "BE_OK":   {"dir": "LONG",  "entry": 100.0,   "tps": [110.0],  "sl": 100.0},    # 保本损==开仓价，合法
+            "DOGE_BAD": {"dir": "LONG", "entry": 0.079,   "tps": [0.09],   "sl": 0.09},     # 止盈/止损都在错误一侧
+        }
+        _bad = position_sanity(_pos, notify_user=False)
+        _bcn = sorted(x[0] for x in _bad)
+        _chk("报告了 ETH_BAD（止盈在空单上方）", "ETH_BAD" in _bcn, True)
+        _chk("报告了 DOGE_BAD（多单 0.079 但止损 0.09 在其上方）", "DOGE_BAD" in _bcn, True)
+        _chk("未误报 ETH_OK", "ETH_OK" in _bcn, False)
+        _chk("未误报保本损 BE_OK（sl==entry 合法）", "BE_OK" in _bcn, False)
+        print("   ↳ 自检报出的问题仓位：%s" % _bcn)
+
+        # ---------- ⑩ 隔离复核 ----------
+        print("\n[10] 隔离复核")
+        _after = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        _chk("生产 run.log 未被写入", _after, _before)
+        print("  /tmp 产物：%s" % ", ".join(sorted(os.listdir(_T))))
+        print("  生产 runtime_config.json mtime = %s"
+              % time.strftime("%Y-%m-%d %H:%M:%S",
+                              time.localtime(os.path.getmtime(BASE + "/runtime_config.json"))))
+
+        print("\n" + "-" * 70)
+        if _fail:
+            print("第3项自检：%d 项失败" % len(_fail))
+            for _f in _fail:
+                print("   ✗ %s" % _f)
+            sys.exit(1)
+        print("第3项自检：全部通过 ✅")
         sys.exit(0)
 
     main()
