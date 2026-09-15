@@ -9,5 +9,10 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/signal-bot
 ExecStart=/home/ubuntu/signal-bot/venv/bin/python /home/ubuntu/signal-bot/log_watch.py
+# ⚠️ log_watch.py 用退出码表达"发现了问题"：0=一切正常，1=有新故障（并已推告警）。
+#    systemd 默认把退出码 1 当成**单元启动失败**，于是每次真告警都会把服务标成 failed、
+#    journal 里刷 "Failed to start" —— 2026-09-15 19:49 实测到这个问题。
+#    语义上"发现了问题并且成功告警了"是**成功**，所以这里把 1 也算成功退出。
+SuccessExitStatus=1
 # 只读巡检：不写机器人任何配置；只写自己的游标 v21/watch_state.json
 Nice=10

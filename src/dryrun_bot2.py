@@ -86,6 +86,10 @@ def log(msg):
 
 # ---------------- 飞书通知 ----------------
 def notify(text):
+    # ⚠️ 2026-09-15 晚实测：飞书自定义机器人 **msg_type=text 不渲染 Markdown** ——
+    #    用户收到的告警截图里 `**` 是**原样显示**的（「** 【测试】… ** —— 这不是真告警」）。
+    #    在唯一出口统一剥掉，免得每条通知各写一遍、也免得审批单看起来一团乱。
+    text = str(text).replace("**", "")
     log("[通知] " + text.replace("\n", " | ")[:200])
     cfg = {}
     try:
@@ -2008,10 +2012,11 @@ def load_runtime():
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
                 bexec.LEV = LEV
-            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s ｜ 开单需审批=%s"
+            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s ｜ 开单需审批=%s ｜ 失联告警阈值=%.1fh ｜ 暂停=%s"
                 % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE,
                    "、".join(STRICT_LIMIT_GROUPS) or "无", _be_mode(),
-                   "是" if REQUIRE_APPROVAL[0] else "否"))
+                   "是" if REQUIRE_APPROVAL[0] else "否", SILENCE_ALERT_H,
+                   "是" if PAUSED[0] else "否"))
     except Exception as e:
         log("读取运行配置失败: " + str(e)[:80])
 
@@ -2414,9 +2419,12 @@ def handle_command(txt):
                 notify("【指令】没有 %s 的持仓" % c)
     elif cmd.startswith("暂停"):
         PAUSED[0] = True
-        notify("【指令】已暂停：仍会抓取和记录，但不会开单/平仓。回复「继续」恢复")
+        STATE_DIRTY[0] = True          # 落盘：重启后仍然是暂停态（否则"暂停"对维护没用）
+        notify("【指令】已暂停：仍会抓取和记录，但不会开单/平仓。回复「继续」恢复"
+               "（暂停状态会落盘，重启后依然生效）")
     elif cmd.startswith("继续"):
         PAUSED[0] = False
+        STATE_DIRTY[0] = True
         notify("【指令】已恢复")
     elif cmd.startswith("修改监控群"):
         m = re.search(r"修改监控群\s*(.+)", cmd)
@@ -2781,6 +2789,10 @@ def position_sanity(open_pos, notify_user=True):
             notify("【跟单机器人·持仓自检】⚠️ 发现 %d 处**止盈/止损落在错误一侧**的持仓，"
                    "监控循环会把它当场判成成交（19:20 那笔 -6.57U 假亏损就是这个原因）：\n%s\n"
                    "建议：发「修改止损/平仓」指令处理，或告诉我怎么改。" % (len(bad), "\n".join(_ls)))
+    elif notify_user:
+        # ⚠️ 可核验性：干净时也要留一行 —— 否则"检查跑没跑过"从日志上无法证明
+        #    （2026-09-15 重启核验时就踩到这个：日志里搜不到"持仓自检"，分不清是没问题还是没执行）
+        log("   ✅ 持仓健康自检通过：%d 笔持仓的止盈/止损方向全部正常" % len(open_pos))
     return bad
 
 
@@ -2837,6 +2849,11 @@ def main():
                         % (_keep, "、".join(sorted(ASKING))))
                 if _drop:
                     log("   ↳ 丢弃 %d 个已超时的待确认信号：%s" % (len(_drop), "、".join(sorted(_drop))))
+            # ===== 暂停态恢复：原来 PAUSED 只在内存里，重启会**静默恢复交易** =====
+            if "paused" in sv:
+                PAUSED[0] = bool(sv.get("paused"))
+                log("已恢复暂停状态：%s" % ("暂停中（不会开单/平仓，发「继续」恢复）"
+                                          if PAUSED[0] else "运行中"))
         except Exception:
             pass
     # ===== 启动对账闸门（评估 G3）：放在开页之前，避免带着不一致状态开始跑 =====
@@ -2915,6 +2932,7 @@ def main():
         # ⚠️ 不要在这里写 {"open": []}，会把已恢复的持仓清空（曾经踩过这个坑）
         json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
                    "asking": _asking_dump(),
+                   "paused": bool(PAUSED[0]),
                    "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
         try:
@@ -3519,6 +3537,7 @@ def main():
                 STATE_DIRTY[0] = False
             json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
                        "asking": _asking_dump(),      # B11：待确认池落盘，重启不再静默丢失
+                       "paused": bool(PAUSED[0]),     # 暂停态落盘，重启后依然生效
                        "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
@@ -3887,6 +3906,20 @@ if __name__ == "__main__":
         _open_asking("AAA")                          # 等价于用户回「开」
         _chk("回「开」后 approved 标记已置位", PENDING.get("AAA", {}).get("approved"), True)
         _chk("回「开」后 deadline 归零（立刻处理）", PENDING.get("AAA", {}).get("deadline"), 0)
+
+        print("\n[7b] 暂停态落盘与恢复（原来 PAUSED 只在内存里，重启会静默恢复交易）")
+        PAUSED[0] = True
+        _pdump = {"open": {}, "paused": bool(PAUSED[0]), "asking": _asking_dump()}
+        json.dump(_pdump, open(STATE, "w", encoding="utf-8"), ensure_ascii=False)
+        PAUSED[0] = False
+        _sv2 = json.load(open(STATE, encoding="utf-8"))
+        if "paused" in _sv2:
+            PAUSED[0] = bool(_sv2.get("paused"))
+        _chk("暂停态落盘后能恢复为 True", PAUSED[0], True)
+        json.dump({"paused": False}, open(STATE, "w", encoding="utf-8"))
+        _sv3 = json.load(open(STATE, encoding="utf-8"))
+        PAUSED[0] = bool(_sv3.get("paused")) if "paused" in _sv3 else PAUSED[0]
+        _chk("恢复态落盘后能恢复为 False", PAUSED[0], False)
 
         # ---------- ⑧ B14：止盈方向校验 + 持仓健康自检 ----------
         print("\n[8] B14 止盈方向校验（19:20 ETH 假亏损事故复刻）")
