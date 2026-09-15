@@ -43,7 +43,9 @@ LEV = 3
 NOTIONAL = MARGIN * LEV
 MAX_OPEN = 5           # 1500U 分 5 份，每份 300U
 TP_TIERS = 3
-TEST_MODE = True       # 测试阶段：抓到的一切信号都要出单（不受持仓上限拦截）
+TEST_MODE = True       # ⚠️ 2026-09-15 核实：它现在**只影响「状态」显示**和「测试模式 开/关」指令。
+                       # 已【不再】绕过持仓上限、也不再"抓到什么都出单"（旧注释是过期的）。
+                       # 真正决定"纸面/实盘"的是 runtime_config.json 的 live_trading。
 MSG_URL = "https://www.feishu.cn/messenger"
 SEARCH_TERM = {"颜驰2群": "颜驰"}
 
@@ -3491,7 +3493,9 @@ def main():
                             hit_i = i
                             break
                     if hit_i is not None:
-                        # 2R 兜底档只平 1/3（由 tp_part 显式指定）；常规档位仍按 1/档数 平分
+                        # 平仓比例：2R 兜底档 = 一次全平（tp_part=R_FALLBACK_PART=1.0，
+                        # 用户 09-13 定的「到价全平」）；常规档位按 1/档数 平分（3 档各 33.3%）。
+                        # ⚠️ 旧注释写的是"2R 兜底档只平 1/3"，与 R_FALLBACK_PART=1.0 矛盾，已改正。
                         part = tr.get("tp_part") or (1.0 / max(len(tps), 1))
                         tp = tps[hit_i]
                         pnl = (tp - tr["entry"]) * d / tr["entry"] * NOTIONAL * part
