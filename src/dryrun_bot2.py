@@ -2427,6 +2427,110 @@ def open_group_page(ctx, name):
         log("[%s] 开页异常: %s" % (name, str(e)[:100]))
         return page, []
 
+# ===== B1 自愈：浏览器上下文死亡检测 + 全量重启（2026-09-15）=====
+# 真实事故（2026-09-15）：16:07:33 systemd-logind 停掉 user@1000（Linger=no + 最后一个 SSH
+#   会话登出）→ 挂在它下面的 Chromium 被杀 → 从这一刻起 ctx.new_page() **必然**抛
+#   "Target page, context or browser has been closed"。旧代码只写"下一轮会继续重试"，
+#   于是机器人带着一个永远打不开页面的死 ctx 空转 93 分钟，还一直打「运行中」心跳 —— 全瞎。
+# 根因已用 `loginctl enable-linger ubuntu` 消除（B1 第 1 步）；但浏览器仍可能因其它原因
+#   （OOM / 自身崩溃 / 被误杀）整体死亡，所以这一层必须存在：
+#   **判定"整个上下文已死" → 主动重建整个浏览器 + 重开所有页面 + 立即飞书告警**。
+CTX_DEAD_MARKS = (
+    "Target page, context or browser has been closed",
+    "TargetClosedError",
+    "Browser has been closed",
+    "Browser closed",
+    "browser has been closed",
+    # 驱动进程本身死了 —— 只有这一条（不带泛指 "Connection closed"），
+    # 避免把页面级的 "WebSocket connection closed" 之类误判成整个浏览器死亡。
+    "Connection closed while reading from the driver",
+)
+RELAUNCH_MIN_GAP = 120.0        # 两次全量重启的最小间隔（秒），防崩溃循环把内存打爆
+DEAD_ROUNDS_TO_RELAUNCH = 2     # 连续 N 轮命中"上下文已死"才判定死亡（单群偶发失败不触发）
+CHROME_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+               "--disable-software-rasterizer", "--renderer-process-limit=2",
+               "--js-flags=--max-old-space-size=320",
+               "--disable-features=Translate,BackForwardCache"]
+
+
+def ctx_dead_error(e):
+    """这个异常是不是「整个浏览器上下文已死」？
+    区别于「这一个标签页被关了」——后者重开一个标签页就行，前者重开必然失败。"""
+    s = str(e)
+    return any(m in s for m in CTX_DEAD_MARKS)
+
+
+def launch_persistent(p, profile):
+    """persistent context 的唯一启动入口：启动时与自愈重启时共用，避免两处参数漂移。"""
+    return p.chromium.launch_persistent_context(
+        user_data_dir=profile, headless=False, args=list(CHROME_ARGS))
+
+
+def chrome_pids_of_profile(profile):
+    """扫 /proc 找出还在用这个 user-data-dir 的 chrome 进程（Linux，只读）"""
+    pids = []
+    try:
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                cl = open("/proc/%s/cmdline" % d, "rb").read().decode("utf-8", "replace")
+            except Exception:
+                continue
+            if profile in cl:
+                pids.append(int(d))
+    except Exception:
+        pass
+    return pids
+
+
+def _ppid_of(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except Exception:
+        return -1
+
+
+def kill_profile_chrome(profile, wait_sec=6.0, orphan_only=False):
+    """杀掉还占着这个 profile 的残留 chrome；返回被杀 PID 列表。
+    ⚠️ profile 用全路径匹配，绝不会误伤其它 profile。
+    orphan_only=True 时只杀孤儿 chrome（ppid==1）—— 用于"启动失败后重试"，
+    避免误杀一个正在被别的进程正常使用的浏览器。"""
+    killed = []
+    t0 = time.time()
+    while time.time() - t0 < wait_sec:
+        left = chrome_pids_of_profile(profile)
+        if orphan_only:
+            left = [p for p in left if _ppid_of(p) == 1]
+        if not left:
+            break
+        for pid in left:
+            try:
+                os.kill(pid, 9)
+                killed.append(pid)
+            except Exception:
+                pass
+        time.sleep(0.4)
+    return killed
+
+
+def clear_singleton_locks(profile):
+    """清 Singleton* 锁：不清掉的话新 context 会因「profile 已被占用」启动失败。
+    ⚠️ 只在确认旧 chrome 进程已清干净之后调用 —— fs_bot 是登录态核心资产，
+       绝不能让两个 Chrome 实例同时写同一个 profile。"""
+    gone = []
+    for f in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            os.remove(os.path.join(profile, f))
+            gone.append(f)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log("   ↳ 删除 %s 失败（不致命）：%s" % (f, str(e)[:60]))
+    return gone
+
+
 def main():
     log("==== dryRun 机器人 v2 启动（每群独立标签页）====")
     last_id = {}
@@ -2468,11 +2572,20 @@ def main():
     except Exception as _e:
         log("启动对账异常：%s" % str(_e)[:120])
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(user_data_dir=BASE + "/fs_bot", headless=False,
-                                                  args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                                                        "--disable-software-rasterizer", "--renderer-process-limit=2",
-                                                        "--js-flags=--max-old-space-size=320",
-                                                        "--disable-features=Translate,BackForwardCache"])
+        try:
+            ctx = launch_persistent(p, BASE + "/fs_bot")
+        except Exception as _e0:
+            # 启动失败最常见的原因：上一次崩溃残留下来的 Singleton 锁 / 孤儿 chrome 占着 profile。
+            # ⚠️ 只杀 ppid==1 的孤儿 chrome，绝不动正在被其它进程正常使用的浏览器。
+            log("浏览器首次启动失败：%s" % str(_e0)[:120])
+            log("   ↳ 清理孤儿 chrome + profile 锁后重试一次（只杀孤儿，不碰正常浏览器）")
+            _k = kill_profile_chrome(BASE + "/fs_bot", orphan_only=True)
+            if _k:
+                log("   ↳ 已清理孤儿 chrome：%s" % _k)
+            _g = clear_singleton_locks(BASE + "/fs_bot")
+            if _g:
+                log("   ↳ 已清理 profile 锁：%s" % _g)
+            ctx = launch_persistent(p, BASE + "/fs_bot")
         pages = {}
         # 打开页面后的统一处理：⚠️ 绝不把游标抬到"页面最新"，否则停机期间的消息会被静默吞掉
         def adopt_page(g, rows):
@@ -2546,6 +2659,86 @@ def main():
         hb = 0
         feed_prev = {}            # 群 -> 上次看到的会话列表预览
         safety = 0                # 兜底：每 N 轮无条件扫一次所有群
+        # ===== B1 自愈状态 =====
+        _reopen_fail = {}         # 群 -> 连续重开失败次数（日志降噪 + 判定用）
+        _dead_groups = set()      # 本轮哪些群因「整个上下文已死」而失败
+        _dead_rounds = [0]        # 连续多少轮出现「上下文已死」
+        _relaunch_ts = [0.0]      # 上次全量重启时刻（节流）
+        _relaunch_fail = [0]      # 连续重启失败次数
+        _blind_since = [0.0]      # 本轮失明起点（用来汇报「瞎了多久」）
+
+        def relaunch_browser(why):
+            """整个浏览器上下文已死 → 重建 persistent context + 重开所有页面 + 重预热。
+            游标一律保留：停机期间的消息交给回补闸门（超 30 分钟只通报不下单）。"""
+            nonlocal ctx
+            _relaunch_ts[0] = time.time()
+            t0 = time.time()
+            prof = BASE + "/fs_bot"
+            log("!" * 60)
+            log("🧯 [B1 自愈] 浏览器上下文死亡（%s）→ 开始全量重启浏览器" % why)
+            notify("【跟单机器人】🧯 **浏览器上下文死亡，正在自动重启**\n"
+                   "原因：%s\n"
+                   "重启期间暂停抓信号；游标已保留，停机消息走回补闸门（超 30 分钟只通报不下单）。"
+                   % why)
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            _k = kill_profile_chrome(prof)
+            if _k:
+                log("   ↳ 清理残留 chrome 进程：%s" % _k)
+            _g = clear_singleton_locks(prof)
+            if _g:
+                log("   ↳ 清理 profile 锁：%s" % _g)
+            try:
+                ctx = launch_persistent(p, prof)
+            except Exception as e:
+                _relaunch_fail[0] += 1
+                log("   ✗ 重建浏览器失败（第 %d 次）：%s" % (_relaunch_fail[0], str(e)[:120]))
+                notify("【跟单机器人】🛑 **浏览器自动重启失败**（第 %d 次）：%s\n"
+                       "机器人当前读不到任何群，请人工介入：pm2 restart dryrun-bot2"
+                       % (_relaunch_fail[0], str(e)[:120]))
+                return False
+            for _gg in GROUPS:
+                pages[_gg] = None
+            ok_pages = []
+            for _gg in GROUPS:
+                try:
+                    _pg, _rows = open_group_page(ctx, _gg)
+                    pages[_gg] = _pg
+                    adopt_page(_gg, _rows)
+                    ok_pages.append(_gg)
+                except Exception as e:
+                    pages[_gg] = None
+                    log("   ✗ [%s] 重开失败：%s" % (_gg, str(e)[:90]))
+            feed_prev.clear()
+            for _gg in GROUPS:
+                _reopen_fail[_gg] = 0
+            try:
+                price_of("BTC")
+                log("   币安行情已重新预热")
+            except Exception:
+                pass
+            if _BEXEC_OK:
+                try:
+                    bexec.load_specs()
+                except Exception:
+                    pass
+            dt = time.time() - t0
+            blind = (time.time() - _blind_since[0]) if _blind_since[0] else dt
+            _blind_since[0] = 0.0
+            if ok_pages:
+                _relaunch_fail[0] = 0
+            log("🧯 [B1 自愈] 浏览器已重建：%d/%d 个页面就绪，用时 %.1fs，本次累计失明 %.1fs（%.1f 分钟）"
+                % (len(ok_pages), len(GROUPS), dt, blind, blind / 60.0))
+            notify("【跟单机器人】%s **浏览器已自动重启**：%d/%d 个页面就绪，用时 %.1fs\n"
+                   "本次累计失明约 %.1f 分钟（%.0f 秒）。%s"
+                   % ("✅" if ok_pages else "⚠️", len(ok_pages), len(GROUPS), dt,
+                      blind / 60.0, blind,
+                      "游标已保留，停机消息走回补闸门。" if ok_pages
+                      else "有页面没打开成功，下一轮会继续重试。"))
+            return bool(ok_pages)
+
         while True:
             # ===== 方案A：先用「会话列表预览」判断哪个群有新消息（一次 JS 调用 ≈0.2s）=====
             ref_page = next((pages[g] for g in GROUPS if pages.get(g) and not pages[g].is_closed()), None)
@@ -2567,6 +2760,24 @@ def main():
                     to_scan.append(missing[safety % len(missing)])
             if changed:
                 log("🔔 会话列表显示有新消息：%s" % "、".join(changed))
+            # ===== B1 自愈判定（基于上一轮的重开结果，在扫描前处理）=====
+            if _dead_groups:
+                _dead_rounds[0] += 1
+                if _blind_since[0] == 0.0:
+                    _blind_since[0] = time.time()
+                    log("👁 [B1 自愈] 出现「整个浏览器上下文已死」信号（%d 个群：%s）→ 进入观察"
+                        % (len(_dead_groups), "、".join(sorted(_dead_groups))))
+            else:
+                _dead_rounds[0] = 0
+            if _dead_rounds[0] >= DEAD_ROUNDS_TO_RELAUNCH or len(_dead_groups) >= 2:
+                if time.time() - _relaunch_ts[0] >= RELAUNCH_MIN_GAP:
+                    relaunch_browser("连续 %d 轮命中上下文已死（涉及群：%s）"
+                                     % (_dead_rounds[0], "、".join(sorted(_dead_groups)) or "-"))
+                    _dead_rounds[0] = 0
+                elif safety % 40 == 0:
+                    log("   ⏳ 浏览器重启被节流（距上次 %.0fs < %.0fs），本轮仍按单群重开处理"
+                        % (time.time() - _relaunch_ts[0], RELAUNCH_MIN_GAP))
+            _dead_groups.clear()
             missed_sig = []          # 本轮被闸门拦下的消息（只通报，不下单）
             for g in GROUPS:
                 page = pages.get(g)
@@ -2575,14 +2786,24 @@ def main():
                 if page is None or page.is_closed():
                     # ⚠️ 旧代码在 page 为 None 时直接 continue —— 那个群会永久停止监控，且日志里毫无提示。
                     #    现在改为主动重开；重开后保留原游标，停机期间的消息由回补闸门处理。
-                    log("[%s] 页面不存在/已关闭，正在重新打开…" % g)
+                    _reopen_fail[g] = _reopen_fail.get(g, 0) + 1
+                    _nf = _reopen_fail[g]
+                    if _nf <= 2 or _nf % 20 == 0:     # 日志降噪：事故时这两行刷了 2488 条
+                        log("[%s] 页面不存在/已关闭，正在重新打开…（连续第 %d 次）" % (g, _nf))
                     try:
                         _pg, _rows = open_group_page(ctx, g)
                         pages[g] = _pg
                         adopt_page(g, _rows)
+                        if _nf > 1:
+                            log("[%s] 页面已重开成功（此前连续失败 %d 次）" % (g, _nf))
+                        _reopen_fail[g] = 0
                     except Exception as _e:
                         pages[g] = None
-                        log("[%s] 重开失败（下一轮会继续重试）：%s" % (g, str(_e)[:80]))
+                        # 关键：区分「这一个标签页被关了」（重开就好）与「整个上下文已死」（重开必然失败）
+                        if ctx_dead_error(_e):
+                            _dead_groups.add(g)
+                        if _nf <= 2 or _nf % 20 == 0:
+                            log("[%s] 重开失败（连续第 %d 次）：%s" % (g, _nf, str(_e)[:80]))
                     continue
                 try:
                     page.mouse.move(900, 400); page.mouse.wheel(0, 2600); time.sleep(0.3)
@@ -2831,6 +3052,8 @@ def main():
                 except Exception as e:
                     msg = str(e)[:120]
                     log("[%s] 轮询异常 %s" % (g, msg))
+                    if ctx_dead_error(e):
+                        _dead_groups.add(g)          # 整个上下文已死，交给 B1 自愈做全量重启
                     if "crash" in msg.lower() or "closed" in msg.lower():
                         try:
                             pages[g].close()
@@ -2839,8 +3062,12 @@ def main():
                         log("[%s] 页面崩溃，正在重建…" % g)
                         try:
                             pages[g] = open_group_page(ctx, g)[0]
-                        except Exception:
+                            _reopen_fail[g] = 0
+                        except Exception as _e2:
                             pages[g] = None
+                            if ctx_dead_error(_e2):
+                                _dead_groups.add(g)
+                            log("[%s] 重建失败：%s" % (g, str(_e2)[:80]))
             # 被回补闸门拦下的消息：汇总通报给你（文本以 【跟单机器人】 开头，
             # 会被下面的 SELF_MARKS 检查过滤掉，不会引发自我循环 —— 这条依赖别删）
             if missed_sig:
@@ -3112,4 +3339,140 @@ if __name__ == "__main__":
         print("2R 兜底自检：%d/%d 通过（盈亏比 %.0f:1，该档平 %.0f%%）"
               % (_ok, len(cases), R_FALLBACK_MULT, R_FALLBACK_PART * 100))
         sys.exit(0 if _ok == len(cases) else 1)
+    if "--selftest-b1" in sys.argv:
+        # ===== B1 自愈自检：完全隔离在 /tmp，不碰生产配置/状态/日志，不发飞书，不下单 =====
+        import shutil
+        _T = "/tmp/b1_selftest"
+        # ① 按交接文档第十一节第 16 条：生产路径全部重定向到 /tmp（这就是隔离的证明）
+        _prod_log = BASE + "/v21/run.log"
+        _before_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        RUNTIME = _T + "/runtime_config.json"
+        TRADES = _T + "/trades_dryrun.jsonl"
+        STATE = _T + "/state.json"
+        LOGF = _T + "/run.log"
+        IMGDIR = _T + "/imgs"
+        NOTIFY_CFG = _T + "/notify.json"          # 不存在 → notify() 不会推飞书
+        shutil.rmtree(_T, ignore_errors=True)
+        os.makedirs(_T + "/imgs", exist_ok=True)
+        print("=" * 70)
+        print("B1 自愈自检（隔离在 /tmp，不碰生产）")
+        print("=" * 70)
+        print("路径重定向证明：")
+        print("  BASE（只读引用） = %s" % BASE)
+        print("  RUNTIME         = %s" % RUNTIME)
+        print("  TRADES          = %s" % TRADES)
+        print("  STATE           = %s" % STATE)
+        print("  LOGF            = %s" % LOGF)
+        print("  NOTIFY_CFG      = %s（不存在 → 不发飞书）" % NOTIFY_CFG)
+        _fail = []
+
+        # ---------- ② 单元：异常分类（用的是 2026-09-15 那场 93 分钟事故的真实报错串）----------
+        print("\n[1] ctx_dead_error 分类（真实事故报错串）")
+        _cases = [
+            ("真实事故串 new_page closed",
+             "BrowserContext.new_page: Target page, context or browser has been closed", True),
+            ("Playwright 原始串", "Target page, context or browser has been closed", True),
+            ("TargetClosedError 包装",
+             "TargetClosedError('Target page, context or browser has been closed')", True),
+            ("浏览器整体关闭", "Browser has been closed", True),
+            ("驱动连接断开", "Connection closed while reading from the driver", True),
+            ("页面级 WebSocket 关闭（不可误判）", "WebSocket connection closed", False),
+            ("普通超时（不可误判）", "Timeout 30000ms exceeded waiting for selector", False),
+            ("网络重置（不可误判）", "net::ERR_CONNECTION_RESET at https://x", False),
+            ("元素歧义（不可误判）", "Error: strict mode violation: locator resolved to 2 elements", False),
+        ]
+        for _n, _s, _want in _cases:
+            _got = ctx_dead_error(Exception(_s))
+            _ok = (_got == _want)
+            print("  %s %-26s got=%s want=%s" % ("[ OK ]" if _ok else "[FAIL]", _n, _got, _want))
+            if not _ok:
+                _fail.append("分类：" + _n)
+
+        # ---------- ③ 端到端：真起浏览器 → 杀掉它 → 验证检出 → 验证全量重建 ----------
+        print("\n[2] 端到端：真浏览器被杀 → 检出 → 全量重建（用 /tmp profile）")
+        _avail = 0
+        try:
+            for _l in open("/proc/meminfo"):
+                if _l.startswith("MemAvailable"):
+                    _avail = int(_l.split()[1]) // 1024
+                    break
+        except Exception:
+            pass
+        print("  可用内存 %d MB（生产浏览器约占 2.9GB，所以设了内存门槛保护它）" % _avail)
+        if _avail < 500:
+            print("  [SKIP] 可用内存 < 500MB → 为保护生产浏览器，跳过端到端部分")
+        else:
+            _prof = _T + "/profile"
+            os.makedirs(_prof, exist_ok=True)
+            with sync_playwright() as _p:
+                _ctx = launch_persistent(_p, _prof)
+                _pg = _ctx.new_page()
+                _pg.goto("about:blank", timeout=30000)
+                print("  [ OK ] 测试浏览器已启动，evaluate 验证 = %s" % _pg.evaluate("() => 1 + 1"))
+                _pids = chrome_pids_of_profile(_prof)
+                print("  测试 chrome PID = %s（匹配串是 /tmp 路径，生产 fs_bot 不受影响）" % _pids)
+                for _pid in _pids:
+                    try:
+                        os.kill(_pid, 9)
+                    except Exception:
+                        pass
+                time.sleep(2.5)
+                try:
+                    _ctx.new_page()
+                    print("  [FAIL] 杀掉浏览器后 new_page 竟然还成功")
+                    _fail.append("E2E：杀浏览器后仍能 new_page")
+                except Exception as _e:
+                    _ok = ctx_dead_error(_e)
+                    print("  %s 杀掉后 new_page 抛错，且被识别为「上下文已死」：%s"
+                          % ("[ OK ]" if _ok else "[FAIL]", str(_e)[:88]))
+                    if not _ok:
+                        _fail.append("E2E：未能识别上下文已死")
+                try:
+                    _ctx.close()
+                except Exception:
+                    pass
+                _k = kill_profile_chrome(_prof)
+                _g = clear_singleton_locks(_prof)
+                print("  [info] 自愈清理动作：杀残留=%s 清锁=%s" % (_k or "无", _g or "无"))
+                _ctx2 = launch_persistent(_p, _prof)
+                _pg2 = _ctx2.new_page()
+                _pg2.goto("about:blank", timeout=30000)
+                _v2 = _pg2.evaluate("() => 6 * 7")
+                print("  %s 重建后新上下文可用：evaluate=%s（期望 42）"
+                      % ("[ OK ]" if _v2 == 42 else "[FAIL]", _v2))
+                if _v2 != 42:
+                    _fail.append("E2E：重建后上下文不可用")
+                try:
+                    _ctx2.close()
+                except Exception:
+                    pass
+            kill_profile_chrome(_prof)
+
+        # ---------- ④ 隔离复核：生产文件一行都没动 ----------
+        print("\n[3] 隔离复核")
+        _after_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        print("  生产 run.log 行数：自检前 %d → 自检后 %d  %s"
+              % (_before_lines, _after_lines,
+                 "[ OK ] 未被写入" if _before_lines == _after_lines else "[FAIL] 被写入了！"))
+        if _before_lines != _after_lines:
+            _fail.append("隔离：生产 run.log 被写入")
+        print("  生产 state.json mtime          = %s"
+              % time.strftime("%Y-%m-%d %H:%M:%S",
+                              time.localtime(os.path.getmtime(BASE + "/v21/state.json"))))
+        print("  生产 runtime_config.json mtime = %s"
+              % time.strftime("%Y-%m-%d %H:%M:%S",
+                              time.localtime(os.path.getmtime(BASE + "/runtime_config.json"))))
+        print("  自检当前时间                   = %s（上面两个 mtime 不应等于它）"
+              % time.strftime("%Y-%m-%d %H:%M:%S"))
+        print("  /tmp 自检产物：%s" % ", ".join(sorted(os.listdir(_T))))
+
+        print("\n" + "-" * 70)
+        if _fail:
+            print("B1 自检：%d 项失败" % len(_fail))
+            for _f in _fail:
+                print("   ✗ %s" % _f)
+            sys.exit(1)
+        print("B1 自检：全部通过 ✅")
+        sys.exit(0)
+
     main()
