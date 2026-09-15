@@ -46,7 +46,13 @@ STATE = RUN + "/state.json"                   # 固定指向生产状态文件�
 CST = datetime.timezone(datetime.timedelta(hours=8))
 STALE_HEARTBEAT_MIN = 10      # 心跳超过这个分钟数没更新 → 告警（机器人可能卡死）
 STALE_STATE_MIN = 10          # state.json 超过这个分钟数没更新 → 告警
-COOLDOWN_SEC = 1800           # 同类告警 30 分钟内只推一次，防轰炸
+COOLDOWN_SEC = 1800           # 普通关键字：同类 30 分钟内只推一次，防轰炸
+CRITICAL_COOLDOWN_SEC = 300   # 致命关键字：只冷 5 分钟
+# ⚠️ 2026-09-15 B1 实战验证时发现的**真实缺陷**：原来冷却按整个 "fault" 类别计，
+#    于是 19:49 一条「对账不一致」告警把 fault 冷却了 30 分钟 → 20:04 **浏览器整体死亡**
+#    （BrowserContext）被静默吞掉，实际推送=无。这正是最不能漏的事件。
+#    改成：**冷却按关键字分别计**，且致命关键字只冷 5 分钟。
+CRITICAL_KW = ("BrowserContext", "熔断", "重建浏览器失败", "浏览器自动重启失败", "对账闸门")
 MAX_SHOW = 3                  # 每条告警最多展示几行原文
 
 # 只认这些"新增"行 —— 命中即告警
@@ -211,42 +217,49 @@ def main():
                 hits.setdefault(kw, []).append(l)
                 break
 
-    alerts = []
+    cand = []          # (冷却键, 正文, 冷却秒数)
     if hits:
         parts = []
-        for kw, ls in hits.items():
+        for kw in sorted(hits):
+            ls = hits[kw]
             parts.append("· %s × %d\n  %s" % (kw, len(ls),
                                              "\n  ".join(x[:150] for x in ls[:MAX_SHOW])))
-        alerts.append(("fault", "🔴 新增故障行（共 %d 条）\n%s"
-                       % (sum(len(v) for v in hits.values()), "\n".join(parts))))
+        cand.append(("fault:" + "|".join(sorted(hits)),
+                     "🔴 新增故障行（共 %d 条）\n%s"
+                     % (sum(len(v) for v in hits.values()), "\n".join(parts)),
+                     CRITICAL_COOLDOWN_SEC if any(k in CRITICAL_KW for k in hits) else COOLDOWN_SEC))
 
     # 心跳停摆（机器人可能整体卡死，或进程被 pm2 拉起但没跑起来）
     hb = last_heartbeat_ts(new_lines) or last_heartbeat_ts(
         open(LOGF, encoding="utf-8", errors="replace").read().splitlines()[-400:])
     if hb and (time.time() - hb) > STALE_HEARTBEAT_MIN * 60:
-        alerts.append(("heartbeat", "⏸️ 心跳停摆：最后一条心跳是 %s（%.1f 分钟前，阈值 %d 分钟）"
-                       % (datetime.datetime.fromtimestamp(hb, CST).strftime("%Y-%m-%d %H:%M:%S"),
-                          (time.time() - hb) / 60.0, STALE_HEARTBEAT_MIN)))
+        cand.append(("heartbeat",
+                     "⏸️ 心跳停摆：最后一条心跳是 %s（%.1f 分钟前，阈值 %d 分钟）"
+                     % (datetime.datetime.fromtimestamp(hb, CST).strftime("%Y-%m-%d %H:%M:%S"),
+                        (time.time() - hb) / 60.0, STALE_HEARTBEAT_MIN), COOLDOWN_SEC))
 
     # 进程 / 状态文件
     pid = bot_process_alive()
     if not pid:
-        alerts.append(("proc", "💀 找不到机器人主进程（dryrun_bot2.py 不在 /proc 里）"))
+        cand.append(("proc", "💀 找不到机器人主进程（dryrun_bot2.py 不在 /proc 里）",
+                     CRITICAL_COOLDOWN_SEC))
     try:
         sm = os.path.getmtime(STATE)
         if (time.time() - sm) > STALE_STATE_MIN * 60:
-            alerts.append(("state", "⏸️ state.json 已 %.1f 分钟没更新（阈值 %d 分钟）"
-                           % ((time.time() - sm) / 60.0, STALE_STATE_MIN)))
+            cand.append(("state", "⏸️ state.json 已 %.1f 分钟没更新（阈值 %d 分钟）"
+                         % ((time.time() - sm) / 60.0, STALE_STATE_MIN), COOLDOWN_SEC))
     except Exception:
-        alerts.append(("state", "💀 读不到 state.json"))
+        cand.append(("state", "💀 读不到 state.json", COOLDOWN_SEC))
 
-    # 冷却：同类告警 30 分钟内只推一次
+    # 冷却：**按冷却键分别计**（不是按整个类别），致命项只冷 5 分钟
     cd = cur.get("cooldown") or {}
-    fresh = [(k, m) for (k, m) in alerts if time.time() - float(cd.get(k, 0)) > COOLDOWN_SEC]
+    fresh = [(k, m) for (k, m, cool) in cand
+             if time.time() - float(cd.get(k, 0)) > cool]
 
-    print("[%s] 新增 %d 行｜命中类别 %s｜告警项 %s｜实际推送 %s"
-          % (now_str(), len(new_lines), list(hits) or "无",
-             [k for k, _ in alerts] or "无", [k for k, _ in fresh] or "无"))
+    print("[%s] 新增 %d 行｜命中类别 %s｜候选告警 %d 项 %s｜实际推送 %d 项 %s"
+          % (now_str(), len(new_lines), sorted(hits) or "无",
+             len(cand), [k for k, _, _ in cand] or [],
+             len(fresh), [k for k, _ in fresh] or []))
 
     rc = 0
     if fresh:
