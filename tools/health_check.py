@@ -51,9 +51,20 @@ def main():
             line("      ", f"  {c} {t['dir']} 入场 {t['entry']} 止损 {t['sl']} "
                            f"止盈 {t.get('tps') or '未读'} 剩余 {t.get('remaining',1)*100:.0f}% "
                            f"来源 {t.get('group')}")
-        if len(op) > 5:
-            problems.append(f"持仓 {len(op)} 笔 > 上限 5")
-            line(BAD, "持仓超过 5 笔上限！")
+        # ⚠️ 2026-09-15 修：原来这里硬编码 5，而 max_open 是可用指令改的（当时已改成 7）
+        #    → 会**永远误报**"持仓超过 5 笔上限"，把核验工具变成噪音源。
+        #    现在读 runtime_config.json 的 max_open；读不到才退回代码默认 5。
+        _mo = 5
+        try:
+            _mo = int(json.load(open(os.path.join(BASE, "runtime_config.json"),
+                                     encoding="utf-8")).get("max_open") or 5)
+        except Exception:
+            pass
+        if len(op) > _mo:
+            problems.append(f"持仓 {len(op)} 笔 > 上限 {_mo}")
+            line(BAD, f"持仓超过 {_mo} 笔上限（max_open={_mo}，可用「修改持仓上限 N」改）！")
+        else:
+            line(OK, f"持仓 {len(op)} 笔 ≤ 上限 {_mo} 笔")
         lm = st.get("last", {})
         line(OK, "进度游标: " + ", ".join(f"{k}" for k in lm))
         seen = st.get("seen") or []
