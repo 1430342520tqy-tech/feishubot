@@ -1,0 +1,13 @@
+[Unit]
+Description=信号机器人 外部日志巡检（B2：不依赖机器人进程活着）
+Documentation=https://github.com/1430342520tqy-tech/feishubot
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/signal-bot
+ExecStart=/home/ubuntu/signal-bot/venv/bin/python /home/ubuntu/signal-bot/log_watch.py
+# 只读巡检：不写机器人任何配置；只写自己的游标 v21/watch_state.json
+Nice=10

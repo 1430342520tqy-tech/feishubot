@@ -1,0 +1,14 @@
+[Unit]
+Description=每 5 分钟巡检一次信号机器人日志（B2）
+Documentation=https://github.com/1430342520tqy-tech/feishubot
+
+[Timer]
+# 开机 3 分钟后先跑一次，之后每 5 分钟一次
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=signalbot-watch.service
+
+[Install]
+WantedBy=timers.target

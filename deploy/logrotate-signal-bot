@@ -1,0 +1,22 @@
+# run.log 轮转（B12）
+# 背景：run.log 无轮转，2.23MB / 2.5 万行里 66% 是心跳，
+#       把 health_check.py 的「最近 400 行」窗口挤占掉 246 行 → 故障关键字会被挤出去导致漏报。
+#
+# ⚠️ 必须用 copytruncate：机器人是用追加模式**长期持有**这个文件句柄的，
+#    若用默认的 create+rename，机器人会继续写进已被改名的旧 inode，日志会"消失"。
+#    copytruncate = 先复制走备份、再把原文件截断为 0，句柄继续有效。
+#    （外部巡检 log_watch.py 已处理"文件变小 → 游标归零"，不会因此漏检。）
+#
+# 部署：sudo cp deploy/logrotate-signal-bot /etc/logrotate.d/signal-bot
+#       sudo logrotate -d /etc/logrotate.d/signal-bot   # -d = 干跑，只看不转
+/home/ubuntu/signal-bot/v21/run.log {
+    daily
+    size 20M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su ubuntu ubuntu
+}
