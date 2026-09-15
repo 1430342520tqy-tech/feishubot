@@ -110,8 +110,9 @@ def push_feishu(text, dry=False):
         import requests
         r = requests.post(hook, json={"msg_type": "text", "content": {"text": text}},
                           timeout=20).json()
+        print("webhook 响应：%s" % json.dumps(r, ensure_ascii=False)[:200])
         if r.get("code") not in (0, None):
-            print("[warn] webhook 返回：%s" % json.dumps(r, ensure_ascii=False)[:160])
+            print("[warn] webhook 返回非 0：%s" % json.dumps(r, ensure_ascii=False)[:160])
     except Exception as e:
         print("[warn] webhook 失败：%s" % str(e)[:120])
 
@@ -146,6 +147,17 @@ def main():
     dry = "--dry-run" in sys.argv
     status_only = "--status" in sys.argv
     do_reset = "--reset" in sys.argv
+
+    if "--test-alert" in sys.argv:
+        # 验证"外部巡检 → 飞书告警"这条链路。刻意把【测试】字样写在最前面，避免被误当成真告警。
+        push_feishu(
+            "【跟单机器人】🩺 **【测试】外部巡检告警通道测试** —— 这不是真告警\n"
+            "用途：验证「外部巡检 → 飞书」这条链路是通的。\n"
+            "时间：%s\n"
+            "说明：收到这条即代表 B2 告警通道正常。平时收不到巡检消息 = 系统一直健康，\n"
+            "      只有发现**新增**故障行 / 心跳停摆 / 进程消失 / state.json 停更 时才会发。" % now_str())
+        print("推送调用已返回（上面若出现 code 0 即成功）")
+        return 0
 
     if not os.path.exists(LOGF):
         print("[FAIL] 日志不存在：%s" % LOGF)
