@@ -3463,8 +3463,21 @@ def main():
                         last_id[g] = max(last_id.get(g, 0), int(mid))
                         STATE_DIRTY[0] = True
                         low = txt.lower()
-                        SELF_MARKS = ["【跟单机器人】", "【机器人指令】", "【已开单·纸面】", "【已结单·纸面】", "【止盈成交·纸面】", "【你的持仓】", "【指令】", "【博主指令】", "【信号·"]
-                        if any(_m in txt for _m in SELF_MARKS) or "通过webhook" in txt or "invited" in low or "test notification" in low:
+                        # ⚠️ 2026-09-15 实测事故：用户发「全部平仓」后，机器人把自己的
+                        #    【已平仓·纸面】通知**当成博主信号重新解析**，播报出 5 条假的
+                        #    「【博主指令】xxx 动作：close_all」。根因就是这张表漏了「【已平仓」。
+                        #    现在把机器人自己会发出的**所有**前缀都列全，并加一条防御规则。
+                        SELF_MARKS = ["【跟单机器人】", "【机器人指令】", "【已开单·纸面】",
+                                      "【已结单·纸面】", "【止盈成交·纸面】", "【已平仓·纸面】",
+                                      "【已减仓·纸面】", "【你的持仓】", "【指令】", "【博主指令】",
+                                      "【信号·", "【待确认】", "【挂单情况】", "【机器人状态】",
+                                      "【持仓情况】", "【风控熔断", "【对账闸门】", "【持仓自检】"]
+                        # 防御规则：机器人自己的通知里必然带这些字样，命中即视为自己发的
+                        # （将来新加通知前缀忘了登记，也不至于又变成"自己给自己发信号"）
+                        if any(_m in txt for _m in SELF_MARKS) or "通过webhook" in txt \
+                                or "invited" in low or "test notification" in low \
+                                or "（你的指令：" in txt or "本次盈亏：" in txt \
+                                or "该档盈亏：" in txt or "累计：" in txt:
                             continue
                         # 指令优先：只有在指定指令群里、由你发的短消息才会被当成指令
                         if g in CMD_GROUPS:
