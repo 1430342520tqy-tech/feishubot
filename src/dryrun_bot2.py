@@ -131,6 +131,67 @@ FILL_TIMEOUT = 1800       # 30 分钟没成交 → 撤单并通知你
 _WATCH_NOTIFIED = set()   # 通知去重
 
 
+_LIVE_ALERTS = set()      # 告警去重，避免刷屏
+
+
+def _live_alert(action, coin, err, extra=""):
+    """真实下单动作失败 → 必须【大喊】，绝不能只写一行日志（评估 P0-1：绝不静默丢弃）。
+    同时登记到 NAKED_WATCH，交给每轮的裸仓看门狗自动补挂。"""
+    key = "%s|%s" % (action, coin)
+    log("   🔴 [真实动作失败] %s %s: %s" % (action, coin, str(err)[:160]))
+    if key in _LIVE_ALERTS:
+        return key
+    _LIVE_ALERTS.add(key)
+    try:
+        notify("🔴【实盘动作失败·需要处理】\n"
+               "操作：%s ｜ 币种：%s\n错误：%s\n%s\n\n"
+               "⚠️ 这意味着该仓位可能【暂时没有止损保护】，或挂单状态与预期不符。\n"
+               "机器人会在下一轮自动尝试补挂；若反复失败会继续告警。\n"
+               "建议你打开币安 App 核对一次。" % (action, coin, str(err)[:200], extra))
+    except Exception:
+        pass
+    NAKED_WATCH.add(coin)
+    return key
+
+
+def _clear_live_alert(action, coin):
+    _LIVE_ALERTS.discard("%s|%s" % (action, coin))
+
+
+NAKED_WATCH = set()       # 需要看门狗复核止损的币种
+_NAKED_TICK = [0]
+NAKED_EVERY = 60          # 每 60 轮（约 30 秒）查一次，避免打爆币安限频
+
+
+def watch_naked():
+    """裸仓看门狗：检查【实盘仓位是否真的有止损单】，没有就自动补挂，补挂失败继续告警。
+    评估 P0-2：这是最核心的保命机制 —— 没有它，任何一次挂单失败都会留下无保护的真钱仓位。"""
+    if not _BEXEC_OK or not bexec.LIVE[0]:
+        return
+    for coin, tr in list(open_pos_ref.items()):
+        if tr.get("real_layer") != "实盘" or tr.get("pending_fill"):
+            continue
+        sl = tr.get("sl")
+        if not sl:
+            continue
+        sym = coin.upper() + "USDT"
+        try:
+            algo = bexec.open_algo_orders(sym) or []
+            clas = [o for o in (bexec.open_orders(sym) or [])
+                    if o.get("type") in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET")]
+            if algo or clas:
+                NAKED_WATCH.discard(coin)
+                _clear_live_alert("裸仓看门狗", coin)
+                continue
+            log("   🛡 看门狗：%s 没有止损单 → 自动补挂" % coin)
+            _q = _real_qty_or_estimate(coin, tr)
+            bexec.place_sl_stop_market(sym, tr["dir"], sl, _q)
+            notify("【实盘·看门狗】%s 之前没有止损单，已自动补挂：止损 %s（数量 %s）" % (coin, sl, _q))
+            NAKED_WATCH.discard(coin)
+        except Exception as e:
+            _live_alert("裸仓看门狗补挂", coin, e, "该仓位止损 %s 仍未挂上" % sl)
+
+
 def watch_entries():
     """轮询限价入场的成交情况。只在【实盘模式】有意义（影子模式没有真实委托）。"""
     if not _BEXEC_OK or not bexec.LIVE[0] or not ENTRY_WATCH:
@@ -162,7 +223,7 @@ def watch_entries():
                         t["qty"] = bexec.fmt_qty(w["sym"], filled_qty / max(len(_tps), 1))
                     except Exception:
                         pass
-                bexec.after_entry_filled(w["sym"], w["dir"], _tps, w.get("stop"), filled_qty)
+                _res = bexec.after_entry_filled(w["sym"], w["dir"], _tps, w.get("stop"), filled_qty)
                 _tr = open_pos_ref.get(coin)
                 if _tr is not None:
                     _tr["entry"] = avg_px or _tr.get("entry")
@@ -170,11 +231,27 @@ def watch_entries():
                     _tr["fill_qty"] = filled_qty
                     _tr["fill_px"] = avg_px
                     STATE_DIRTY[0] = True
-                notify("【实盘·成交】%s %s 限价单已成交\n成交均价 %.8g ｜ 数量 %s\n"
-                       "已挂：止盈 %d 档（限价）+ 止损 %s（Algo STOP_MARKET）"
-                       % (coin, w["dir"], avg_px, filled_qty,
-                          len(_tps), w.get("stop")))
-                log("   ✅ [实盘成交] %s 均价 %.8g 数量 %s → 已挂止盈/止损" % (coin, avg_px, filled_qty))
+                # ⚠️ 评估 M2（我自己写错的）：绝不能丢弃返回值、无条件报"已挂"。
+                _sl_res = (_res or {}).get("sl")
+                _sl_ok = isinstance(_sl_res, dict) and not _sl_res.get("err")
+                _tps_ok = sum(1 for x in ((_res or {}).get("tps") or [])
+                              if not (isinstance(x, dict) and x.get("err")))
+                if w.get("stop") and not _sl_ok:
+                    _live_alert("成交后挂止损", coin, str(_sl_res)[:180],
+                                "仓位已真实成交（数量 %s 均价 %.8g）但止损未确认成功" % (filled_qty, avg_px))
+                    notify("【实盘·成交但要你处理】%s %s 已成交\n成交均价 %.8g ｜ 数量 %s\n"
+                           "⚠️ **止损挂单失败**：%s\n止盈成功 %d/%d 档\n"
+                           "机器人会持续尝试补挂止损；请打开币安核对一次。"
+                           % (coin, w["dir"], avg_px, filled_qty, str(_sl_res)[:120],
+                              _tps_ok, len(_tps)))
+                    log("   🔴 [实盘成交] %s 已成交，但止损挂失败 → 已告警" % coin)
+                else:
+                    notify("【实盘·成交】%s %s 限价单已成交\n成交均价 %.8g ｜ 数量 %s\n"
+                           "已挂：止盈 %d/%d 档（限价）+ 止损 %s（Algo STOP_MARKET）"
+                           % (coin, w["dir"], avg_px, filled_qty,
+                              _tps_ok, len(_tps), w.get("stop")))
+                    log("   ✅ [实盘成交] %s 均价 %.8g 数量 %s → 止盈 %d/%d 档 + 止损已挂"
+                        % (coin, avg_px, filled_qty, _tps_ok, len(_tps)))
                 ENTRY_WATCH.pop(coin, None)
             elif filled_qty > 0 and any_live and now > w["deadline"]:
                 # 部分成交且超时：保留已成交部分，撤掉剩余，并告知
@@ -215,6 +292,15 @@ def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
         return bexec.open_full_position(coin.upper() + "USDT", dirc, entry, stop,
                                         list(tps or []), margin=margin or MARGIN)
     except Exception as e:
+        # ⚠️ 实盘下绝不能只说一句"不影响纸面"：可能已经有真实仓位建立了
+        if _BEXEC_OK:
+            try:
+                if bexec.LIVE[0]:
+                    _live_alert("开仓(%s)" % coin, coin,
+                                e, "真实仓位可能已部分建立或未挂保护，看门狗会复核")
+                    return None
+            except Exception:
+                pass
         log("   ⚠️ 真实下单层计划生成失败（不影响纸面）：%s" % str(e)[:140])
         return None
 
@@ -238,6 +324,22 @@ def real_plan_close(coin, dirc, qty=None):
     except Exception as e:
         log("   ⚠️ 真实下单层平仓计划生成失败：%s" % str(e)[:140])
         return None
+
+
+def _real_qty_or_estimate(coin, tr):
+    """止损数量：**优先查交易所真实持仓**，查不到才退回纸面估算。
+    评估 M4：实盘下若用纸面公式估数量，可能偏大（被拒）或偏小（只保护一部分仓位）。"""
+    sym = coin.upper() + "USDT"
+    if _BEXEC_OK:
+        try:
+            pos = bexec.position_of(sym, tr.get("dir"))
+            q = abs(float((pos or {}).get("positionAmt") or 0))
+            if q > 0:
+                return q
+            log("   ⚠️ 交易所查不到 %s 的真实持仓（可能已平仓）→ 止损数量退回纸面估算" % coin)
+        except Exception as e:
+            log("   ⚠️ 查交易所真实持仓失败（%s）→ 止损数量退回纸面估算" % str(e)[:80])
+    return real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
 
 
 def real_qty_estimate(entry, remaining):
@@ -1214,9 +1316,14 @@ def finalize_pending(open_pos):
                 log("   ↳ 博主未给止盈 → 启用 2R 兜底：入场 %s 止损 %s → 2R 目标 %s（到价全平）"
                     % (entry, p["stop"], _ft, ))
         over_cap = (len(open_pos) >= MAX_OPEN and coin not in open_pos)
-        if over_cap and not TEST_MODE:
-            notify("【信号·跳过】%s 同时持仓已满 %d 笔" % (coin, MAX_OPEN))
-            PENDING.pop(coin, None); continue
+        # 用户 2026-09-15：达到持仓上限时【询问我】是否提高上限开单，不再直接跳过
+        if over_cap and not p.get("cap_override"):
+            ask_user(coin, p,
+                     "当前已持 %d 笔，达到持仓上限 %d 笔。"
+                     "回复「开」= 把上限**提高**到 %d 笔并开这一单；回「不开」= 放弃"
+                     % (len(open_pos), MAX_OPEN, len(open_pos) + 1))
+            PENDING.pop(coin, None)
+            continue
         if coin in open_pos:
             _ex = open_pos[coin]
             # ===== 博主后来补了真实止盈位 → 撤掉 2R 兜底那档，按真实档位重挂 =====
@@ -1498,7 +1605,7 @@ HELP_TEXT = """【机器人指令】在「开单记录」群直接发这些词�
 · 开 / 不开 —— 把握不准时机器人会问你，回「开」才开单、回「不开」作废"""
 
 def load_runtime():
-    global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE, STRICT_LIMIT_GROUPS
+    global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE, STRICT_LIMIT_GROUPS, MAX_OPEN
     try:
         if os.path.exists(RUNTIME):
             cfg = json.load(open(RUNTIME, encoding="utf-8"))
@@ -1506,6 +1613,8 @@ def load_runtime():
                 GROUPS = [g for g in cfg["groups"] if g]
             if "strict_limit_groups" in cfg:
                 STRICT_LIMIT_GROUPS = [g for g in (cfg.get("strict_limit_groups") or []) if g]
+            if cfg.get("max_open"):
+                MAX_OPEN = max(1, int(cfg["max_open"]))     # 用户可用指令改（4~8…）
             if cfg.get("margin"):
                 MARGIN = float(cfg["margin"])
             if cfg.get("leverage"):
@@ -1530,7 +1639,8 @@ def save_runtime():
             _old = json.load(open(RUNTIME, encoding="utf-8"))
         except Exception:
             pass
-        out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE}
+        out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE,
+               "max_open": MAX_OPEN}
         # ⚠️ 必须保留 live_trading / strict_limit_groups：否则任何一条指令都会把它们悄悄抹掉
         if "live_trading" in _old:
             out["live_trading"] = _old["live_trading"]
@@ -1585,7 +1695,8 @@ def close_position(coin, pct=100.0, why="手动指令"):
     STATE_DIRTY[0] = True
     with open(TRADES, "a", encoding="utf-8") as f:
         f.write(json.dumps(tr, ensure_ascii=False) + "\n")
-    if _BEXEC_OK:      # 真实层同步：撤旧挂单，全平 or 按剩余量重挂止损
+    if _BEXEC_OK and tr.get("real_layer") == "实盘":
+        # 只对实盘仓动真实挂单（用户 2026-09-15：切换模式时已有持仓不动）
         try:
             _sym = coin.upper() + "USDT"
             bexec.cancel_all(_sym)
@@ -1593,10 +1704,11 @@ def close_position(coin, pct=100.0, why="手动指令"):
                 real_plan_close(coin, tr["dir"], None)
             else:
                 bexec.sync_sl(_sym, tr["dir"], tr.get("sl") or tr["entry"],
-                              real_qty_estimate(tr["entry"], tr["remaining"]))
-            log("   ↳ [真实下单层·%s] 已记录手工平/减仓的对应计划" % _be_mode())
+                              _real_qty_or_estimate(coin, tr))
+            _clear_live_alert("手工平仓", coin)
+            log("   ↳ [真实下单层·实盘] 已执行手工平/减仓的对应动作")
         except Exception as _e:
-            log("   ⚠️ 真实层手工平仓计划失败：%s" % str(_e)[:120])
+            _live_alert("手工平/减仓", coin, _e, "真实仓位可能未平掉，请立刻核对")
     if tr["remaining"] <= 0.001:
         open_pos_ref.pop(coin, None)
         notify("【已平仓·纸面】%s %s（%s）@%.8g\n本次盈亏：%+.1fU · 累计：%+.1fU"
@@ -1618,6 +1730,15 @@ def _reply_coins(s):
     return found
 
 
+def _bump_cap(n):
+    """修改持仓上限并落盘（用户 2026-09-15 要求可指令控制）"""
+    global MAX_OPEN
+    MAX_OPEN = max(1, int(n))
+    save_runtime()
+    log("持仓上限 -> %d（已落盘）" % MAX_OPEN)
+    return MAX_OPEN
+
+
 def _open_asking(coin):
     """把待确认信号放回待确认池，立刻出单"""
     it = ASKING.pop(coin, None)
@@ -1625,6 +1746,10 @@ def _open_asking(coin):
         return False
     p = it["p"]
     p["deadline"] = 0
+    # 若是因"持仓上限"被拦下的：回「开」即视为同意把上限提高（到当前持仓数+1）
+    if len(open_pos_ref) >= MAX_OPEN and coin not in open_pos_ref:
+        p["cap_override"] = True
+        _bump_cap(len(open_pos_ref) + 1)
     PENDING[coin] = p
     return True
 
@@ -1728,7 +1853,8 @@ def handle_command(txt):
         return False
     KEY = ["帮助", "状态", "持仓情况", "持仓", "全部平仓", "确认全部平仓", "平仓", "减仓",
            "修改止损", "移保本", "暂停", "继续", "修改监控群", "修改金额", "修改杠杆", "测试模式",
-           "实盘模式", "挂单情况", "挂单", "待确认"]
+           "实盘模式", "挂单情况", "挂单", "待确认", "修改持仓上限", "持仓上限", "进入测试模式",
+           "进入实盘模式"]
     # 去掉可能的昵称/时间前缀后，指令必须在消息开头（防止转发内容被误当指令）
     nick = lambda x: re.sub(r"^[^\s]{2,16}\s+", "", x)
     tm = lambda x: re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x, flags=re.I).strip()
@@ -1739,6 +1865,9 @@ def handle_command(txt):
     _ct = (tm(t) or t).strip()
     if len(_ct) <= 48:
         _co = _reply_coins(_ct)
+        if not _co and ASKING:      # 兜底：直接匹配当前待确认里的币种（防止别名/非标准写法）
+            _co = [c for c in ASKING
+                   if re.search(r"(?<![A-Za-z0-9])" + re.escape(c) + r"(?![A-Za-z0-9])", _ct, re.I)]
         _is_reply = bool(_co and re.search(r"开|买|作废|不要", _ct)) or bool(re.fullmatch(
             r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)", _ct))
         if _is_reply:
@@ -1899,6 +2028,36 @@ def handle_command(txt):
             LEV = int(m.group(1)); NOTIONAL = MARGIN * LEV
             save_runtime()
             notify("【指令】杠杆已改为 %d 倍（保证金 %.0fU = 名义 %.0fU）" % (LEV, MARGIN, NOTIONAL))
+    elif cmd.startswith("修改持仓上限") or cmd.startswith("持仓上限"):
+        m = re.search(r"(?:修改)?持仓上限\s*(\d+)", cmd)
+        if m:
+            n = max(1, min(50, int(m.group(1))))
+            _bump_cap(n)
+            notify("【指令】持仓上限已改为 **%d 笔**（最大敞口 %.0fU = %d × %.0fU）\n"
+                   "当前持仓 %d 笔 ｜ 已有持仓不受影响"
+                   % (n, n * MARGIN, n, MARGIN, len(open_pos_ref)))
+        else:
+            notify("【指令】格式：修改持仓上限 6（当前 %d 笔，持仓 %d 笔）"
+                   % (MAX_OPEN, len(open_pos_ref)))
+    elif cmd.startswith("进入测试模式"):
+        _set_live(False)
+        _n = len(open_pos_ref)
+        notify("【指令】已切换到 **测试模式（纸面）**\n"
+               "· 之后的信号只在纸面记录，不会向币安发任何委托\n"
+               "· **已有持仓 %d 笔保持原样不动**（它们的模式在开仓时就固定了，不会被切换影响）"
+               % _n)
+    elif cmd.startswith("进入实盘模式"):
+        if "确认" not in cmd:
+            notify("【指令】进入实盘需要二次确认：发「**进入实盘模式 确认**」\n"
+                   "（实盘下单会用真钱。要回纸面随时发「进入测试模式」）")
+        else:
+            _set_live(True)
+            _live = sum(1 for t in open_pos_ref.values() if t.get("real_layer") == "实盘")
+            _n = len(open_pos_ref)
+            notify("【指令】⚠️ 已切换到 **实盘模式**\n"
+                   "· 之后的信号会真的向币安发单（保证金 %.0fU × %d倍 / 上限 %d 笔）\n"
+                   "· **已有持仓 %d 笔保持原样不动**（其中实盘仓 %d 笔继续按实盘管理）\n"
+                   "· 要回纸面随时发「进入测试模式」" % (MARGIN, LEV, MAX_OPEN, _n, _live))
     elif cmd.startswith("实盘模式"):
         if "关" in cmd:
             _set_live(False)
@@ -2523,6 +2682,13 @@ def main():
                 watch_entries()
             except Exception as e:
                 log("成交监听异常 " + str(e)[:100])
+            # 裸仓看门狗（每约 30 秒查一次）
+            _NAKED_TICK[0] += 1
+            if _NAKED_TICK[0] % NAKED_EVERY == 0:
+                try:
+                    watch_naked()
+                except Exception as e:
+                    log("裸仓看门狗异常 " + str(e)[:100])
             # 待确认信号超时作废
             try:
                 expire_asking()
@@ -2560,12 +2726,13 @@ def main():
                             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
                         notify("【已结单·纸面】%s %s\n结果：%s @%.8g（剩余 %.0f%%）\n累计盈亏：%+.1fU（保证金 %.0fU）"
                                % (coin, tr["dir"], tr["exit_why"], stop, remaining * 100, tr["realized"], MARGIN))
-                        if _BEXEC_OK:      # 真实层：仓位已了结 → 撤掉剩余挂单
+                        if _BEXEC_OK and tr.get("real_layer") == "实盘":
+                            # 只对【开仓时就是实盘】的仓位动真实挂单；切模式前开的纸面仓一律不碰（用户 2026-09-15 要求）
                             try:
                                 bexec.cancel_all(coin.upper() + "USDT")
-                                log("   ↳ [真实下单层·%s] 已记录撤单计划（仓位已了结）" % _be_mode())
+                                log("   ↳ [真实下单层·实盘] 仓位已了结，已撤掉剩余挂单")
                             except Exception as _e:
-                                log("   ⚠️ 真实层撤单计划失败：%s" % str(_e)[:120])
+                                _live_alert("撤单", coin, str(_e))
                         open_pos.pop(coin, None)
                         continue
                     # ② 依次检查各档止盈
@@ -2596,15 +2763,18 @@ def main():
                         notify("【止盈成交·纸面】%s %s\nTP%d 成交 @%.8g（平%.0f%%）\n该档盈亏：%+.1fU · 累计：%+.1fU\n剩余仓位：%.0f%%%s"
                                % (coin, tr["dir"], hit_i + 1, tp, part * 100, pnl, tr["realized"], remaining * 100,
                                   ("\n止损已移到开仓价 %.8g（保本损）" % stop) if hit_i == 0 else ""))
-                        if _BEXEC_OK:      # 真实层：限价止盈成交 → Algo 止损数量必须跟着改（撤单重挂）
+                        if _BEXEC_OK and tr.get("real_layer") == "实盘":
+                            # 只对实盘仓动真实止损；切模式前开的纸面仓不碰
                             try:
+                                _rq = _real_qty_or_estimate(coin, tr)
                                 bexec.sync_sl(coin.upper() + "USDT", tr["dir"],
-                                              tr.get("sl") or tr["entry"],
-                                              real_qty_estimate(tr["entry"], remaining))
-                                log("   ↳ [真实下单层·%s] 已记录止损同步计划：%s，数量按剩余 %.0f%% 重算"
-                                    % (_be_mode(), "移到开仓价" if hit_i == 0 else "价格不变", remaining * 100))
+                                              tr.get("sl") or tr["entry"], _rq)
+                                _clear_live_alert("止损同步", coin)
+                                log("   ↳ [真实下单层·实盘] 止损已同步：%s，数量 %s（按交易所真实持仓）"
+                                    % ("移到开仓价" if hit_i == 0 else "价格不变", _rq))
                             except Exception as _e:
-                                log("   ⚠️ 真实层止损同步计划失败：%s" % str(_e)[:120])
+                                _live_alert("止损同步(TP%d后)" % (hit_i + 1), coin, _e,
+                                            "纸面认为已平 %.0f%%，真实止损可能未更新" % (part * 100))
                         if remaining <= 0.001:
                             tr.update({"status": "CLOSED", "exit": tp, "exit_why": "全部止盈",
                                        "pnl": tr["realized"]})

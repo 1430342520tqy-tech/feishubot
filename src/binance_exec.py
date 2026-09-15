@@ -331,18 +331,44 @@ def cancel_algo(symbol, algo_id):
 
 
 def sync_sl(symbol, dir_, new_stop, qty):
-    """移动/重挂止损（TP1 后移保本损、或分批止盈后修正剩余数量）：
-    先把该币种所有 algo 止损撤掉，再按最新数量与价格重挂。"""
-    if LIVE[0]:
-        for o in (open_algo_orders(symbol) or []):
-            cancel_algo(symbol, o.get("algoId"))
-        for o in (open_orders(symbol) or []):          # 顺带清掉经典挂单里的止损残留
-            if o.get("type") in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
-                cancel_order(symbol, o.get("orderId"))
-    else:
+    """移动/重挂止损（TP1 后移保本损、分批止盈后修正数量）。
+
+    ⚠️ 顺序已改为【先挂新止损 → 确认成功 → 才撤旧止损】。
+    评估 P0-2：原来的"先撤后挂"在重挂失败时会让仓位**裸奔**，
+    而每笔走到 TP1 的盈利单都必然经过这里 —— 不是小概率意外，是必经路径。
+    """
+    if not LIVE[0]:
         audit("sync_sl_plan", {"symbol": symbol, "dir": dir_, "new_stop": new_stop,
                                "qty": fmt_qty(symbol, qty)}, mode="shadow")
-    return place_sl_stop_market(symbol, dir_, new_stop, qty)
+        return place_sl_stop_market(symbol, dir_, new_stop, qty)
+
+    old_algo = [o.get("algoId") for o in (open_algo_orders(symbol) or [])]
+    old_cls = [o.get("orderId") for o in (open_orders(symbol) or [])
+               if o.get("type") in ("STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET")]
+
+    new = place_sl_stop_market(symbol, dir_, new_stop, qty)          # ① 先挂新
+    new_id = None
+    if isinstance(new, dict):
+        new_id = new.get("algoId") or new.get("clientAlgoId") or new.get("orderId")
+    if not new_id:
+        audit("sync_sl_abort", {"symbol": symbol, "new": new,
+                               "kept_algo": old_algo, "kept_classic": old_cls},
+              "新止损未确认成功 → 保留旧止损不动，避免裸奔")
+        raise BinanceError("sync_sl 中止：新止损未确认成功，已保留旧止损（避免裸奔）")
+
+    for aid in old_algo:                                             # ② 确认成功后才撤旧
+        try:
+            cancel_algo(symbol, aid)
+        except BinanceError:
+            pass
+    for oid in old_cls:
+        try:
+            cancel_order(symbol, oid)
+        except BinanceError:
+            pass
+    audit("sync_sl_done", {"symbol": symbol, "new_id": new_id,
+                           "cancelled_algo": old_algo, "cancelled_classic": old_cls})
+    return new
 
 
 def move_sl(symbol, dir_, new_stop, qty=None):
@@ -475,7 +501,9 @@ def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=L
     audit("open_full_position_plan", plan)
     if LIVE[0]:
         # ===== 先下入场腿 =====
-        _oids = []
+        # ⚠️ 评估 M3：绝不能"有腿失败还照挂全额保护"。止损数量按全额 900U 挂出去，
+        #    而实际只成交一半 → 数量错、被拒、或只保护一部分。必须全成功才继续。
+        _oids, _fail = [], []
         _has_limit = any(l["kind"] != "market" for l in plan["entry_legs"])
         for leg in plan["entry_legs"]:
             try:
@@ -485,9 +513,19 @@ def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=L
                     r = limit_open(symbol, dir_, float(leg["price"]), leg["notional"], lev)
                 if isinstance(r, dict) and r.get("orderId"):
                     _oids.append(r["orderId"])
+                else:
+                    _fail.append({"leg": leg, "err": "下单未返回 orderId: %s" % str(r)[:120]})
             except BinanceError as e:
+                _fail.append({"leg": leg, "err": str(e)[:160]})
                 audit("entry_leg_fail", {"leg": leg}, str(e))
         plan["order_ids"] = _oids
+        plan["entry_failed"] = _fail
+        if _fail:
+            audit("entry_abort", {"symbol": symbol, "ok": _oids, "failed": _fail},
+                  "有入场腿失败 → 不挂止盈止损，交由上层告警 + 裸仓看门狗接管")
+            raise BinanceError(
+                "入场腿 %d 条失败（成功 %d 条）：%s —— 已中止挂保护，交由告警+看门狗处理"
+                % (len(_fail), len(_oids), _fail[0].get("err")))
         if _has_limit:
             # ⚠️ 限价入场必须【先等成交】再挂止盈止损：
             #    没持仓时挂止损/止盈会被币安拒（或语义错误），所以交给成交监听接管。
@@ -495,10 +533,23 @@ def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=L
             audit("await_fill", {"symbol": symbol, "order_ids": _oids,
                                  "note": "等成交后再挂止盈/止损"})
             return plan
+        # ===== 市价入场：立刻挂止盈/止损，且【逐个容错并记录成败】=====
+        _prot = {"tps": [], "sl": None}
         for t in plan["tps"]:
-            place_tp_limit(symbol, dir_, float(t["price"]), float(t["qty"]))
+            try:
+                _prot["tps"].append(place_tp_limit(symbol, dir_, float(t["price"]), float(t["qty"])))
+            except BinanceError as e:
+                _prot["tps"].append({"err": str(e)[:160]})
         if plan.get("sl"):
-            place_sl_stop_market(symbol, dir_, float(plan["sl"]["triggerPrice"]), tot_qty)
+            try:
+                _prot["sl"] = place_sl_stop_market(symbol, dir_, float(plan["sl"]["triggerPrice"]), tot_qty)
+            except BinanceError as e:
+                _prot["sl"] = {"err": str(e)[:160]}
+        plan["protection"] = _prot
+        audit("protection_result", {"symbol": symbol}, _prot)
+        if plan.get("sl") and isinstance(_prot["sl"], dict) and _prot["sl"].get("err"):
+            # 止损没挂上 = 裸奔 → 必须让上层告警（不能静默）
+            raise BinanceError("市价仓已建立，但【止损挂单失败】：%s" % _prot["sl"]["err"])
     return plan
 
 
