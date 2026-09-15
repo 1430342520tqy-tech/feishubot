@@ -1029,8 +1029,10 @@ def fast_parse(txt):
             out_stop_pct = float(_msp.group(1))
         except Exception:
             pass
-    # ③ 止损区间
-    _msr = re.search(r"止损[^0-9]{0,10}\$?([0-9]*\.?[0-9]+)\s*(?:到|至|~|～|-|—|–)\s*\$?([0-9]*\.?[0-9]+)", txt)
+    # ③ 止损区间（⚠️ 同样不许跨越标点：实测「4250止损，4350到4450分批止盈」里
+    #    旧写法把止盈区间 4350~4450 读成了止损区间）
+    _msr = re.search(r"止损\s*[:：=]?\s*\$?([0-9]*\.?[0-9]+)\s*"
+                     r"(?:到|至|~|～|-|—|–)\s*\$?([0-9]*\.?[0-9]+)", txt)
     if _msr:
         out_stop_range = [float(_msr.group(1)), float(_msr.group(2))]
     # ④ 止盈区间：止盈2400到2350
@@ -1223,6 +1225,103 @@ ASK_TIMEOUT = 1800       # 30 分钟没回复自动作废
 # 用户 2026-09-15 第 12 条硬要求：**所有订单在开之前都必须经我审批**（不再只问"把握不准"的）。
 # 默认 True；可用 runtime_config.json 的 require_approval 关掉（关掉后恢复"只在把握不准时问"）。
 REQUIRE_APPROVAL = [True]
+# ===== AI 优先解析（2026-09-15，用户要求"让机器人理解人话而不是抓关键词"）=====
+# 现状的致命缺陷：本地正则先跑，**然后自己判断自己可不可信** —— 正则的盲区就是系统的盲区
+#   （点数、语序、条件单全在盲区里，正则还能"很自信地"给错答案，于是永远不会去叫 AI）。
+# 改造后：AI 当**主解析器**（结构化 JSON，temperature=0），本地正则降级为
+#   ①交叉校验 ②补齐 AI 漏读的档位。并加**反幻觉硬约束**：AI 给的每个数字都必须在原文里
+#   逐字出现，否则判为可疑 → 强制送人工审批（绝不自动开）。
+# 开关：runtime_config.json 的 ai_first_parse（默认 True）；关掉即回到"正则优先"老行为。
+AI_FIRST = [True]
+
+
+def _ai_numbers(d, depth=0):
+    """把解析结果里所有【数值】收集出来（用于反幻觉校验）。只收价位类字段，不收元数据。"""
+    out = []
+    if depth > 3:
+        return out
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if k in ("type", "manage_action", "direction", "coin", "is_signal", "tp_on_chart",
+                     "entry_is_cmp", "_fast", "_ai", "_ai_unverified"):
+                continue
+            out += _ai_numbers(v, depth + 1)
+    elif isinstance(d, (list, tuple)):
+        for x in d:
+            out += _ai_numbers(x, depth + 1)
+    elif isinstance(d, bool):
+        pass
+    elif isinstance(d, (int, float)):
+        out.append(float(d))
+    return out
+
+
+def verify_ai_numbers(txt, d):
+    """**反幻觉硬约束**：AI 给出的每个数字都必须在原文里逐字出现。
+    这是 AI 优先方案能成立的前提 —— 没有它，AI 编一个点位就会变成一笔真单。
+    返回"在原文里找不到"的数字列表（空列表 = 全部有据可查）。"""
+    t = (txt or "").replace(",", "").replace("$", "").replace("，", "")
+    bad = []
+    for v in _ai_numbers(d):
+        cands = set()
+        try:
+            cands.add(("%.8g" % v))
+            if abs(v - round(v)) < 1e-9:
+                cands.add(str(int(round(v))))
+        except Exception:
+            pass
+        if not any(c and c in t for c in cands):
+            bad.append(v)
+    return bad
+
+
+def merge_parse_results(txt, ai, fast):
+    """AI 优先：以 AI 为主，本地正则只做【交叉校验 + 补齐缺档】。返回 (info, 说明)。"""
+    if not ai:
+        if fast:
+            return fast, "AI 无结果 → 降级用本地正则（仍走同一套校验与审批）"
+        return None, "AI 无结果且本地正则也没读到"
+    out = dict(ai)
+    notes = []
+    bad = verify_ai_numbers(txt, ai)
+    if bad:
+        out["_ai_unverified"] = bad
+        notes.append("⚠️ 反幻觉校验未过：这些数字在原文里找不到 → 强制送审批：%s" % bad[:6])
+    # 正则补齐：AI 漏读的止盈档
+    ft = [float(x) for x in ((fast or {}).get("targets") or []) if isinstance(x, (int, float))]
+    at = [float(x) for x in (out.get("targets") or []) if isinstance(x, (int, float))]
+    if ft and len(ft) > len(at):
+        _add = [t for t in ft if t not in at]
+        if _add:
+            out["targets"] = at + _add
+            notes.append("正则补齐止盈档 +%s" % _add)
+    # 正则补齐：AI 漏读的关键字段
+    # ⚠️ 必须避免"注入冲突值"：实测踩到过 —— AI 已给出正确的 stop=4250，
+    #    而正则的 stopRange 因为跨越逗号读到了止盈区间 [4350,4450]，一旦注入就污染了正确结果。
+    #    规则：语义等价的字段（stop/stopRange、entry/entryRange/entryLegs）AI 已给就不注入。
+    _SEM = {"stop": ("stop", "stopRange"), "stopRange": ("stop", "stopRange"),
+            "entry": ("entry", "entryRange", "entryLegs"),
+            "entryRange": ("entry", "entryRange", "entryLegs"),
+            "entryLegs": ("entry", "entryRange", "entryLegs")}
+    for k in ("stop", "entry", "entryLegs", "entryRange", "stopRange", "stopPct", "add_price"):
+        if (out.get(k) in (None, [], "")) and (fast or {}).get(k) not in (None, [], ""):
+            _grp = _SEM.get(k)
+            if _grp and any(out.get(_g) not in (None, [], "") for _g in _grp):
+                notes.append("跳过注入 %s（AI 已给出等价的 %s，避免冲突）"
+                             % (k, [g for g in _grp if out.get(g) not in (None, [], "")]))
+                continue
+            out[k] = fast.get(k)
+            notes.append("正则补 %s=%s" % (k, fast.get(k)))
+    out["_ai"] = True
+    if not out.get("direction"):
+        out["direction"] = (fast or {}).get("direction")
+        if out["direction"]:
+            notes.append("正则补 direction=%s" % out["direction"])
+    if not out.get("coin"):
+        out["coin"] = (fast or {}).get("coin")
+        if out["coin"]:
+            notes.append("正则补 coin=%s" % out["coin"])
+    return out, "；".join(notes)
 
 
 def _jsonable(o, depth=0):
@@ -1729,6 +1828,10 @@ def finalize_pending(open_pos):
         # ===== B5-① 点数换算已发生 → 必须人工确认（绝不自动开）=====
         if _why is None and (_pt_why or _tp_pt_why):
             _why = "数字被识别为【点数】并已换算：" + "；".join(_pt_why + _tp_pt_why)
+        # ===== AI 优先：反幻觉校验没过的，一律送审批（绝不自动开）=====
+        if _why is None and p.get("_ai_unverified"):
+            _why = ("AI 解析出的这些数字在原文里**找不到**（疑似编造）：%s —— 必须你确认"
+                    % (p.get("_ai_unverified") or [])[:6])
         if _why:
             ask_user(coin, p, _why)
             PENDING.pop(coin, None)
@@ -2150,14 +2253,18 @@ def load_runtime():
             # 审批闸门开关（用户 2026-09-15 第 12 条）：默认 True=所有新开仓都要经用户审批
             if "require_approval" in cfg:
                 REQUIRE_APPROVAL[0] = bool(cfg["require_approval"])
+            # AI 优先解析开关：默认 True；设为 false 即回退到"本地正则优先"
+            if "ai_first_parse" in cfg:
+                AI_FIRST[0] = bool(cfg["ai_first_parse"])
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
                 bexec.LEV = LEV
-            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s ｜ 开单需审批=%s ｜ 失联告警阈值=%.1fh ｜ 暂停=%s"
+            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s ｜ 开单需审批=%s ｜ AI优先解析=%s ｜ 失联告警阈值=%.1fh ｜ 暂停=%s"
                 % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE,
                    "、".join(STRICT_LIMIT_GROUPS) or "无", _be_mode(),
-                   "是" if REQUIRE_APPROVAL[0] else "否", SILENCE_ALERT_H,
+                   "是" if REQUIRE_APPROVAL[0] else "否",
+                   "是" if AI_FIRST[0] else "否", SILENCE_ALERT_H,
                    "是" if PAUSED[0] else "否"))
     except Exception as e:
         log("读取运行配置失败: " + str(e)[:80])
@@ -2172,7 +2279,7 @@ def save_runtime():
         out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE,
                "max_open": MAX_OPEN, "max_consec_loss": MAX_CONSEC_LOSS,
                "daily_loss_limit": DAILY_LOSS_LIMIT, "max_total_margin": MAX_TOTAL_MARGIN,
-               "require_approval": REQUIRE_APPROVAL[0]}
+               "require_approval": REQUIRE_APPROVAL[0], "ai_first_parse": AI_FIRST[0]}
         # ⚠️ 必须保留 live_trading / strict_limit_groups：否则任何一条指令都会把它们悄悄抹掉
         if "live_trading" in _old:
             out["live_trading"] = _old["live_trading"]
@@ -3397,11 +3504,19 @@ def main():
                             log("   ↳ 多币种消息，按币拆开：%s" % [c for c, _ in _segs])
                             _names = []
                             for _c, _seg in _segs:
-                                _ci = fast_parse(_seg) or {}
-                                if (not _ci.get("direction")) or fast_parse_suspect(_seg, _ci):
-                                    _ai = parse_text(_seg) or {}
-                                    _ci = {**(_ci or {}), **{k: v for k, v in _ai.items()
-                                                             if v not in (None, [], "")}}
+                                _cf = fast_parse(_seg) or {}
+                                if AI_FIRST[0]:
+                                    # AI 优先模式下，多币种的每一段也走 AI 主解析 + 反幻觉校验
+                                    _ci, _cn = merge_parse_results(_seg, parse_text(_seg), _cf)
+                                    _ci = _ci or {}
+                                    if _cn:
+                                        log("   🤖 [AI优先·多币种] %s：%s" % (_c, _cn))
+                                else:
+                                    _ci = dict(_cf)
+                                    if (not _ci.get("direction")) or fast_parse_suspect(_seg, _ci):
+                                        _ai = parse_text(_seg) or {}
+                                        _ci = {**(_ci or {}), **{k: v for k, v in _ai.items()
+                                                                 if v not in (None, [], "")}}
                                 _dir_ = (_ci.get("direction") or "").upper() or None
                                 if not _dir_:
                                     log("   ↳ %s 段没解析出方向 → 只记录不询问" % _c)
@@ -3452,13 +3567,15 @@ def main():
                         info = fast_parse(txt)
                         _fast = info
                         _suspect = fast_parse_suspect(txt, info)
-                        if info is not None and not _suspect:
-                            log("   ⚡ 快速解析命中（本地正则，0 AI 调用）")
-                        elif info is not None and _suspect:
-                            log("   ⚠️ 快速解析不完整（文字里 %d 个止盈关键词，只读到 %d 档）"
-                                "→ 改调 AI 复核，避免静默漏档"
-                                % (len(_TPKW_RE.findall(txt)), len(info.get("targets") or [])))
-                            info = None
+                        if not AI_FIRST[0]:
+                            # —— 老行为（正则优先）：正则自称可疑才叫 AI ——
+                            if info is not None and not _suspect:
+                                log("   ⚡ 快速解析命中（本地正则，0 AI 调用）")
+                            elif info is not None and _suspect:
+                                log("   ⚠️ 快速解析不完整（文字里 %d 个止盈关键词，只读到 %d 档）"
+                                    "→ 改调 AI 复核，避免静默漏档"
+                                    % (len(_TPKW_RE.findall(txt)), len(info.get("targets") or [])))
+                                info = None
                         need_chart = bool(imgs) and (info is None or len(info.get("targets") or []) < TP_TIERS or not info.get("stop"))
                         _th, _res = None, {}
                         if need_chart:
@@ -3466,8 +3583,22 @@ def main():
                             _th.start()
                         elif imgs:
                             log("   ⏩ 文字/卡片已够（止损+3档止盈），跳过读图")
-                        if info is None:
-                            info = parse_text(txt)
+                        # ===== AI 优先：AI 与读图**并行**跑（不额外增加等待）=====
+                        _ait, _aires = None, {}
+                        if AI_FIRST[0]:
+                            _ait = threading.Thread(target=lambda: _aires.update({"ai": parse_text(txt)}))
+                            _ait.start()
+                        elif info is None:
+                            _ait = threading.Thread(target=lambda: _aires.update({"ai": parse_text(txt)}))
+                            _ait.start()
+                        if _ait:
+                            _ait.join()
+                            if AI_FIRST[0]:
+                                info, _anote = merge_parse_results(txt, _aires.get("ai"), _fast)
+                                if _anote:
+                                    log("   🤖 [AI优先] %s" % _anote)
+                            else:
+                                info = _aires.get("ai") or info
                         # AI 结果若比快速解析还少 → 合并补齐（绝不因为 AI 少读而丢档）
                         if isinstance(_fast, dict):
                             if isinstance(info, dict):
@@ -4262,6 +4393,32 @@ if __name__ == "__main__":
         _sft = soft_ask_reason("在2465跌破可以追空，止损带个30点左右", 30.0, 2465.0)
         _ck("点数/条件单 → 转成审批原因（不硬拒、也不自动开）", bool(_sft), True)
         print("     ↳ 审批原因：%s" % _sft)
+
+        # ---------- AI 优先：反幻觉 + 合并 ----------
+        print("\n[6] AI 优先：反幻觉硬约束（AI 编的数字必须被抓住）")
+        _msg = "BTC 做多 止损74000 止盈 79000 80000"
+        _ai_ok = {"coin": "BTC", "direction": "LONG", "stop": 74000, "targets": [79000, 80000], "type": "open"}
+        _ck("AI 数字都出自原文 → 无问题", verify_ai_numbers(_msg, _ai_ok), [])
+        _ai_bad = dict(_ai_ok); _ai_bad["stop"] = 73500       # 原文里没有 73500
+        _ck("AI 编了一个原文没有的止损 → 必须被抓住", verify_ai_numbers(_msg, _ai_bad), [73500.0])
+        _ai_bad2 = dict(_ai_ok); _ai_bad2["entry"] = 77777.0
+        _ck("AI 编了开仓价 → 必须被抓住", verify_ai_numbers(_msg, _ai_bad2), [77777.0])
+        _ck("带 $ 和千分位也能对上",
+             verify_ai_numbers("ENTRY: $77,760", {"entry": 77760.0}), [])
+        _ck("元数据字段（direction/coin/type）不计入数字校验",
+             verify_ai_numbers("BTC 做多", {"coin": "BTC", "direction": "LONG", "type": "open"}), [])
+
+        print("\n[7] AI 优先：正则补齐 AI 漏档（AI 少读不能被静默吞掉）")
+        _rg = fast_parse("BTC 做多 止损74000 第一止盈79000 第二止盈80000") or {}
+        _ai_short = {"coin": "BTC", "direction": "LONG", "stop": 74000, "targets": [79000]}
+        _mg, _note = merge_parse_results("BTC 做多 止损74000 第一止盈79000 第二止盈80000", _ai_short, _rg)
+        _ck("AI 只读到 1 档 → 正则补齐到 2 档", len(_mg.get("targets") or []), 2)
+        print("     ↳ 说明：%s" % _note)
+        _mg2, _n2 = merge_parse_results("BTC 做多 止损74000", None, _rg)
+        _ck("AI 无结果 → 降级用正则（不是丢单）", bool(_mg2), True)
+        _mg3, _n3 = merge_parse_results("BTC 做多 止损74000 止盈73500", _ai_bad, _rg)
+        _ck("反幻觉未过 → 打上 _ai_unverified 标记（后续强制审批）",
+             bool(_mg3.get("_ai_unverified")), True)
 
         print("\n" + "-" * 72)
         if _fail:
