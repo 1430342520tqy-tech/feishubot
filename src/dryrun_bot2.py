@@ -2085,6 +2085,15 @@ def _approval_lines(coin, p, d):
     """审批通知里的详细清单 —— 用户第 8 条硬要求：币种 / 时间 / 开单金额 / 杠杆 /
     止损位 / **止损点数（不含杠杆）** / 各档止盈位 / **各档预期收益率（含杠杆）**。"""
     entry = p.get("entry")
+    _cmp_mkt = None
+    # 🆕 2026-09-17 联调实测：博主只写「CMP」没给价位 → p["entry"] 为 None →
+    #    审批单显示「入场：未读到」，同时却写「已通过全部机器校验」，看起来自相矛盾。
+    #    CMP 的语义本来就是"按市价入场"，所以借 p["mkt_at_ask"]（下单时取的市价）显示成
+    #    「按市价（CMP）」，下面止损点数/亏损估算才有得算。
+    if (not isinstance(entry, (int, float)) or not entry) and p.get("entry_is_cmp"):
+        _m = p.get("mkt_at_ask")
+        if isinstance(_m, (int, float)) and _m:
+            entry, _cmp_mkt = _m, _m
     _lg = [float(x) for x in (p.get("legs") or []) if isinstance(x, (int, float))]
     if (not isinstance(entry, (int, float)) or not entry) and _lg:
         entry = sum(_lg) / len(_lg)
@@ -2101,8 +2110,14 @@ def _approval_lines(coin, p, d):
         out.append("⚠️ 你在币安有 **%s 的手工仓**：机器人在实盘下**不会碰它**（不会开真单、不挂保护、"
                    "不改它的止损）。这条信号只走纸面。" % str(coin).upper())
     if isinstance(entry, (int, float)) and entry:
-        out.append("入场：%s%s" % (_fmt_num(entry),
-                                 ("（%s）" % p["entry_src"]) if p.get("entry_src") else ""))
+        if _cmp_mkt:
+            out.append("入场：**按市价（博主只写了 CMP，未给具体价位）** ≈ %s"
+                       "（下单时以当时市价为准）" % _fmt_num(entry))
+        else:
+            out.append("入场：%s%s" % (_fmt_num(entry),
+                                     ("（%s）" % p["entry_src"]) if p.get("entry_src") else ""))
+    elif p.get("entry_is_cmp"):
+        out.append("入场：**按市价（博主写的是 CMP）** → 下单时取当时市价")
     else:
         out.append("入场：**未读到**")
     if _lg:
@@ -2399,6 +2414,10 @@ def finalize_pending(open_pos):
         if p.get("entry_is_cmp") and not _legs:
             signal_entry = None
             entry_note = "文本写的是 CMP/现价 → 入场价取**当前市价** %.8g（不用图上的标签）" % mkt
+            # 🆕 2026-09-17：博主只写 CMP 没给价位时，审批单里原来显示「入场：未读到」，
+            #    却又写着「已通过全部机器校验」—— 自相矛盾，看起来像解析失败。
+            #    这里把"下单时的参考市价"记下来，**只用于审批单展示**（不改入场计划逻辑）。
+            p["mkt_at_ask"] = mkt
             log("   ↳ CMP 语义：入场价取当前市价 %.8g" % mkt)
         if len(_legs) >= 2:
             # ① 分批建仓
@@ -2504,17 +2523,16 @@ def finalize_pending(open_pos):
         #   做多的"止损"却落在入场价【上方】→ 一开仓立刻满足止损条件 → 秒平，还记了一笔 +4.6U 的**假盈利**。
         # 真单场景下这更危险：STOP_MARKET 挂错边会被币安拒绝，或触发即成交。
         if isinstance(p["stop"], (int, float)) and p["stop"] and isinstance(entry, (int, float)) and entry:
-            if dirc0 == "LONG" and float(p["stop"]) >= float(entry):
-                notify("【信号·拒绝】%s 做多\n止损价 %.8g **不低于** 入场价 %.8g —— 做多的止损必须在下方，"
-                       "判为解析错误，**不下单**\n原文：%s"
-                       % (coin, p["stop"], entry, (p["texts"][0][:160] if p["texts"] else "")))
-                log("   ⛔ 止损方向不对（做多但止损≥入场 %.8g），拒绝出单" % entry)
-                PENDING.pop(coin, None); continue
-            if dirc0 == "SHORT" and float(p["stop"]) <= float(entry):
-                notify("【信号·拒绝】%s 做空\n止损价 %.8g **不高于** 入场价 %.8g —— 做空的止损必须在上方，"
-                       "判为解析错误，**不下单**\n原文：%s"
-                       % (coin, p["stop"], entry, (p["texts"][0][:160] if p["texts"] else "")))
-                log("   ⛔ 止损方向不对（做空但止损≤入场 %.8g），拒绝出单" % entry)
+            # 2026-09-17 联调实测：这条路径原来也写「判为解析错误」，
+            # 但实测那次其实是**市价已跌破信号止损（信号陈旧）** —— 交给共用归因函数区分。
+            _side = _stop_side_reason(coin, dirc0, entry, p["stop"], mkt,
+                                      bool(p.get("entry_is_cmp")),
+                                      (p["texts"][0] if p.get("texts") else ""))
+            if _side:
+                notify("【信号·拒绝】%s %s\n%s\n原文：%s"
+                       % (coin, "做多" if dirc0 == "LONG" else "做空", _side,
+                          (p["texts"][0][:160] if p["texts"] else "")))
+                log("   ⛔ 止损在错误一侧，拒绝出单：%s" % _side.replace("**", "")[:100])
                 PENDING.pop(coin, None); continue
         # 止盈方向同理：做多的止盈必须在上方、做空必须在下方 → 方向不对的直接剔除
         if tps and isinstance(entry, (int, float)) and entry:
@@ -3810,7 +3828,44 @@ def _tp_wrong_side(dirc, entry, tps, ref=None):
             and (float(t) <= base if d == "LONG" else float(t) >= base)]
 
 
-def validate_plan(coin, dirc, entry, stop, tps, mkt, texts=None):
+def _stop_side_reason(coin, dirc, entry, stop, mkt=None, entry_is_cmp=False, txt=None):
+    """止损落在错误一侧时，**归因**到底是"信号陈旧"还是"解析错了"（2026-09-17 联调实测新增）。
+
+    实测事故（真实端到端联调）：博主那条 UNI 信号是 `CMP 6.719 / 止损 6.39`，
+    而联调时市价已跌到 **6.244 —— 已跌破信号的止损**。此时拒绝开仓是**对的**，
+    但旧文案一律写「判为解析错误」→ **错误归因**：解析没错，是这条信号**过期了**。
+    照旧文案去找解析的毛病，方向就错了（这次联调就是这么发现它的）。
+
+    返回拒绝原因字符串；不该拒绝时返回 None。
+    """
+    if not (isinstance(stop, (int, float)) and stop
+            and isinstance(entry, (int, float)) and entry):
+        return None
+    d = 1 if str(dirc or "LONG").upper() == "LONG" else -1
+    wrong = (d == 1 and float(stop) >= float(entry)) or (d == -1 and float(stop) <= float(entry))
+    if not wrong:
+        return None
+    _mkt = float(mkt) if isinstance(mkt, (int, float)) and mkt else None
+    _entry_is_market = False
+    if _mkt:
+        try:
+            _entry_is_market = abs(float(entry) - _mkt) / _mkt <= 0.005     # 0.5% 内视为"就是市价"
+        except Exception:
+            _entry_is_market = False
+    _t = str(txt or "")
+    _looks_close = bool(_CLOSE_ANNOUNCE.search(_t)) if _t else False
+    if entry_is_cmp or _entry_is_market:
+        return ("市价 %.8g **已%s**信号的止损 %.8g —— 这条信号已经**失效（陈旧）**："
+                "按 CMP 语义要用当前市价入场，而市价已在止损的另一侧，开仓等于立刻认亏，**不下单**"
+                % (_mkt or float(entry), "跌破" if d == 1 else "涨破", float(stop)))
+    return ("止损价 %.8g **%s** 入场价 %.8g —— %s的止损必须在%s%s，**不下单**"
+            % (float(stop), "不低于" if d == 1 else "不高于", float(entry),
+               "做多" if d == 1 else "做空", "下方" if d == 1 else "上方",
+               "；而且这条读起来像**平仓/止损通报**而不是开仓信号，八成是解析错了（判为解析错误）"
+               if _looks_close else "（判为解析错误）"))
+
+
+def validate_plan(coin, dirc, entry, stop, tps, mkt, texts=None, entry_is_cmp=False):
     """**公共合理性校验**（B3 修复）。
 
     背景：原来的「多币种分支」(`split_by_coin` → `ask_user`) **完全绕过**了
@@ -3825,13 +3880,11 @@ def validate_plan(coin, dirc, entry, stop, tps, mkt, texts=None):
     tps = [t for t in (tps or []) if isinstance(t, (int, float))]
     d = 1 if (str(dirc or "LONG").upper() == "LONG") else -1
     # ① 止损方向
-    if isinstance(stop, (int, float)) and stop and isinstance(entry, (int, float)) and entry:
-        if d == 1 and float(stop) >= float(entry):
-            return ("止损价 %.8g **不低于** 入场价 %.8g —— 做多的止损必须在下方，判为解析错误"
-                    % (stop, entry)), tps
-        if d == -1 and float(stop) <= float(entry):
-            return ("止损价 %.8g **不高于** 入场价 %.8g —— 做空的止损必须在上方，判为解析错误"
-                    % (stop, entry)), tps
+    #    2026-09-17：不再一律写「解析错误」—— 由 _stop_side_reason 区分
+    #    「市价已越过止损 → 信号失效（陈旧）」与「止损落在入场价错误一侧 → 解析错误」。
+    _side = _stop_side_reason(coin, dirc, entry, stop, mkt, entry_is_cmp, t0)
+    if _side:
+        return _side, tps
     # ② 止盈方向：方向不对的档位剔除
     if tps and isinstance(entry, (int, float)) and entry:
         tps = [t for t in tps if (float(t) > float(entry) if d == 1 else float(t) < float(entry))]
@@ -4495,7 +4548,8 @@ def main():
                                     _lg = [float(x) for x in (_pp.get("legs") or []) if isinstance(x, (int, float))]
                                     _ent = (sum(_lg) / len(_lg)) if _lg else None
                                 _bad_why, _tt2 = validate_plan(_c, _dir_, _ent, _pp.get("stop"), _tt, _mk,
-                                                               texts=[_seg])
+                                                               texts=[_seg],
+                                                               entry_is_cmp=bool(_pp.get("entry_is_cmp")))
                                 _soft = soft_ask_reason(_seg, _pp.get("stop"), _ent)
                                 if _tt2:
                                     _tt = _tt2
@@ -5773,6 +5827,39 @@ if __name__ == "__main__":
               "move_stop_to_cost": "止损移到开仓价"}.get("close_all"), "全部平仓")
         ASKING.clear()
         ASKING.update(_saved_asking)
+
+        # ---------- ⑧j 归因与展示（2026-09-17 真实端到端联调暴露的两个问题）----------
+        print("\n[8j] 拒绝原因要区分「信号陈旧」与「解析错误」；CMP 无价位要显示「按市价」")
+        # 实测原文：博主那条 UNI 信号 CMP 6.719 / 止损 6.39，联调时市价已跌到 6.244（跌破止损）。
+        # 旧文案写「判为解析错误」→ 错误归因（会让人去查解析而不是查信号时效）。
+        _stale = _stop_side_reason("UNI", "LONG", 6.244, 6.39, 6.244, True,
+                                   "UNI 做多 CMP 6.719 止损 6.39 止盈 7.180 / 8.216 / 9.302")
+        print("     ↳ 陈旧信号：%s" % _stale)
+        _chk("市价已越过止损 → 判为「失效/陈旧」", bool(_stale) and ("失效" in _stale or "陈旧" in _stale), True)
+        _chk("陈旧信号不再误写成「解析错误」", "解析错误" in (_stale or ""), False)
+        _chk("陈旧信号里说清了是哪一侧越界（跌破）", "跌破" in (_stale or ""), True)
+        # 真解析错误：入场价是博主给的价位、与市价差得远，止损落在错误一侧
+        _perr = _stop_side_reason("DOGE", "LONG", 0.079, 0.09, 0.0790 * 1.6, False, "DOGE 在0.078到0.08接多")
+        print("     ↳ 真解析错误：%s" % _perr)
+        _chk("入场价与市价差得远 + 止损在错侧 → 判为「解析错误」",
+             bool(_perr) and ("解析错误" in _perr), True)
+        # 平仓通报被误读成开仓信号时，要额外点出来
+        _perr2 = _stop_side_reason("DOGE", "LONG", 0.079, 0.0828, 0.079 * 1.6, False,
+                                   "Trade Closed — DOGE/USDT LONG Stop loss hit at $0.08280")
+        _chk("像是平仓通报 → 文案里点出来", "平仓" in (_perr2 or ""), True)
+        _chk("止损方向正常时不拒绝", _stop_side_reason("BTC", "LONG", 100.0, 95.0, 100.0), None)
+        # CMP 无价位：审批单不能再显示「入场：未读到」
+        _pcmp = {"entry": None, "stop": 6.10, "tps": [6.60, 6.90, 7.20], "group": "机器人开单通知",
+                 "dir": "LONG", "texts": ["【联调测试2】UNI 做多 CMP 止损 6.10 止盈 6.60 / 6.90 / 7.20"],
+                 "legs": [], "entry_is_cmp": True, "mkt_at_ask": 6.244, "deadline": 0}
+        _al = "\n".join(_approval_lines("UNI", _pcmp, 1))
+        _aline = [x for x in _al.splitlines() if x.startswith("入场：")]
+        print("     ↳ %s" % (_aline[0] if _aline else "(没有入场行)"))
+        _chk("CMP 无价位 → 显示「按市价」，不再写「未读到」",
+             bool(_aline) and ("按市价" in _aline[0]) and ("未读到" not in _aline[0]), True)
+        _chk("CMP 无价位时也带上参考市价（止损点数才算得出来）", "6.244" in (_aline[0] if _aline else ""), True)
+        _chk("CMP 有价位时仍正常显示价位",
+             "6.719" in "\n".join(_approval_lines("UNI", dict(_pcmp, entry=6.719, entry_is_cmp=False), 1)), True)
 
         # ---------- ⑨ 隔离复核 ----------
         print("\n[9] 隔离复核（生产零写入）")
