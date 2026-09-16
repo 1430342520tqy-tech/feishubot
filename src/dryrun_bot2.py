@@ -332,6 +332,16 @@ def startup_reconcile():
     for s in only_real:
         diffs.append("⚠️ 交易所有仓、纸面无记录（孤儿仓/手工仓）：%s 数量 %s"
                      % (s, real[s].get("positionAmt")))
+        # 用户 2026-09-16 明确要求：交易所有、纸面没有的仓 = **用户手工仓，机器人不得有任何干涉**
+        MANUAL_COINS.add(s[:-4] if s.endswith("USDT") else s)
+    if MANUAL_COINS:
+        log("   [手工仓] 已登记 %d 个币为你的手工仓（机器人不会对它们发任何真单）：%s"
+            % (len(MANUAL_COINS), "、".join(sorted(MANUAL_COINS))))
+        STATE_DIRTY[0] = True
+        for _c in sorted(MANUAL_COINS):
+            notify("ℹ️【手工仓护栏】检测到交易所有你的手工仓：**%s**\n"
+                   "机器人不会对它做任何事（不开新仓、不平仓、不改止损、也不拿它的数量去挂保护）。\n"
+                   "手工仓平掉后发「解除手工仓 %s」即可解除这条护栏。" % (_c, _c))
     RECONCILE["diffs"] = diffs
     consistent = (not only_real) and (bexec.LIVE[0] is False or not only_paper)
     RECONCILE["ok"] = consistent
@@ -441,9 +451,47 @@ def watch_entries():
             log("   成交监听异常 %s: %s" % (coin, str(e)[:120]))
 
 
+# ===== 手工仓护栏（用户 2026-09-16 明确要求：机器人在交易所有手工仓时必须毫无干涉）=====
+# 背景：用户在币安手工开了 LSKUSDT 多单（588 张）。机器人若对它做任何事都会变成"干涉"：
+#   · 用交易所持仓数量去挂止损 → 止损会覆盖到用户手工仓的数量（M4 的 _real_qty_or_estimate 有这个能力！）
+#   · 平仓/减仓/改止损 → 直接动用户的手工仓
+#   · 同币再开一笔真仓 → 在双向持仓下与手工仓同向合并，等于加仓用户的仓
+# 所以：对账时把"交易所有仓、纸面无记录"的币记入 MANUAL_COINS，落盘保存；
+#       任何真实下单动作（开/平/减/移止损）遇到这些币 → **一律硬拦 + 告警**，绝不发单。
+MANUAL_COINS = set()
+
+
+def manual_guard(coin, action="真实下单"):
+    """该币是否有用户手工仓 → 返回拦截原因（有的话）。"""
+    c = (coin or "").upper()
+    if c and c in MANUAL_COINS:
+        return ("%s 在交易所有**你的手工仓**（机器人不干涉），所以拒绝执行「%s」"
+                % (c, action))
+    return None
+
+
+def manual_block(coin, action):
+    """拦下来并告警（只告警、不下单）。"""
+    why = manual_guard(coin, action)
+    if not why:
+        return False
+    log("   🛑 [手工仓护栏] %s" % why)
+    notify("🛑【手工仓护栏】%s\n机器人**不会碰这个币的任何真实仓位**（你的手工仓）。\n"
+           "（纸面记录/信号解析照常，只是不发真单。手工仓平掉后发「解除手工仓 %s」即可解除。）"
+           % (why, (coin or "").upper()))
+    return True
+
+
+def _manual_dump():
+    return sorted(MANUAL_COINS)
+
+
 def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
     """开仓 → 交给真实下单层生成完整计划（市价/限价腿 + 各档止盈 + Algo 止损）"""
     if not _BEXEC_OK:
+        return None
+    # ===== 手工仓护栏：用户的仓，绝不动（优先级高于一切）=====
+    if bexec.LIVE[0] and manual_block(coin, "开新仓"):
         return None
     # ===== 启动对账闸门：不一致时禁止开新真仓（评估 G3）=====
     try:
@@ -475,12 +523,16 @@ def real_plan_sync_sl(coin, dirc, new_stop, qty=None):
     """止损移动/重挂（TP1 后移保本损、分批止盈后修正数量）"""
     if not _BEXEC_OK:
         return None
+    if bexec.LIVE[0] and manual_block(coin, "改止损"):
+        return None
     return bexec.sync_sl(coin.upper() + "USDT", dirc, new_stop, qty)
 
 
 def real_plan_close(coin, dirc, qty=None):
     """平仓/减仓 → 真实层对应动作"""
     if not _BEXEC_OK:
+        return None
+    if bexec.LIVE[0] and manual_block(coin, "平仓/减仓"):
         return None
     sym = coin.upper() + "USDT"
     try:
@@ -494,8 +546,13 @@ def real_plan_close(coin, dirc, qty=None):
 
 def _real_qty_or_estimate(coin, tr):
     """止损数量：**优先查交易所真实持仓**，查不到才退回纸面估算。
-    评估 M4：实盘下若用纸面公式估数量，可能偏大（被拒）或偏小（只保护一部分仓位）。"""
+    评估 M4：实盘下若用纸面公式估数量，可能偏大（被拒）或偏小（只保护一部分仓位）。
+    ⚠️ 手工仓护栏：该币若有用户手工仓，**绝不允许**把交易所数量（含手工仓）拿来挂止损 ——
+       否则机器人的止损会覆盖到用户手工仓的数量，那就是"干涉"。"""
     sym = coin.upper() + "USDT"
+    if manual_guard(coin):
+        log("   🛑 [手工仓护栏] %s 有你的手工仓 → 止损数量只用纸面估算，绝不用交易所数量" % coin)
+        return real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
     if _BEXEC_OK:
         try:
             pos = bexec.position_of(sym, tr.get("dir"))
@@ -646,6 +703,70 @@ def _vision(img_path):
     m = re.search(r"\{[\s\S]*\}", r.json()["choices"][0]["message"]["content"])
     return json.loads(m.group(0))
 
+def _ocr_one_label(im, x0, t):
+    """**单个标签单独一次 OCR**（用户 2026-09-16 选定方案）。
+    为什么必须这样：批量 OCR 是"拼图 + 黄色序号"，模型一旦漏答/错位，
+    `nums.get(str(i))` 就会把数值贴到**错误的标签**上 —— 实测同一张图多跑几次，
+    同一个 y 上的标签会拿到不同数值、甚至整张图标签全丢。单标签裁图没有"序号→数值"这一步，
+    从机制上消除了错位，代价是每个关键标签多一次调用（只对关键标签做，见 read_chart）。"""
+    from PIL import Image as _I
+    box = (max(0, x0 + t["x1"] - 5), max(0, t["y1"] - 5),
+           min(im.width, x0 + t["x2"] + 6), min(im.height, t["y2"] + 6))
+    try:
+        crop = im.crop(box)
+        if crop.width < 8 or crop.height < 4:
+            return None
+        crop = crop.resize((crop.width * 3, crop.height * 3), _I.LANCZOS)
+        buf = RUN + "/tmp_one_label.png"
+        crop.save(buf)
+        b64 = base64.b64encode(open(buf, "rb").read()).decode()
+        body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+                "messages": [{"role": "system",
+                              "content": "You transcribe the price number printed in this chart screenshot crop. STRICT JSON only."},
+                             {"role": "user", "content": [
+                                 {"type": "text", "text": "This crop contains ONE price label from a price axis. "
+                                  "Return {\"value\": <number>} with the number exactly as printed. "
+                                  "If you cannot read any number, return {\"value\": null}."},
+                                 {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}
+        r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY,
+                                           "Content-Type": "application/json"}, json=body, timeout=120)
+        m = re.search(r"\{[\s\S]*\}", r.json()["choices"][0]["message"]["content"])
+        v = json.loads(m.group(0)).get("value")
+        return float(str(v).replace(",", "").replace("$", "").strip())
+    except Exception:
+        return None
+
+
+def two_read_ok(v_batch, v_single, tol=0.005):
+    """两次**互相独立**的读数（批量拼图 / 单标签单独读）是否一致。
+    返回 (是否可用, 采用值, 说明)。用户要求：不一致就标「未读到」，绝不猜。"""
+    if v_single is None and v_batch is None:
+        return False, None, "两次都没读出来"
+    if v_single is None:
+        return True, float(v_batch), "只有批量读数"
+    if v_batch is None:
+        return True, float(v_single), "只有单标签读数"
+    v1, v2 = float(v_batch), float(v_single)
+    if abs(v1 - v2) / max(abs(v2), 1e-9) <= tol:
+        return True, v2, "两次一致"
+    return False, None, "两次读数不一致（%s vs %s）→ 按未读到处理" % (v1, v2)
+
+
+def drop_nonmonotonic(tags):
+    """价格随 y 增大必须单调下降（价格轴的几何性质）。返回被剔除的 tags。
+    ⚠️ 前提：tags 必须来自**同一张图**的横线，且已按 y 排序。"""
+    order = sorted([t for t in tags if t.get("y") is not None and t.get("value")],
+                   key=lambda t: t["y"])
+    drop = []
+    for i in range(1, len(order)):
+        if order[i]["value"] >= order[i - 1]["value"]:
+            # 越靠下反而越贵 → 至少有一个读错了：剔除覆盖率低的那个（更可能是误读/短线干扰）
+            bad = order[i - 1] if order[i - 1].get("cov", 0) < order[i].get("cov", 0) else order[i]
+            if bad not in drop:
+                drop.append(bad)
+    return drop
+
+
 def _ocr_tags_batch(im, x0, merged):
     """把所有价格标签小图拼成一张大图（左侧标序号），一次 API 调用读完 → 从 15~20s 降到 3~5s"""
     from PIL import ImageDraw
@@ -747,23 +868,61 @@ def read_chart(path):
         else:
             merged.append(dict(g))
     merged = [t for t in merged if t["x2"] - t["x1"] + 1 >= 55]
-    nums = _ocr_tags_batch(im, x0, merged)                   # 一次调用读完所有标签
+    merged = sorted(merged, key=lambda t: t["y1"])
+    nums = _ocr_tags_batch(im, x0, merged)                   # 一次调用读完所有标签（第 1 次读数）
     tags = []
-    for i, t in enumerate(sorted(merged, key=lambda t: t["y1"]), 1):
+    for i, t in enumerate(merged, 1):
         v = nums.get(str(i))
         if v is None: v = nums.get(i)
         try:
             fv = float(str(v).replace(",", "").replace("$", "").strip())
         except Exception:
-            continue
+            fv = None                      # ⚠️ 读不出也不许丢标签（下面会用单标签复核救回来）
         yc = (t["y1"] + t["y2"]) // 2
-        tags.append({"y": yc, "color": t["c"], "value": fv, "text": str(v),
+        tags.append({"y": yc, "color": t["c"], "value": fv,
+                     "text": str(v) if v is not None else None, "_reg": t,
                      "cov": _coverage(px, w, max(0, yc - 14), min(h, yc + 15))})
+    # ===== 关键标签逐个复核（用户 2026-09-16 选定）=====
+    # 只对"关键"标签做单标签单独 OCR：红色止损线 + 够长的止盈候选横线（≤6 个）。
+    # 与批量读数**互相独立**：一致 → 采信；不一致 → 标「未读到」并记日志（绝不猜）。
+    verify = {"checked": 0, "agreed": 0, "single_only": 0, "batch_only": 0, "dropped": 0, "notes": []}
+    _key = [t for t in tags if t["color"] == "red" or t["cov"] >= TP_MIN_COV][:6]
+    for t in _key:
+        v1 = _ocr_one_label(im, x0, t["_reg"])
+        verify["checked"] += 1
+        ok, val, why = two_read_ok(t.get("value"), v1)
+        if ok:
+            if v1 is not None and t.get("value") is not None:
+                verify["agreed"] += 1
+            elif v1 is not None:
+                verify["single_only"] += 1
+            else:
+                verify["batch_only"] += 1
+            t["value"] = val
+            t["verified"] = (v1 is not None and t.get("text") is not None)
+        else:
+            verify["dropped"] += 1
+            verify["notes"].append("%s：%s" % (t["color"], why))
+            t["value"] = None
+            t["unverified"] = why
+            log("   ⚠️ 读图标签两次读数不一致 → 按未读到处理（%s，y=%d）：%s"
+                % (t["color"], t["y"], why))
+    # 单调性校验：同一张图上，价格必须随 y 增大而下降（价格轴的几何性质）
+    _mono_bad = drop_nonmonotonic(tags)
+    for t in _mono_bad:
+        if t.get("value"):
+            t["value"] = None
+            t["unverified"] = "违反价格轴单调性（y 越大价格反而越高）"
+            verify["dropped"] += 1
+            log("   ⚠️ 读图标签违反单调性 → 按未读到处理（%s，y=%d）" % (t["color"], t["y"]))
+    tags = [t for t in tags if t.get("value")]
     reds = [t for t in tags if t["color"] == "red"]
-    if not reds: return {"ok": False, "why": "无红色止损标签", "tags": tags}
+    if not reds:
+        return {"ok": False, "why": "无红色止损标签（标签区域 %d 个，两次读数一致可用 %d 个）"
+                                    % (len(merged), len(tags)), "tags": tags, "verify": verify}
     sl = min(reds, key=lambda t: t["value"])["value"]
     above = sorted([t for t in tags if t["value"] > sl * 1.0005], key=lambda t: t["value"])
-    if not above: return {"ok": False, "why": "止损上方无标签", "tags": tags}
+    if not above: return {"ok": False, "why": "止损上方无标签", "tags": tags, "verify": verify}
     entry = above[0]["value"]
     # ---- 止盈候选：止损上方、覆盖率够长的横线 ----
     _cand = []
@@ -785,7 +944,7 @@ def read_chart(path):
     # 让用户能看到图上到底有什么，而不是只看到一个数字。
     all_lines = [{"value": t["value"], "color": t["color"], "cov": t["cov"]} for t in above]
     return {"ok": True, "sl": sl, "entry": entry, "tps_all": tps_all, "tps": tp[:TP_TIERS],
-            "tags": tags, "lines": all_lines}
+            "tags": tags, "lines": all_lines, "verify": verify}
 
 # ---------------- 文本解析 ----------------
 def parse_text(text):
@@ -1660,6 +1819,9 @@ def _approval_lines(coin, p, d):
     out = ["币种：%s ｜ 方向：%s ｜ 来源群：%s"
            % (coin, "做多 LONG" if d == 1 else "做空 SHORT", p.get("group") or "-"),
            "时间：%s" % datetime.datetime.now(CST).strftime("%m-%d %H:%M:%S")]
+    if coin and str(coin).upper() in MANUAL_COINS:
+        out.append("⚠️ 你在币安有 **%s 的手工仓**：机器人在实盘下**不会碰它**（不会开真单、不挂保护、"
+                   "不改它的止损）。这条信号只走纸面。" % str(coin).upper())
     if isinstance(entry, (int, float)) and entry:
         out.append("入场：%s%s" % (_fmt_num(entry),
                                  ("（%s）" % p["entry_src"]) if p.get("entry_src") else ""))
@@ -2497,7 +2659,12 @@ HELP_TEXT = """【机器人指令】在「开单记录」或「机器人开单�
   （多币种会列出**全部非空组合**，3 个币就是 6 种两两/单个组合 + 「全部开」）
 · 回复时机器人会带上：保证金/杠杆/止损位/**止损点数（不含杠杆）**/各档止盈/**各档预期收益率（含杠杆）**
 · 持仓达上限时机器人会一并问你要不要提高上限，回「开」即提高并开单
-· 待你确认的信号会**落盘保存**，机器人意外重启也不会丢"""
+· 待你确认的信号会**落盘保存**，机器人意外重启也不会丢
+
+— 手工仓护栏（你在币安自己开的仓）—
+· 对账时若发现「交易所有仓、纸面无记录」→ 机器人把该币登记为**你的手工仓**并告警，
+  之后**绝不对它发任何真单**（不开新仓、不平仓、不改止损、也不拿它的数量去挂保护）
+· 解除手工仓 LSK —— 手工仓平掉后解除护栏（也可写：手工仓已平 LSK）"""
 
 
 def load_runtime():
@@ -2778,7 +2945,7 @@ def handle_command(txt):
     KEY = ["帮助", "状态", "持仓情况", "持仓", "全部平仓", "确认全部平仓", "平仓", "减仓",
            "修改止损", "移保本", "暂停", "继续", "修改监控群", "修改金额", "修改杠杆", "测试模式",
            "实盘模式", "挂单情况", "挂单", "待确认", "修改持仓上限", "持仓上限", "进入测试模式",
-           "进入实盘模式", "重新对账", "对账"]
+           "进入实盘模式", "重新对账", "对账", "解除手工仓", "手工仓已平"]
     # 去掉可能的昵称/时间前缀后，指令必须在消息开头（防止转发内容被误当指令）
     nick = lambda x: re.sub(r"^[^\s]{2,16}\s+", "", x)
     tm = lambda x: re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x, flags=re.I).strip()
@@ -2834,6 +3001,22 @@ def handle_command(txt):
                   _be_mode(), "开" if TEST_MODE else "关", "是" if PAUSED[0] else "否",
                   RISK.get("consec_loss", 0), MAX_CONSEC_LOSS,
                   RISK.get("day_trades", 0), RISK.get("day_pnl", 0.0), DAILY_LOSS_LIMIT, _rec))
+    elif cmd.startswith("解除手工仓") or cmd.startswith("手工仓已平"):
+        # 用户 2026-09-16：手工仓平掉后，用这条指令解除护栏
+        _cs = [c for c in re.split(r"[\s,，、]+", cmd) if c and c not in ("解除手工仓", "手工仓已平")]
+        if not _cs or "全部" in cmd:
+            _cs = sorted(MANUAL_COINS)
+        _done = []
+        for c in _cs:
+            c = resolve_coin(c)[0] or c.upper()
+            if c in MANUAL_COINS:
+                MANUAL_COINS.discard(c)
+                _done.append(c)
+        STATE_DIRTY[0] = True
+        notify("【指令】手工仓护栏已解除：%s\n"
+               "（如果交易所其实还有该币的仓，下次对账会重新登记。）"
+               % ("、".join(_done) if _done else "没有匹配到手工仓（当前：%s）"
+                  % ("、".join(sorted(MANUAL_COINS)) or "无")))
     elif cmd.startswith("重新对账") or cmd.startswith("对账"):
         startup_reconcile()
         if RECONCILE.get("blocked"):
@@ -3464,6 +3647,13 @@ def main():
                 PAUSED[0] = bool(sv.get("paused"))
                 log("已恢复暂停状态：%s" % ("暂停中（不会开单/平仓，发「继续」恢复）"
                                           if PAUSED[0] else "运行中"))
+            # ===== 手工仓护栏恢复（用户 2026-09-16：交易所有、纸面没有的仓 = 用户手工仓）=====
+            for _c in (sv.get("manual") or []):
+                if _c:
+                    MANUAL_COINS.add(str(_c).upper())
+            if MANUAL_COINS:
+                log("已恢复手工仓护栏：%s（机器人不会对它们发任何真单）"
+                    % "、".join(sorted(MANUAL_COINS)))
         except Exception:
             pass
     # ===== 启动对账闸门（评估 G3）：放在开页之前，避免带着不一致状态开始跑 =====
@@ -3554,6 +3744,7 @@ def main():
         json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
                    "asking": _asking_dump(),
                    "paused": bool(PAUSED[0]),
+                   "manual": _manual_dump(),      # 用户手工仓护栏（机器人不干涉）
                    "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
         try:
@@ -3962,7 +4153,12 @@ def main():
                         info = info or {}
                         chart = _res.get("chart")
                         if chart and chart.get("ok"):
-                            log("   读图: 止损 %s 开仓 %s 止盈 %s" % (chart["sl"], chart["entry"], chart["tps"]))
+                            _vf = chart.get("verify") or {}
+                            log("   读图: 止损 %s 开仓 %s 止盈 %s ｜ 关键标签复核 %s 个（两次一致 %s / "
+                                "仅单标签 %s / 仅批量 %s / 判为未读到 %s）"
+                                % (chart["sl"], chart["entry"], chart["tps"], _vf.get("checked"),
+                                   _vf.get("agreed"), _vf.get("single_only"),
+                                   _vf.get("batch_only"), _vf.get("dropped")))
                         raw_coin = info.get("coin")
                         coin, coin_ok = (resolve_coin(raw_coin) if raw_coin else (None, False))
                         if raw_coin and coin and not coin_ok:
@@ -4290,6 +4486,7 @@ def main():
             json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
                        "asking": _asking_dump(),      # B11：待确认池落盘，重启不再静默丢失
                        "paused": bool(PAUSED[0]),     # 暂停态落盘，重启后依然生效
+                       "manual": _manual_dump(),      # 手工仓护栏落盘（机器人不干涉用户手工仓）
                        "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
@@ -5021,6 +5218,56 @@ if __name__ == "__main__":
         print("\n[8] 合并窗口没被拖慢（用户要求②）")
         _chk("PENDING_WAIT 仍是 4 秒", PENDING_WAIT, 4)
         _chk("图关联窗口 = 合并窗口", RAWQ_WAIT, PENDING_WAIT)
+
+        # ---------- ⑨ 隔离复核 ----------
+        # ---------- ⑧d 关键标签两次读数交叉校验（用户 2026-09-16 选定方案）----------
+        print("\n[8d] 关键标签两次独立读数必须一致，不一致就按未读到处理")
+        _chk("两次一致 → 可用", two_read_ok(6.396, 6.398), (True, 6.398, "两次一致"))
+        _ok1, _v1, _w1 = two_read_ok(6.396, 4.0)
+        _chk("两次差 37% → 不可用", _ok1, False)
+        _chk("不可用时不给值（绝不猜）", _v1, None)
+        print("     ↳ 说明：%s" % _w1)
+        _ok2, _v2, _w2 = two_read_ok(6.396, None)
+        _chk("只有批量读数 → 可用（不因单标签失败而丢数据）", (_ok2, _v2), (True, 6.396))
+        _ok3, _v3, _w3 = two_read_ok(None, 7.18)
+        _chk("只有单标签读数 → 可用（补回批量丢掉的标签）", (_ok3, _v3), (True, 7.18))
+        _chk("两次都没读出 → 不可用", two_read_ok(None, None)[0], False)
+
+        print("\n[8e] 单调性校验：价格必须随 y 增大而下降（价格轴几何性质）")
+        _m_ok = [{"y": 100, "value": 9.289, "cov": 0.86},
+                 {"y": 300, "value": 8.216, "cov": 0.79},
+                 {"y": 500, "value": 7.18, "cov": 0.74}]
+        _chk("正常图 → 剔除 0 个", drop_nonmonotonic(_m_ok), [])
+        _m_bad = [{"y": 100, "value": 9.289, "cov": 0.86},
+                  {"y": 300, "value": 6.4, "cov": 0.20},      # 这条读得可疑（cov 只有 0.2）
+                  {"y": 500, "value": 7.18, "cov": 0.74}]
+        _bad = drop_nonmonotonic(_m_bad)
+        # 两条冲突时剔除**覆盖率更低**的那条（长线是 KOL 真画的线，更可信）
+        _chk("违反单调（y 越大反而越贵）→ 剔除覆盖率更低的那条", [x["value"] for x in _bad], [6.4])
+
+        # ---------- ⑧f 手工仓护栏（用户：我在币安手工开的仓，机器人不得有任何干涉）----------
+        print("\n[8f] 手工仓护栏：交易所有、纸面没有的仓 = 用户手工仓，机器人绝不干涉")
+        MANUAL_COINS.clear()
+        MANUAL_COINS.add("LSK")
+        _chk("manual_guard 认出手工仓", bool(manual_guard("LSK")), True)
+        _chk("非手工仓不误拦", manual_guard("BTC"), None)
+        _chk("manual_block 返回 True（会被拦）", manual_block("LSK", "开新仓"), True)
+        _chk("拦下时发了告警", any("手工仓护栏" in s for s in _SENT), True)
+        _chk("非手工仓不告警", manual_block("ETH", "开新仓"), False)
+        _SENT.clear()
+        # 止损数量：不能用交易所数量（含手工仓），只能退回纸面估算
+        _tr = {"entry": 0.5, "remaining": 1.0, "dir": "LONG"}
+        _q = _real_qty_or_estimate("LSK", _tr)
+        _chk("手工仓的止损数量只用纸面估算（绝不用交易所数量）", _q, real_qty_estimate(0.5, 1.0))
+        # 落盘 / 恢复
+        _md = _manual_dump()
+        _chk("手工仓名单可落盘", _md, ["LSK"])
+        json.dump({"open": {}, "manual": _md}, open(STATE, "w", encoding="utf-8"), ensure_ascii=False)
+        MANUAL_COINS.clear()
+        for _c in (json.load(open(STATE, encoding="utf-8")).get("manual") or []):
+            MANUAL_COINS.add(str(_c).upper())
+        _chk("重启后手工仓护栏能恢复", sorted(MANUAL_COINS), ["LSK"])
+        MANUAL_COINS.clear()
 
         # ---------- ⑨ 隔离复核 ----------
         print("\n[9] 隔离复核（生产零写入）")
