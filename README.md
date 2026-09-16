@@ -17,6 +17,28 @@
 | **全链路计时** | 信号发出 → 发现 → 抓图 → 解析 → 读图 → 下单 → 推送，逐段计时并随通知推送 |
 | **多群稳定监控** | 每个群一个独立标签页，开完不再切换会话，杜绝"读错群" |
 
+## 取消息：飞书官方 API（2026-09-17 起为默认）
+
+2026-09-16 深夜飞书网页端 messenger 前端崩（4 个群全部打不开、机器人进盲区），因此把"取消息"这一层
+整体换成**飞书官方 API + 用户身份令牌**（用户已授权 `im:chat:readonly im:message:readonly
+im:message.group_msg:get_as_user im:resource offline_access`）。
+
+| 项 | 浏览器爬网页（旧，兜底） | **官方 API（现在）** |
+|---|---|---|
+| 是否需要浏览器 | 需要（Chromium 常驻约 2.7GB） | **完全不需要** |
+| 重启盲区 | 约 **4.5 分钟**（开 5 个页面） | **几秒** |
+| 图片 | 抓 blob → base64 | `/im/v1/messages/{id}/resources/{key}?type=image` 取**原图**（与网页 blob **字节完全相同**） |
+| 令牌 | 浏览器登录态 profile | `user_access_token` 2h + `refresh_token` **7 天**，自动刷新、失效会告警提醒重新授权 |
+
+- 配置项 `fetch_mode`：`api`（默认）/ `browser`（兜底），**热加载，改完即生效，可随时回滚**
+- 行结构与网页版**完全一致** → 解析 / 审批 / 下单逻辑一行没改
+- **实测（2026-09-17 00:10 重启后）**：`tools/verify_api_mode.py` 五段全绿；Chromium 进程 0；
+  内存 available 2854MB/3719MB；心跳每约 20 秒一条；真实消息被读到（`发现新消息 | 发出=09-17 00:10:33`）
+- ⚠️ **切换当天有一段空窗**：API 首次启动的游标是"从 10 分钟前开始、不回补更早历史"，
+  所以各群从"浏览器模式最后进度"到 09-17 00:00:36 之间的消息**没有被处理**。
+  飞书 API 支持按时间范围拉回，这些消息**仍可原样回补**（含卡片与图片原图）。
+  详见 `docs/待办与未解决问题-2026-09-15.md` 第 0.16.18 节
+
 ## 读图规则（关键）
 
 KOL 在 TradingView 图上画的是：
@@ -68,9 +90,12 @@ KOL 常把 **K 线图单独发一条消息**（没有文字、没有币种）。
 
 ```
 src/
-  dryrun_bot2.py      当前使用的机器人（每群独立标签页 + 全链路计时）
+  dryrun_bot2.py      当前使用的机器人（API 取消息 + 图片不丢 + 审批闸门 + 全链路计时）
+  feishu_api.py       飞书官方 API 取消息层（用户身份令牌、卡片解析、原图下载、令牌自动续期）
   dryrun_bot_v1.py    早期版本（单页面切换会话，供对比参考）
 tools/
+  verify_api_mode.py  上线后一键验证：令牌 / 配置 / 日志证据 / API 游标 / 进程（只读）
+  safe_selftest.py    隔离自检器：逐个跑自检分支 + 运行前后指纹比对，实测证明不碰生产
   read_chart_final.py 图表读取（像素定位 + 逐块 OCR + 覆盖率判据）
   tags_v26.py         色块矩形检测 + 分块识别的算法原型
   scrape_v19.py       群历史抓取（消息级，含图表下载）
@@ -81,6 +106,22 @@ config/
 docs/
   交接文档.md          项目背景、已完成/未完成、坑与结论
 ```
+
+## 测试（必须在 /tmp 里跑，绝不碰生产）
+
+```bash
+cd /home/ubuntu/signal-bot
+venv/bin/python safe_selftest.py --selftest-imgmerge --selftest-feishu \
+                                --selftest-approval --selftest-parse --selftest-tp
+```
+
+每个 `--selftest-*` 分支都以 `sys.exit` 结束，所以**一次只能给一个 flag**，由运行器逐个起进程跑。
+自检自身会把 `RUNTIME / TRADES / STATE / LOGF / IMGDIR / NOTIFY_CFG / RUN` 重定向到 `/tmp`；
+运行器再加一道**指纹比对**（硬文件逐字节一致、持仓数与图片目录不许变、日志新增行不许出现"自检"字样、
+全程不许出现 Chromium 进程），任何一条不满足即判 FAIL 并返回非 0。
+
+> 为什么要有这个运行器：`/tmp` 里的临时脚本**一重启就没了**（2026-09-17 实例重启后实测），
+> 而"测试隔离"这件事必须有可复现、可版本管理的载体。
 
 ## 部署
 
@@ -93,33 +134,44 @@ python3 -m venv venv && ./venv/bin/pip install playwright ccxt requests pillow
 cp config/config.example.json config.json   # 填入 API Key / Webhook / 监控群
 export DEEPSEEK_API_KEY=sk-xxx              # 或写进 config.json
 
-# 3) 首次登录飞书（服务器上开一次浏览器扫码/登录，登录态存到 profile 目录）
-./venv/bin/python tools/scrape_v19.py
+# 3) 飞书授权（API 模式只需一次）
+#    在浏览器打开 tools/verify_api_mode.py 里打印的授权链接，拿到 code 后写入令牌文件
+#    （令牌文件 feishu_user_token.json 权限 600、不进 git；access 2h、refresh 7 天，自动续期）
+#    备用方式：回退浏览器模式时才需要登录一次 profile
+# ./venv/bin/python tools/scrape_v19.py
 
 # 4) 启动机器人（纸面模式）
-pm2 start ./venv/bin/python --name dryrun-bot -- -u src/dryrun_bot2.py
-pm2 logs dryrun-bot
+pm2 start ./venv/bin/python --name dryrun-bot2 -- -u src/dryrun_bot2.py
+pm2 logs dryrun-bot2
+
+# 5) 上线后一键验证（只读，不改任何东西）
+venv/bin/python verify_api_mode.py
 ```
 
 ## 运行环境注意事项
 
-- 服务器 **2C4G**，5 个飞书标签页约占 3GB 内存 → **务必加 swap**（否则页面会崩）
+- 服务器 **2C4G**（实测 3719MB）。**浏览器模式**下 Chromium 常驻约 **2.7GB** → 内存被吃满过，
+  2026-09-16 深夜曾把整机拖到"SSH 能建连但 sshd 发不出 banner"（详见 `docs/待办与未解决问题-2026-09-15.md` 第 0.16.17 节）。
+  现在默认 **API 模式不开浏览器**，该风险随之消失；**务必保留 swap**：
   ```bash
   sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile
   sudo mkswap /swapfile && sudo swapon /swapfile
   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
   ```
-- 一个浏览器 profile 只能被一个进程使用，别同时跑两个抓取脚本
-- 飞书网页自动化用的是**真实账号**，有风控风险
+- 一个浏览器 profile 只能被一个进程使用，别同时跑两个抓取脚本（仅浏览器模式相关）
+- 飞书网页自动化用的是**真实账号**，有风控风险；API 模式用的是官方接口 + 用户授权令牌，无此风险
 
 ## 已知限制
 
 1. **真实下单层尚未实现**（当前 dryRun，只生成计划与推送）
 2. **币安 API Key 尚未创建**（当前只用公开行情接口，无需密钥）
 3. 博主"规则止损"（如 4H 收盘跌破 X）目前按该价位的硬止损近似处理
-4. **重启期间（开 5 个页面约 4.5 分钟）到达的信号会被跳过丢失**
-5. 加仓（DCA）只记录点位，尚未实现真实加仓下单
-6. 同一张图上的价格标签 OCR 偶有 0.0x% 级误差（挂单取整后通常同价）
+4. ~~**重启期间（开 5 个页面约 4.5 分钟）到达的信号会被跳过丢失**~~
+   → API 模式下**不再开浏览器，重启盲区约几秒**；只在回退到 `fetch_mode=browser` 时才会重新出现 4.5 分钟盲窗
+5. **2026-09-16 浏览器 → API 切换当天，各群存在一段未处理空窗**（如暴富龙约 29 小时、其余约 8~10 小时）：
+   API 首次启动游标只从"10 分钟前"开始。消息仍在飞书、**可按时间范围回补**，但当时确实没被处理（第 0.16.18 节）
+6. 加仓（DCA）只记录点位，尚未实现真实加仓下单
+7. 同一张图上的价格标签 OCR 偶有 0.0x% 级误差（挂单取整后通常同价）
 
 ## 免责声明
 
