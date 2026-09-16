@@ -96,6 +96,10 @@ src/
 tools/
   verify_api_mode.py  上线后一键验证：令牌 / 配置 / 日志证据 / API 游标 / 进程（只读）
   safe_selftest.py    隔离自检器：逐个跑自检分支 + 运行前后指纹比对，实测证明不碰生产
+  send_test_msg.py    往监控群发测试信号（默认 dry-run；只读凭据、不打印 webhook、自带自环前缀自查）
+  peek_recent.py      把群里最近的真实消息原样读回来（日志里的通知行会截断，别靠猜）
+  backfill_analyze.py 历史区间回补分析（只读、隔离自检、可选读图；用于核对"哪段时间漏了什么"）
+  log_watch.py        外部日志巡检（systemd timer 每 5 分钟；只认"新增"故障行，按关键字分别冷却）
   read_chart_final.py 图表读取（像素定位 + 逐块 OCR + 覆盖率判据）
   tags_v26.py         色块矩形检测 + 分块识别的算法原型
   scrape_v19.py       群历史抓取（消息级，含图表下载）

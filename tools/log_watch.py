@@ -22,7 +22,7 @@
                            指定日志与游标路径 —— **验证时用它把测试完全隔离到 /tmp**，
                            绝不要再往生产 run.log 里注入测试行（我 09-15 晚犯过这个错）。
 """
-import os, sys, json, time, datetime
+import os, re, sys, json, time, datetime
 
 BASE = "/home/ubuntu/signal-bot"
 RUN = BASE + "/v21"
@@ -219,12 +219,39 @@ def main():
     new_lines = complete.decode("utf-8", "replace").splitlines()
     new_off = off + consumed
 
+    # ⚠️ 2026-09-17 实测误报（根因=用户的手工仓，与故障无关）：
+    #    机器人每次启动必打一行
+    #      「[对账] 纸面 0 笔 ｜ 交易所 3 笔 ｜ 差异 3 条 ｜ 结论=不一致」
+    #    那 3 笔正是**用户自己的手工仓**（BTC / XAU / XAUT），机器人紧接着自己就写了
+    #      「[对账] 差异仅记录（当前影子模式，不影响）」
+    #    → 于是每重启一次就误报一次 🔴，正是"告警疲劳"的典型来源。
+    #    判据：命中「结论=不一致」时看**上下文 ±3 行**，能解释（差异仅记录 / 手工仓）就放过，
+    #    并且**不静默丢弃** —— 单独计数并在每轮输出里写明放过了几条，便于事后复核。
+    _explained = set()
+    for _i, _l in enumerate(new_lines):
+        if "结论=不一致" in _l:
+            _win = new_lines[max(0, _i - 3):_i + 4]
+            if any(("差异仅记录" in _x) or ("手工仓" in _x) for _x in _win):
+                _explained.add(_i)
+
     hits = {}
-    for l in new_lines:
+    ignored_explained = []
+    ignored_echo = []
+    for _i, l in enumerate(new_lines):
         if any(m in l for m in ECHO_MARKS):
             continue                     # 跳过"我们自己告警的回声"，否则会自激循环（实测踩过）
+        # ⚠️ 2026-09-17 全量扫描（生产日志 8373 行）实测到的**残留回声**：
+        #    告警正文是**多行文本**，机器人把它读进日志后，正文的后续行会以"裸行"形式落进 run.log
+        #    （例如 `  · 结论=不一致 × 1`、`日志：/home/ubuntu/.../run.log`）。
+        #    这些行只可能来自我们自己的告警体，却被关键字又命中一次 → 仍是自激。
+        if re.match(r"^\s*·\s", l) or l.startswith("日志："):
+            ignored_echo.append(l)
+            continue
         for kw in FAULT_KW:
             if kw in l:
+                if kw == "结论=不一致" and _i in _explained:
+                    ignored_explained.append(l)
+                    break
                 hits.setdefault(kw, []).append(l)
                 break
 
@@ -267,10 +294,13 @@ def main():
     fresh = [(k, m) for (k, m, cool) in cand
              if time.time() - float(cd.get(k, 0)) > cool]
 
-    print("[%s] 新增 %d 行｜命中类别 %s｜候选告警 %d 项 %s｜实际推送 %d 项 %s"
+    print("[%s] 新增 %d 行｜命中类别 %s｜候选告警 %d 项 %s｜实际推送 %d 项 %s｜放过可解释的对账不一致 %d 条｜放过自身回声 %d 行"
           % (now_str(), len(new_lines), sorted(hits) or "无",
              len(cand), [k for k, _, _ in cand] or [],
-             len(fresh), [k for k, _ in fresh] or []))
+             len(fresh), [k for k, _ in fresh] or [],
+             len(ignored_explained), len(ignored_echo)))
+    for _l in ignored_explained[:3]:
+        print("   ↳ 放过（可解释：手工仓/差异仅记录）：%s" % _l.strip()[:140])
 
     rc = 0
     if fresh:
