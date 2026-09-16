@@ -162,8 +162,15 @@ def api_bootstrap():
     ok, why = fapi.health()
     if not ok:
         log("   [取消息] 官方 API 自检未通过：%s" % why)
+        # 令牌类失败 → 直接把"重新授权链接"发给他（用户要求：刷新失败要提醒重新授权）
+        _hint = ""
+        if ("令牌" in why) or ("授权" in why) or ("token" in why.lower()):
+            try:
+                _hint = "\n\n" + fapi.reauth_hint()
+            except Exception:
+                _hint = ""
         notify("⚠️【取消息】飞书官方 API 自检未通过：%s\n"
-               "机器人会先用浏览器兜底；要恢复 API 模式请重新授权（我可以给你授权链接）。" % why)
+               "机器人会先用浏览器兜底（如果浏览器也打不开，就会暂时收不到群消息）。%s" % (why, _hint))
         return False
     log("   [取消息] 官方 API 自检通过：%s" % why)
     ids = fapi.resolve_chat_ids(GROUPS)
@@ -4301,9 +4308,16 @@ def main():
                             API_FAILS[0] += 1
                             log("[%s] ⚠️ API 取消息失败（连续第 %d 次）：%s" % (g, API_FAILS[0], _err))
                             if API_FAILS[0] in (3, 10) or API_FAILS[0] % 50 == 0:
+                                # 令牌失效/刷新失败 → 附上"重新授权链接"，让他点一下就能恢复
+                                _hint2 = ""
+                                if ("令牌" in _err) or ("授权" in _err) or ("401" in _err):
+                                    try:
+                                        _hint2 = "\n\n" + fapi.reauth_hint()
+                                    except Exception:
+                                        _hint2 = ""
                                 notify("⚠️【取消息告警】官方 API 连续 %d 次取不到消息：%s\n"
-                                       "（浏览器兜底仍然可用：把 runtime_config.json 的 fetch_mode 改成 browser）"
-                                       % (API_FAILS[0], _err))
+                                       "（也可以把 runtime_config.json 的 fetch_mode 改成 browser 先用浏览器兜底）%s"
+                                       % (API_FAILS[0], _err, _hint2))
                             continue
                         API_FAILS[0] = 0
                         if rows:
@@ -5864,6 +5878,17 @@ if __name__ == "__main__":
                 _ck("能拉到消息（err 为空）", _err, None)
                 print("     ↳ 群「%s」近 24 小时拉到 %d 条；示例：%s"
                       % (_g0, len(_rows), (_rows[-1]["text"][:60].replace("\n", " ") if _rows else "-")))
+
+        print("\n[5] 令牌失效时必须给出「重新授权链接」（用户要求：刷新失败要提醒重新授权）")
+        _m, _fbk = _fa.authorize_url("dshT")
+        print("     ↳ 主链接：%s" % _m[:120])
+        _chk("主链接是 accounts.feishu.cn 授权页", "accounts.feishu.cn/open-apis/authen/v1/authorize" in _m, True)
+        _chk("带 offline_access（才能拿长期令牌）", "offline_access" in _m, True)
+        _chk("带 redirect_uri", "redirect_uri=https%3A%2F%2Flocalhost%3A8765%2Fcallback" in _m, True)
+        _chk("备用链接（不带 scope）", "scope" not in _fbk, True)
+        _hint = _fa.reauth_hint()
+        _chk("告警文案里含可点击链接与三步说明",
+             ("http" in _hint) and ("2)" in _hint) and ("3)" in _hint), True)
 
         print("\n" + "-" * 72)
         if _fail:

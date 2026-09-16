@@ -20,6 +20,7 @@
     msg_text_of(item)                           # 从任意消息（文本/卡片/post/图片）抽文字
 """
 import os, json, time, hashlib, mimetypes, datetime
+from urllib.parse import quote as urlencode
 import requests
 
 API = "https://open.feishu.cn/open-apis"
@@ -27,10 +28,36 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.environ.get("FEISHU_TOKEN_PATH") or os.path.join(_HERE, "feishu_user_token.json")
 CFG_PATH = os.environ.get("BOT_CONFIG_PATH") or os.path.join(_HERE, "config.json")
 REFRESH_MARGIN = 600          # 剩余有效期 < 10 分钟就提前刷新
+# 重新授权用：控制台「安全设置 → 重定向 URL」里登记过的地址（不需要真的能打开）
+REDIRECT_URI = "https://localhost:8765/callback"
+SCOPE = ("im:chat:readonly im:message:readonly im:message.group_msg:get_as_user "
+         "im:resource offline_access")
 
 _log = lambda m: print(m, flush=True)
 _TOKEN = {}                   # 内存缓存
 _CHAT_CACHE = {}
+
+
+def authorize_url(state="dsh"):
+    """生成**用户点一下就能重新授权**的链接（令牌失效时随告警一起发给他）。
+    返回 (主链接, 备用链接)：主链接带 scope（能拿到 offline_access 长期令牌），
+    备用链接不带 scope（万一主链接报"权限不足"，它会授权该应用已批准的全部用户权限）。"""
+    _q = urlencode
+    main = ("https://accounts.feishu.cn/open-apis/authen/v1/authorize?client_id=%s&redirect_uri=%s"
+            "&scope=%s&state=%s" % (_cfg().get("app_id", ""), _q(REDIRECT_URI, safe=""), _q(SCOPE), state))
+    fallback = ("https://accounts.feishu.cn/open-apis/authen/v1/authorize?client_id=%s&redirect_uri=%s"
+                "&state=%s2" % (_cfg().get("app_id", ""), _q(REDIRECT_URI, safe=""), state))
+    return main, fallback
+
+
+def reauth_hint():
+    """给告警用的三行文字：告诉他怎么恢复（用户 2026-09-16 要求：刷新失败要提醒重新授权）。"""
+    m, f = authorize_url()
+    return ("重新授权步骤：\n"
+            "1) 点开这条链接、用你的飞书账号登录并同意授权：\n%s\n"
+            "2) 浏览器会跳到 https://localhost:8765/callback?code=xxxx（页面打不开是正常的）\n"
+            "3) 把地址栏那一整条发给 AI（我换好长期令牌就恢复，不用再管 7 天）\n"
+            "（如果第 1 步报「权限不足」，用这条不带 scope 的：%s）" % (m, f))
 
 
 def set_logger(fn):
