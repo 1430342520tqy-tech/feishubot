@@ -836,6 +836,145 @@ def _ocr_tags_batch(im, x0, merged):
 #    不能要求 85% 满幅。0.55 保留了对零星色块/标签的过滤能力。
 TP_MIN_COV = 0.55
 
+# ===== 几何读图（用户 2026-09-16：「图明明很清楚，为什么会读不出」）=====
+# 实测根因（把用户发的那张原始图逐像素量出来的）：
+#   ① TradingView 多单工具画的是**半透明实心矩形**：绿框填充≈(27,77,40)、红框≈(96,36,38)。
+#      现有 _cls 要 g>110 / r>150 才认绿/红 → **对填充一律返回 None，等于看不见框**，
+#      于是旧规则（"红色横线=止损"）只能靠旁边那些文字标签去猜角色。
+#   ② 标签的 y 会被 TradingView **挪位防重叠**：实测 6.719/6.676/6.513/6.396 四个标签的
+#      y 间距是 71/50/51（几乎相等），但价格差是 0.043/0.163/0.117 →
+#      **标签的 y 已经不代表它那条线的 y**，"按标签 y 猜角色"必错。
+#   ③ 价格轴是**线性**的（用三条分得开的止盈线拟合，斜率 0.002561 vs 0.002596，一致）。
+# 正确语义（= TradingView 多单工具的通用语义）：
+#      红框下边 = 止损 ｜ 红绿框交界 = 开仓 ｜ 绿框上边 = 末档目标 ｜ 绿框内长横线 = 分档止盈
+#   角色**由几何决定**；数字优先取"与该边几何值最接近的标签"（标签是精确价位），
+#   轴换算做交叉校验；差太多就标「未读到」——不猜。
+FILL_MAX_BRIGHT = 160      # 填充是暗的（≤160）；EMA 曲线/蜡烛是亮的（>200）→ 用它把"框"和"线"分开
+
+
+def _fill_kind(r, g, b):
+    """半透明工具色框的填充色判定（背景约 (2,24,21)）。"""
+    if abs(r - 2) + abs(g - 24) + abs(b - 21) <= 30:
+        return None
+    if max(r, g, b) > FILL_MAX_BRIGHT:
+        return None
+    if g - r >= 6 and g - b >= 8 and g >= 30:
+        return "green"
+    if r - g >= 8 and r - b >= 8 and r >= 30:
+        return "red"
+    return None
+
+
+def find_fill_boxes(px, w, h):
+    """找工具画的色框：返回 {'green': (x0,y0,x1,y1), 'red': (...)}（只取最长的连续 y 段）。"""
+    out = {}
+    for kind in ("green", "red"):
+        rows = {}
+        for y in range(h):
+            xs = [x for x in range(0, w, 2) if _fill_kind(*px[x, y]) == kind]
+            if len(xs) >= max(6, int(w * 0.01)):
+                rows[y] = (min(xs), max(xs), len(xs))
+        if len(rows) < max(8, int(h * 0.015)):
+            continue
+        ys = sorted(rows)
+        best, cur = None, [ys[0], ys[0]]
+        for y in ys[1:]:
+            if y - cur[1] <= 4:
+                cur[1] = y
+            else:
+                if best is None or cur[1] - cur[0] > best[1] - best[0]:
+                    best = list(cur)
+                cur = [y, y]
+        if best is None or cur[1] - cur[0] > best[1] - best[0]:
+            best = list(cur)
+        y0, y1 = best
+        mid = [rows[y] for y in ys if y0 <= y <= y1]
+        x0 = sorted(a for a, _, _ in mid)[len(mid) // 2]
+        x1 = sorted(b for _, b, _ in mid)[len(mid) // 2]
+        out[kind] = (x0, y0, x1, y1)
+    return out
+
+
+def fit_axis_scale(pairs):
+    """(y, 价格) 线性拟合 + 剔除离群。返回 {'a','b','n','max'} 或 None。"""
+    cur = [(float(y), float(v)) for y, v in pairs if v]
+    if len(cur) < 2:
+        return None
+    for _ in range(3):
+        if len(cur) < 2:
+            return None
+        xs = [p[0] for p in cur]
+        ys = [p[1] for p in cur]
+        n = len(xs)
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        if sxx <= 0:
+            return None
+        a = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+        b = my - a * mx
+        res = [abs((a * y + b) - v) / v for y, v in cur]
+        if max(res) <= 0.008 or len(cur) <= 2:
+            return {"a": a, "b": b, "n": n, "max": max(res)}
+        worst = max(range(len(res)), key=lambda i: res[i])
+        cur.pop(worst)
+    return None
+
+
+def axis_price(f, y):
+    try:
+        return f["a"] * float(y) + f["b"]
+    except Exception:
+        return None
+
+
+def nearest_label_value(tags, predicted, tol=0.015):
+    """在标签里挑与该边几何值最接近的价位（标签是精确价、轴换算是估算）。
+    只在相差 ≤1.5% 时采信，否则 None（宁可未读到）。"""
+    best, best_d = None, None
+    for t in tags:
+        v = t.get("value")
+        if not isinstance(v, (int, float)) or v <= 0:
+            continue
+        d = abs(v - predicted) / predicted if predicted else 9
+        if d <= tol and (best_d is None or d < best_d):
+            best, best_d = v, d
+    return best
+
+
+def _line_y(px, w, y0, y1):
+    """在 [y0,y1] 行里找"覆盖最好"的那一行 —— 那就是**线自己的行**。
+    为什么不能用标签区域中心：区域里还含"印在线上方的那行标签文字"，
+    中心会被文字往上拽十几到几十像素（实测这就是 0.5%~5% 的价格误差来源）。"""
+    best, best_y = 0.0, (y0 + y1) // 2
+    for yy in range(max(0, y0), y1 + 1):
+        c = _coverage(px, w, yy, yy + 1)
+        if c > best:
+            best, best_y = c, yy
+    return round(best, 3), best_y
+
+
+def _self_marks():
+    """机器人**自己发出的所有通知前缀**。任何机器人会发的通知都必须登记，
+    否则它会把自己的通知当成博主信号重新解析（2026-09-15 出过一次，2026-09-16 又出过一次）。
+    🆕 2026-09-16 实测：新加的「ℹ️【手工仓护栏】…LSK…」没登记 → 13:33 被当成一条 LSK 信号，
+    播报出【信号·未能识别】。所以要有一条自检：**源码里 notify 用到的前缀必须都在这里**。"""
+    return ["【跟单机器人】", "【机器人指令】", "【已开单·纸面】",
+            "【已结单·纸面】", "【止盈成交·纸面】", "【已平仓·纸面】",
+            "【已减仓·纸面】", "【你的持仓】", "【指令】", "【博主指令】",
+            "【信号·", "【待确认】", "【挂单情况】", "【机器人状态】",
+            "【持仓情况】", "【风控熔断", "【对账闸门】", "【持仓自检】",
+            "【手工仓护栏】", "【机器人告警】",
+            # 🆕 2026-09-16：自检（源码里 notify 用到的前缀必须都在表里）一次抓出这 9 个漏登记的，
+            #    它们每一个都可能让机器人把自己的通知当信号重解析。
+            "【止盈更新·纸面】", "【实盘·成交】", "【实盘·成交但要你处理】", "【实盘·未成交】",
+            "【实盘·看门狗】", "【实盘·部分成交】", "【实盘动作失败·需要处理】",
+            "【失联看门狗】", "【启动对账失败】"]
+
+
+SELF_MARKS = _self_marks()
+
+
 def read_chart(path):
     im = Image.open(path).convert("RGB"); w, h = im.size
     px = im.load()
@@ -879,9 +1018,9 @@ def read_chart(path):
         except Exception:
             fv = None                      # ⚠️ 读不出也不许丢标签（下面会用单标签复核救回来）
         yc = (t["y1"] + t["y2"]) // 2
-        tags.append({"y": yc, "color": t["c"], "value": fv,
-                     "text": str(v) if v is not None else None, "_reg": t,
-                     "cov": _coverage(px, w, max(0, yc - 14), min(h, yc + 15))})
+        _cov, _ly = _line_y(px, w, max(0, yc - 25), min(h - 1, yc + 25))
+        tags.append({"y": yc, "line_y": _ly, "color": t["c"], "value": fv,
+                     "text": str(v) if v is not None else None, "_reg": t, "cov": _cov})
     # ===== 关键标签逐个复核（用户 2026-09-16 选定）=====
     # 只对"关键"标签做单标签单独 OCR：红色止损线 + 够长的止盈候选横线（≤6 个）。
     # 与批量读数**互相独立**：一致 → 采信；不一致 → 标「未读到」并记日志（绝不猜）。
@@ -916,10 +1055,63 @@ def read_chart(path):
             verify["dropped"] += 1
             log("   ⚠️ 读图标签违反单调性 → 按未读到处理（%s，y=%d）" % (t["color"], t["y"]))
     tags = [t for t in tags if t.get("value")]
+    # ===== 🆕 几何优先：认得出"工具色框"就按框的语义定角色 =====
+    geo = {}
+    try:
+        boxes = find_fill_boxes(px, w, h)
+        if "green" in boxes and "red" in boxes:
+            _gx0, gy0, _gx1, gy1 = boxes["green"]
+            _rx0, ry0, _rx1, ry1 = boxes["red"]
+            long_up = gy0 < ry0                       # 绿框在红框上方 → 做多
+            if long_up:
+                stop_y, entry_y, target_y = ry1, ry0, gy0
+            else:
+                stop_y, entry_y, target_y = ry0, ry1, gy1
+            # 价格轴：用"覆盖率够长的横线 + 它的标签值"拟合 —— 但坐标必须用**线自己的行 y**
+            # （不能用合并区域中心，否则被线上方的标签文字拽偏，实测差 0.5%~5%）
+            _long = [t for t in tags if t["cov"] >= TP_MIN_COV]
+            f = fit_axis_scale([(t.get("line_y") or t["y"], t["value"]) for t in _long])
+            pred_stop = axis_price(f, stop_y) if f else None
+            pred_target = axis_price(f, target_y) if f else None
+            pred_entry = axis_price(f, entry_y) if f else None
+            # 数字优先取"与该边几何值最接近的标签"（标签是精确价），没有就用轴换算
+            stop = nearest_label_value(tags, pred_stop) if pred_stop else None
+            target = nearest_label_value(tags, pred_target) if pred_target else None
+            geo = {"boxes": {k: list(v) for k, v in boxes.items()},
+                   "dir": "LONG" if long_up else "SHORT",
+                   "stop_y": stop_y, "entry_y": entry_y, "target_y": target_y,
+                   "pred": {"stop": pred_stop, "entry": pred_entry, "target": pred_target},
+                   "scale": ({"a": f["a"], "b": f["b"], "n": f["n"], "max": round(f["max"], 5)}
+                             if f else None)}
+            if stop and target and stop > 0 and target > 0:
+                # 绿框内的长横线 = 分档止盈；**绿框远端（上边的做多 / 下边的做空）必进**
+                # —— 那是 KOL 画的最终目标（2026-09-16 实测 BTC 空单图：按距离截断会把它挤掉，
+                #    当时给的是 [77366.6,77824.6,78667.4]，而真正的目标 76094（绿框底边）被丢了）
+                inside = [t for t in tags
+                          if t["cov"] >= TP_MIN_COV and t["value"]
+                          and min(entry_y, target_y) + 5 < (t.get("line_y") or t["y"]) < max(entry_y, target_y) - 5
+                          and (t["value"] > stop if long_up else t["value"] < stop)]
+                _near = sorted({round(t["value"], 8) for t in inside},
+                               key=lambda v: abs(v - (pred_entry or stop)))
+                tps = sorted(set(_near[:TP_TIERS - 1]) | {round(target, 8)})
+                geo["used"] = True
+                log("   🧭 几何读图：%s ｜ 止损 %.8g（红框下边 y=%d）｜ 开仓 %.8g（红绿交界 y=%d）｜ "
+                    "止盈 %s（绿框内横线 + 绿框上边）"
+                    % (geo["dir"], stop, stop_y, pred_entry or 0, entry_y, tps))
+                return {"ok": True, "sl": stop, "entry": (pred_entry or None),
+                        "tps_all": tps, "tps": tps[:TP_TIERS], "tags": tags,
+                        "lines": [{"value": t["value"], "color": t["color"], "cov": t["cov"]}
+                                  for t in tags if t["cov"] >= TP_MIN_COV],
+                        "verify": verify, "geo": geo, "mode": "geometry"}
+            log("   ⚠️ 认出了色框，但框边价格没读准（止损=%s 目标=%s）→ 退回标签规则"
+                % (stop, target))
+    except Exception as _e:
+        log("   ⚠️ 几何读图异常（不影响旧逻辑）：%s" % str(_e)[:100])
     reds = [t for t in tags if t["color"] == "red"]
     if not reds:
         return {"ok": False, "why": "无红色止损标签（标签区域 %d 个，两次读数一致可用 %d 个）"
-                                    % (len(merged), len(tags)), "tags": tags, "verify": verify}
+                                    % (len(merged), len(tags)), "tags": tags, "verify": verify,
+                "geo": geo, "mode": "legacy"}
     sl = min(reds, key=lambda t: t["value"])["value"]
     above = sorted([t for t in tags if t["value"] > sl * 1.0005], key=lambda t: t["value"])
     if not above: return {"ok": False, "why": "止损上方无标签", "tags": tags, "verify": verify}
@@ -944,7 +1136,7 @@ def read_chart(path):
     # 让用户能看到图上到底有什么，而不是只看到一个数字。
     all_lines = [{"value": t["value"], "color": t["color"], "cov": t["cov"]} for t in above]
     return {"ok": True, "sl": sl, "entry": entry, "tps_all": tps_all, "tps": tp[:TP_TIERS],
-            "tags": tags, "lines": all_lines, "verify": verify}
+            "tags": tags, "lines": all_lines, "verify": verify, "geo": geo, "mode": "legacy"}
 
 # ---------------- 文本解析 ----------------
 def parse_text(text):
@@ -3982,14 +4174,9 @@ def main():
                         # ⚠️ 2026-09-15 实测事故：用户发「全部平仓」后，机器人把自己的
                         #    【已平仓·纸面】通知**当成博主信号重新解析**，播报出 5 条假的
                         #    「【博主指令】xxx 动作：close_all」。根因就是这张表漏了「【已平仓」。
-                        #    现在把机器人自己会发出的**所有**前缀都列全，并加一条防御规则。
-                        SELF_MARKS = ["【跟单机器人】", "【机器人指令】", "【已开单·纸面】",
-                                      "【已结单·纸面】", "【止盈成交·纸面】", "【已平仓·纸面】",
-                                      "【已减仓·纸面】", "【你的持仓】", "【指令】", "【博主指令】",
-                                      "【信号·", "【待确认】", "【挂单情况】", "【机器人状态】",
-                                      "【持仓情况】", "【风控熔断", "【对账闸门】", "【持仓自检】"]
-                        # 防御规则：机器人自己的通知里必然带这些字样，命中即视为自己发的
-                        # （将来新加通知前缀忘了登记，也不至于又变成"自己给自己发信号"）
+                        #    ⚠️ 2026-09-16 又犯一次：新加的「【手工仓护栏】…LSK…」没登记 →
+                        #    机器人把自己的告警当成一条 LSK 信号。前缀表在模块级 SELF_MARKS，
+                        #    并有一条自检（源码里 notify 用到的前缀必须都在表里）盯着这件事。
                         if any(_m in txt for _m in SELF_MARKS) or "通过webhook" in txt \
                                 or "invited" in low or "test notification" in low \
                                 or "（你的指令：" in txt or "本次盈亏：" in txt \
@@ -4154,11 +4341,13 @@ def main():
                         chart = _res.get("chart")
                         if chart and chart.get("ok"):
                             _vf = chart.get("verify") or {}
-                            log("   读图: 止损 %s 开仓 %s 止盈 %s ｜ 关键标签复核 %s 个（两次一致 %s / "
-                                "仅单标签 %s / 仅批量 %s / 判为未读到 %s）"
-                                % (chart["sl"], chart["entry"], chart["tps"], _vf.get("checked"),
-                                   _vf.get("agreed"), _vf.get("single_only"),
-                                   _vf.get("batch_only"), _vf.get("dropped")))
+                            _gg = chart.get("geo") or {}
+                            log("   读图[%s]: 止损 %s 开仓 %s 止盈 %s ｜ 关键标签复核 %s 个（一致 %s / 单标签 %s / "
+                                "批量 %s / 判为未读到 %s）%s"
+                                % (chart.get("mode") or "?", chart["sl"], chart["entry"], chart["tps"],
+                                   _vf.get("checked"), _vf.get("agreed"), _vf.get("single_only"),
+                                   _vf.get("batch_only"), _vf.get("dropped"),
+                                   (" ｜ 色框=%s" % _gg.get("boxes") if _gg.get("used") else "")))
                         raw_coin = info.get("coin")
                         coin, coin_ok = (resolve_coin(raw_coin) if raw_coin else (None, False))
                         if raw_coin and coin and not coin_ok:
@@ -5268,6 +5457,47 @@ if __name__ == "__main__":
             MANUAL_COINS.add(str(_c).upper())
         _chk("重启后手工仓护栏能恢复", sorted(MANUAL_COINS), ["LSK"])
         MANUAL_COINS.clear()
+
+        # ---------- ⑧g 自环防护：机器人自己的通知前缀必须全部登记 ----------
+        print("\n[8g] 自环防护：源码里 notify 用到的【前缀】必须都在 SELF_MARKS 里")
+        _src = open(os.path.abspath(__file__), encoding="utf-8").read()
+        _used = set()
+        for _m in re.finditer(r"notify\(\s*(?:f)?\"([^\"]{0,240})", _src):
+            for _mk in re.findall(r"【[^】]{0,14}】", _m.group(1)):
+                _used.add(_mk)
+        _missing = sorted(m for m in _used if not any(m.startswith(s[:6]) or s in m for s in SELF_MARKS))
+        print("  源码里用到的通知前缀 %d 个：%s" % (len(_used), "、".join(sorted(_used))[:150]))
+        _chk("没有漏登记的机器人通知前缀", _missing, [])
+        _chk("SELF_MARKS 含【手工仓护栏】（2026-09-16 实测漏过）", "【手工仓护栏】" in SELF_MARKS, True)
+        _chk("SELF_MARKS 含【机器人告警】", "【机器人告警】" in SELF_MARKS, True)
+        _chk("机器人自己的告警不会被当信号（实测那条原文）",
+             any(_m in "ℹ️【手工仓护栏】检测到交易所有你的手工仓：LSK 机器人不会对它做任何事（不开新仓、不平仓、不改止损）"
+                 for _m in SELF_MARKS), True)
+
+        # ---------- ⑧h 几何读图（用户那张真图）----------
+        print("\n[8h] 几何读图：色框语义（红框下边=止损、红绿交界=开仓、绿框内横线=止盈）")
+        if os.path.exists(_real):
+            _im = Image.open(_real).convert("RGB")
+            _px2 = _im.load()
+            _bx = find_fill_boxes(_px2, _im.width, _im.height)
+            print("     ↳ 认出的色框：%s" % {k: list(v) for k, v in _bx.items()})
+            _chk("认出了绿框", "green" in _bx, True)
+            _chk("认出了红框", "red" in _bx, True)
+            if "green" in _bx and "red" in _bx:
+                _chk("绿框在红框上方（=做多）", _bx["green"][1] < _bx["red"][1], True)
+                _chk("红框下边 ≈ y1598（实测）", abs(_bx["red"][3] - 1598) <= 4, True)
+            _f = fit_axis_scale([(476, 9.289), (895, 8.216), (1294, 7.18)])
+            _chk("用三条真实止盈线能拟合价格轴", bool(_f), True)
+            if _f:
+                _chk("轴换算 y=1598（红框下边）≈ 6.39（±1%）",
+                     abs(axis_price(_f, 1598) - 6.39) / 6.39 < 0.01, True)
+            _rc = read_chart(_real) or {}
+            print("     ↳ read_chart：mode=%s 止损=%s 开仓=%s 止盈=%s"
+                  % (_rc.get("mode"), _rc.get("sl"), _rc.get("entry"), _rc.get("tps")))
+            _chk("走的是几何路径", _rc.get("mode"), "geometry")
+            _chk("止损取到 6.396（红框下边）", _rc.get("sl"), 6.396)
+            _chk("三档止盈 7.18/8.216/9.289", [round(x, 3) for x in (_rc.get("tps") or [])],
+                 [7.18, 8.216, 9.289])
 
         # ---------- ⑨ 隔离复核 ----------
         print("\n[9] 隔离复核（生产零写入）")
