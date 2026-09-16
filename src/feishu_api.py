@@ -311,11 +311,13 @@ def fetch_messages(chat_id, start_time=None, end_time=None, page_size=50, max_pa
     return out, None
 
 
-def fetch_new(chat_id, since_ms, img_dir, want_images=True, max_msgs=60):
+def fetch_new(chat_id, since_ms, img_dir, want_images=True, max_msgs=60, skip_ids=None):
     """拉"比 since_ms 新"的消息，产出与网页版 SCAN_JS **同结构**的行：
         {"id": int, "t_sig": int(秒), "text": str, "nimg": n, "loaded": n, "nblob": n,
          "_imgs": [已下载的原图路径], "msg_id": str, "msg_type": str}
     这样下游的解析/审批/下单逻辑一行都不用改。
+    skip_ids：已经处理过的消息 id 集合（传 SEEN 进来）——**在下载图片之前就跳过**，
+              否则那 5 秒回看窗口里的图每轮都会被重复下载。
     """
     since_s = int(since_ms / 1000) - 5 if since_ms else None          # 往回多取 5 秒，避免边界丢消息
     items, err = fetch_messages(chat_id, start_time=since_s)
@@ -329,6 +331,9 @@ def fetch_new(chat_id, since_ms, img_dir, want_images=True, max_msgs=60):
         mid = it.get("message_id") or ""
         if it.get("deleted"):
             continue
+        _sid = _stable_id(cms, mid)
+        if skip_ids and _sid in skip_ids:
+            continue
         txt = msg_text_of(it)
         keys = msg_images_of(it) if want_images else []
         imgs = []
@@ -336,7 +341,7 @@ def fetch_new(chat_id, since_ms, img_dir, want_images=True, max_msgs=60):
             p = download_image(mid, ik, img_dir)
             if p:
                 imgs.append(p)
-        rows.append({"id": _stable_id(cms, mid), "t_sig": cms // 1000, "text": txt,
+        rows.append({"id": _sid, "t_sig": cms // 1000, "text": txt,
                      "nimg": len(keys), "loaded": len(imgs), "nblob": len(imgs),
                      "_imgs": imgs, "msg_id": mid, "msg_type": it.get("msg_type")})
     return rows, None

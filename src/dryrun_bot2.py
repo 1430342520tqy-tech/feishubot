@@ -139,6 +139,7 @@ except Exception as _e:
 FETCH_MODE = "api"                 # api | browser，由 runtime_config.json 的 fetch_mode 决定
 API_READY = [False]                # 启动自检通过后才置 True
 API_CURSOR = {}                    # 群 -> 已处理到的 create_time(毫秒)
+API_LAST = {}                      # 群 -> 上次轮询时间（控制轮询频率，别把接口打爆）
 API_FAILS = [0]                    # 连续失败次数（用于告警/自动回退）
 
 
@@ -4278,6 +4279,11 @@ def main():
                 try:
                     if _use_api:
                         # ===== 官方 API 取消息（不需要浏览器）=====
+                        # 每个群最多每 2 秒轮询一次（飞书接口 1000 次/分钟，这样 4 个群 ≈ 120 次/分钟，
+                        # 又足够快：信号从发出到推送 1~2 秒）
+                        if time.time() - API_LAST.get(g, 0) < 2.0:
+                            continue
+                        API_LAST[g] = time.time()
                         _cid = API_CHAT_IDS.get(g)
                         if not _cid:
                             _cid = fapi.resolve_chat_ids([g]).get(g)
@@ -4287,7 +4293,7 @@ def main():
                             if safety % 200 == 1:
                                 log("[%s] ⚠️ 在飞书 API 里找不到这个群（名字要完全一致）" % g)
                             continue
-                        rows, _err = fapi.fetch_new(_cid, API_CURSOR.get(g, 0), IMGDIR)
+                        rows, _err = fapi.fetch_new(_cid, API_CURSOR.get(g, 0), IMGDIR, skip_ids=SEEN)
                         if _err:
                             API_FAILS[0] += 1
                             log("[%s] ⚠️ API 取消息失败（连续第 %d 次）：%s" % (g, API_FAILS[0], _err))
