@@ -2210,6 +2210,22 @@ def split_by_coin(txt):
     return out
 
 
+def _timing_line(p, prefix="⏱ 从信号发出到推送"):
+    """把这一段耗时按现有分段打出来（用户 2026-09-16 要求：审批消息里也要有）。
+    分段与"出单通知"里的 ⏱ 行**完全一致**：发现 / 抓图 / 解析 / 读图 / 等齐后续消息。"""
+    now = time.time()
+    _f = float(p.get("first_ts") or now)
+    _t = {k: float(p.get(k) or 0) for k in ("t_found", "t_img", "t_parse", "t_chart")}
+    _age = max(0.0, now - _f)
+    _detect = max(0.0, (_t["t_found"] or _f) - _f) if _t["t_found"] else 0.0
+    _img = max(0.0, _t["t_img"] - _t["t_found"]) if (_t["t_img"] and _t["t_found"]) else 0.0
+    _parse = max(0.0, _t["t_parse"] - _t["t_img"]) if (_t["t_parse"] and _t["t_img"]) else 0.0
+    _chart = max(0.0, _t["t_chart"] - _t["t_parse"]) if (_t["t_chart"] and _t["t_parse"]) else 0.0
+    _wait = max(0.0, _age - _detect - _img - _parse - _chart)
+    return ("%s 共 %.1fs（发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 等齐后续消息 %.1fs）"
+            % (prefix, _age, _detect, _img, _parse, _chart, _wait))
+
+
 def ask_user(coin, p, reason, quiet=False):
     """需要用户审批 / 把握不准 → 挂起并询问用户。回「开」才开单，回「不开」作废。
     quiet=True 时只挂起、不发单独通知（多币种消息由调用方汇总成一条）。
@@ -2240,11 +2256,13 @@ def ask_user(coin, p, reason, quiet=False):
          "──────────────"]
         + _approval_lines(coin, p, d)
         + ["──────────────",
+           # 🆕 2026-09-16 用户要求：审批消息里也要带这段耗时（原来只在出单通知里有）
+           _timing_line(p),
            "原文：%s" % (p["texts"][0][:180] if p.get("texts") else ""),
            "",
            "**回复「开」= 按上面这组参数开单；回复「不开」= 作废。**",
            "（%d 分钟内没回复自动作废）" % (ASK_TIMEOUT // 60)]))
-    log("   ❓ 已挂起等用户确认：%s（%s）" % (coin, reason))
+    log("   ❓ 已挂起等用户确认：%s（%s）｜%s" % (coin, reason, _timing_line(p, "耗时")))
 
 
 def expire_asking():
@@ -3145,14 +3163,28 @@ def handle_command(txt):
     # 判定条件收紧，避免"开单记录""开始监控"这类正常文字被误当指令：
     #   ① 回复里点出了币种名 + 含开/买/作废等动词，或
     #   ② 整条就是「开/不开/全部开/全部不开/作废」这种极短词
-    _ct = (tm(t) or t).strip()
-    if len(_ct) <= 48:
+    # ⚠️ 2026-09-16 实测事故（用户报「发送开单消息没有任何反应」）：
+    #   日志 `发现新消息 | 用户963038 开` → 判成「闲聊/无关，跳过」→ XAU 待确认 30 分钟后超时作废。
+    #   根因：飞书对**同一发送者的连续消息会省略时间戳**，而 strip_sender_prefix 的昵称规则
+    #   要求"昵称后面必须跟时间"，于是昵称留在了文本里 → "整条就是『开』"这个判据失败。
+    #   现在：**把"去掉开头昵称"的形态也算候选**，并允许首尾标点/emoji。
+    _REPLY_WORD = r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)"
+    _ct_cands = []
+    for _c in ((tm(t) or t).strip(), nick((tm(t) or t).strip())):
+        _c2 = re.sub(r"^[\s，,。.、！!？?~～✓✅👍]+|[\s，,。.、！!？?~～]+$", "", _c or "")
+        if _c2 and _c2 not in _ct_cands:
+            _ct_cands.append(_c2)
+    if not _ct_cands:
+        _ct_cands = [(tm(t) or t).strip()]
+    for _ct in _ct_cands:
+        if len(_ct) > 48:
+            continue
         _co = _reply_coins(_ct)
         if not _co and ASKING:      # 兜底：直接匹配当前待确认里的币种（防止别名/非标准写法）
             _co = [c for c in ASKING
                    if re.search(r"(?<![A-Za-z0-9])" + re.escape(c) + r"(?![A-Za-z0-9])", _ct, re.I)]
-        _is_reply = bool(_co and re.search(r"开|买|作废|不要", _ct)) or bool(re.fullmatch(
-            r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)", _ct))
+        _is_reply = bool(_co and re.search(r"开|买|作废|不要", _ct)) or bool(
+            re.fullmatch(_REPLY_WORD, _ct))
         if _is_reply:
             return _handle_ask_reply(_ct)
     body = None
@@ -4219,6 +4251,25 @@ def main():
                                 % (r.get("nimg", 0), r.get("loaded", 0), r.get("nblob", 0), len(imgs),
                                    "" if imgs else "  ← 有图元素但没抓到内容图（未加载/非 blob）"))
                         t_img = time.time()
+                        # ===== 🆕 结单/止损通报：**最先挡掉**（用户 2026-09-16 要求）=====
+                        # 「这是触发了止损，博主说一声，并不是开单信号，无用，以后这样的消息直接忽略，不要推送。」
+                        # 放在多币种拆分**之前**，任何分支都无法把它推成【博主指令】。
+                        # 只含"止盈达成"的通报 → 按用户第 9 条回报**你自己的持仓**。
+                        if _CLOSE_ANNOUNCE.search(txt):
+                            _c0 = find_coin_in_text(txt)
+                            _tp_only = bool(re.search(
+                                r"(TP\s?\d?\s*(hit|nailed|done|reached|filled)|take[- ]?profit\s*(hit|reached)|"
+                                r"止盈.{0,6}(达成|到了|命中|触发|已到))", txt, re.I)) and not bool(re.search(
+                                r"(stop[ -]?loss|stopped\s+out|止损|平仓|closed|结单)", txt, re.I))
+                            log("   ↳ 判定为【%s通报】→ %s：%s"
+                                % ("止盈" if _tp_only else "结单/止损",
+                                   "回报你的持仓" if _tp_only else "按你的要求直接忽略、不推送", txt[:90]))
+                            if _tp_only and _c0 and _c0 in open_pos:
+                                try:
+                                    pos_report(_c0, open_pos[_c0])
+                                except Exception as _e:
+                                    log("   持仓汇报失败 " + str(_e)[:80])
+                            continue
                         # ===== 方案C+D：本地正则先解析；需要 AI 时才调，且与读图并行 =====
                         # ===== 多币种消息：按币拆开、各自解析，然后逐个问用户（用户 2026-09-14 要求）=====
                         # 例：「原油Cl跌破97空，100.7止损，93止盈。 Sol突破102.5多，止损100，止盈107到110。」
@@ -4371,7 +4422,10 @@ def main():
                                           "entryRange", "entryLegs", "stopRange", "stopPct"))
                         t_chart = time.time()
                         stamps = {"found": t_found, "img": t_img, "parse": t_parse, "chart": t_chart}
-                        # 博主管理指令：立即处理（带确定性护栏，避免把"止盈达成"误判成"全部平仓"）
+                        # ===== ① 结单/止损通报：上面（拆币之前）已经挡掉，这里不再重复 =====
+                        # ===== ② 博主管理指令（术语一律中文；用户 2026-09-16 要求）=====
+                        _ACT_CN = {"close_all": "全部平仓", "trim": "减仓", "move_stop_to_cost": "止损移到开仓价",
+                                   "other": "其它"}
                         _act = info.get("manage_action")
                         if _act and _act != "other":
                             INFO_ONLY = r"(TP\s?\d?\s*(hit|nailed|done|reached|filled)|take[- ]?profit\s*(hit|reached)|breakeven\s*hit|止盈.{0,6}(达成|到了|命中|触发|已到)|保本.{0,4}(止损|离场))"
@@ -4388,19 +4442,11 @@ def main():
                             log("   ↳ 判定为博主管理类消息但无明确动作 → 不动作：%s" % txt[:80])
                             continue
                         if _act:
-                            notify("【博主指令】%s\n群：%s  时间：%s\n动作：%s\n原文：%s" % (coin or "?", g, when, _act, txt[:200]))
+                            # 用户要求：术语一律中文（原来推的是 close_all 这种英文）
+                            notify("【博主指令】%s\n群：%s  时间：%s\n动作：%s\n原文：%s"
+                                   % (coin or "?", g, when, _ACT_CN.get(_act, _act), txt[:200]))
                             continue
-                        # ===== 结单/止盈止损通报：只回报自己的持仓，【绝不开新仓】=====
-                        # 博主常把「Trade Closed / Stop loss hit at X」当成一条消息发出来，
-                        # 里面既有币种也有方向也有价格，很容易被当成开单信号 —— 必须挡在这里。
-                        if _CLOSE_ANNOUNCE.search(txt):
-                            log("   ↳ 判定为【结单/止损通报】，不建仓：%s" % txt[:90])
-                            if coin and coin in open_pos:
-                                try:
-                                    pos_report(coin, open_pos[coin])
-                                except Exception as _e:
-                                    log("   持仓汇报失败 " + str(_e)[:80])
-                            continue
+                        # （结单/止盈止损通报 已在上面第 ① 挡处理，这里不再重复判断）
                         if coin and dirc in ("LONG", "SHORT") and _text_info:
                             # 开单信号 -> 进待确认池，等同一条信号的后续消息（卡片/图）补齐
                             p = merge_pending(coin, g, info=info, chart=chart, imgs=imgs, t_sig=t_sig, txt=txt, stamps=stamps)
@@ -5498,6 +5544,52 @@ if __name__ == "__main__":
             _chk("止损取到 6.396（红框下边）", _rc.get("sl"), 6.396)
             _chk("三档止盈 7.18/8.216/9.289", [round(x, 3) for x in (_rc.get("tps") or [])],
                  [7.18, 8.216, 9.289])
+
+        # ---------- ⑧i 2026-09-16 下午用户报的三个问题 ----------
+        print("\n[8i] 用户报的三个问题：回复识别 / 审批消息带耗时 / 止损通报不推送")
+        _saved_asking = dict(ASKING)
+        ASKING.clear()
+        ASKING["XAU"] = {"p": {"entry": 4330.0, "stop": 4310.0, "tps": [4430.0], "group": "黄金mansoor",
+                               "dir": "LONG", "texts": ["BUYING XAUUSD Entry : 4330.00 SL : 4310.00 TP : 4430.00"],
+                               "legs": [], "first_ts": time.time() - 12, "t_found": time.time() - 10,
+                               "t_img": time.time() - 9, "t_parse": time.time() - 8,
+                               "t_chart": time.time() - 8, "deadline": 0},
+                         "reason": "测试", "ask_ts": time.time(), "txt": ""}
+        # ① 回复识别：飞书省略时间戳 → 昵称留在文本里（实测事故原文）
+        _chk("「用户963038 开」必须被当成回复（实测漏判的那条）",
+             _handle_ask_reply("开") if False else bool(
+                 re.fullmatch(r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)",
+                              re.sub(r"^[^\s]{2,16}\s+", "", "用户963038 开"))), True)
+        ASKING["XAU"]["p"]["deadline"] = 0
+        _r = handle_command("用户963038 开")
+        _chk("handle_command 认下「用户963038 开」", _r, True)
+        _chk("回复后 XAU 已进入可出单状态（approved=True）",
+             bool(PENDING.get("XAU", {}).get("approved")), True)
+        ASKING.clear(); PENDING.clear()
+        # ② 审批消息必须带耗时
+        _p9 = {"entry": 4330.0, "stop": 4310.0, "tps": [4430.0], "group": "黄金mansoor", "dir": "LONG",
+               "texts": ["BUYING XAUUSD"], "legs": [], "first_ts": time.time() - 18.4,
+               "t_found": time.time() - 9.4, "t_img": time.time() - 9.4, "t_parse": time.time() - 8.6,
+               "t_chart": time.time() - 8.6, "deadline": 0}
+        _tl = _timing_line(_p9)
+        print("     ↳ %s" % _tl)
+        for _kw in ("从信号发出到推送", "发现", "抓图", "解析", "读图", "等齐后续消息"):
+            _chk("耗时行含 %r" % _kw, _kw in _tl, True)
+        _SENT.clear()
+        ask_user("XAU", dict(_p9), "按你的要求：所有订单在开之前都要经你审批")
+        _chk("审批消息里确实带了耗时行", any("从信号发出到推送" in s for s in _SENT), True)
+        ASKING.clear()
+        # ③ 止损通报：直接忽略，不推送；术语中文
+        _chk("止损通报文本被 _CLOSE_ANNOUNCE 命中",
+             bool(_CLOSE_ANNOUNCE.search("Trade Closed — EIGEN/USDT LONG Embed Signal by Neil $0.1905 "
+                                         "(-5.18% from entry) Stop loss hit at $0.1905")), True)
+        _chk("止盈达成也命中（但它会去回报你的持仓）",
+             bool(_CLOSE_ANNOUNCE.search("TP1 hit at 0.19 — 止盈达成")), True)
+        _chk("管理指令术语中文化：close_all → 全部平仓",
+             {"close_all": "全部平仓", "trim": "减仓",
+              "move_stop_to_cost": "止损移到开仓价"}.get("close_all"), "全部平仓")
+        ASKING.clear()
+        ASKING.update(_saved_asking)
 
         # ---------- ⑨ 隔离复核 ----------
         print("\n[9] 隔离复核（生产零写入）")
