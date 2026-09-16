@@ -3140,7 +3140,15 @@ def open_group_page(ctx, name):
         for i in range(20):
             if page.evaluate("() => document.querySelectorAll('[class*=\"a11y_feed_card_main\"]').length"): break
             page.mouse.move(380, 400); page.mouse.wheel(0, 400); time.sleep(1.2)
-        for attempt in range(4):
+        for attempt in range(6):
+            # 每 2 次重试把页面重新载入一遍：实测「标题不符」多半是页面/搜索还没准备好，
+            # 刷新一次比原地重试更有效（2026-09-16 凌晨重启时 3 个群连续 4 次失败）
+            if attempt and attempt % 2 == 0:
+                try:
+                    page.goto(MSG_URL, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(6)
+                except Exception:
+                    pass
             # 方式1：在会话列表里按『标题行』找到并点击（Playwright 元素点击 + 标题校验）
             try:
                 idx = -1
@@ -3169,6 +3177,14 @@ def open_group_page(ctx, name):
             except Exception:
                 pass
             time.sleep(1.5)
+        # ⚠️ 打不开时必须留下**可诊断的现场**：页面当时到底显示了什么？
+        #    （是群被改名了？还是飞书改版把标题挪出了 TITLE_JS 的判定区域？）
+        try:
+            _seen = page.evaluate("() => (document.body.innerText || '').split(String.fromCharCode(10))"
+                                  ".map(s => s.trim()).filter(Boolean).slice(0, 6)")
+            log("   [%s] 打不开：页面当时显示 %s" % (name, " ｜ ".join(_seen or [])[:200]))
+        except Exception:
+            pass
         return page, []
     except Exception as e:
         log("[%s] 开页异常: %s" % (name, str(e)[:100]))
@@ -3521,7 +3537,18 @@ def main():
                 except Exception as _e:
                     log("   ↳ [%s] chat-id 探测失败 %s" % (g, str(_e)[:60]))
             else:
-                log("[%s] 打开失败（未读到消息）" % g)
+                # ⚠️ 2026-09-16 实测缺陷：原来打不开也照样 pages[g]=pg（一个**没通过标题校验**的页面），
+                #    而主循环只在 pages[g] 为 None 或已关闭时才重开 → 这个群会**一直停在错误的页面上**：
+                #    既读不到该群消息（静默变瞎），又可能把别的会话的消息当成这个群的信号（串台）。
+                #    现在：关掉这个未经验证的页面、置 None（交给主循环持续重开），并**立即告警**。
+                log("[%s] 打开失败（未读到消息）→ 该群暂不监控，交给主循环持续重开" % g)
+                try:
+                    pg.close()
+                except Exception:
+                    pass
+                pages[g] = None
+                notify("【机器人告警】群「%s」这次开机没能打开（已重试 6 次：会话列表点击 + Ctrl+K 搜索）\n"
+                       "这个群现在是**盲区**，我会在主循环里继续重开；期间它发的新信号可能收不到。" % g)
         log("==== 开始实时监控（%d 个页面）====" % len(pages))
         # ⚠️ 不要在这里写 {"open": []}，会把已恢复的持仓清空（曾经踩过这个坑）
         json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
@@ -3683,6 +3710,20 @@ def main():
                         log("[%s] 页面不存在/已关闭，正在重新打开…（连续第 %d 次）" % (g, _nf))
                     try:
                         _pg, _rows = open_group_page(ctx, g)
+                        if not _rows:
+                            # 打开了页面但**没通过标题校验/没读到消息** → 不能当成成功
+                            # （否则这个群会停在一个错误的页面上：读不到自己的消息，还可能串台）
+                            try:
+                                _pg.close()
+                            except Exception:
+                                pass
+                            pages[g] = None
+                            if _nf in (3, 10) or _nf % 50 == 0:
+                                log("[%s] 重开后仍未通过标题校验（连续第 %d 次）" % (g, _nf))
+                                notify("【机器人告警】群「%s」连续 %d 次没能打开（页面打开了但标题对不上）\n"
+                                       "该群当前是**盲区**，我会继续重开；期间它发的信号可能收不到。"
+                                       % (g, _nf))
+                            continue
                         pages[g] = _pg
                         adopt_page(g, _rows)
                         if _nf > 1:
