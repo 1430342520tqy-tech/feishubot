@@ -121,6 +121,65 @@ except Exception as _e:
     _BEXEC_ERR = str(_e)[:120]
 
 
+# ---------------- 取消息层：官方 API（首选） / 爬网页（兜底）----------------
+# 用户 2026-09-16 授权了「用户身份」权限，于是机器人可以走飞书官方 API 取消息：
+#   · 不需要把机器人拉进群（那些 KOL 群是别人的，拉不进去）
+#   · 不需要浏览器 → 不再有"开页失败"、重启盲窗从 4.5 分钟降到几秒、省约 2.7GB 内存
+#   · 不受飞书网页前端改版/崩溃影响（9/15、9/16 已被它坑了三次）
+#   · 图片是**原图**（实测与网页 blob 抓下来的字节完全相同）
+# 浏览器那条路完整保留：runtime_config.json 里 `fetch_mode` 改成 "browser" 即可一键回滚（热加载）。
+try:
+    import feishu_api as fapi
+    fapi.set_logger(log)
+    _FAPI_OK, _FAPI_ERR = True, ""
+except Exception as _e:
+    fapi = None
+    _FAPI_OK, _FAPI_ERR = False, str(_e)[:120]
+
+FETCH_MODE = "api"                 # api | browser，由 runtime_config.json 的 fetch_mode 决定
+API_READY = [False]                # 启动自检通过后才置 True
+API_CURSOR = {}                    # 群 -> 已处理到的 create_time(毫秒)
+API_FAILS = [0]                    # 连续失败次数（用于告警/自动回退）
+
+
+def _row_t_sig(r):
+    """消息的"发出时间"（秒）。API 行直接带 t_sig；网页行用 message-id 高位算。"""
+    try:
+        if r.get("t_sig"):
+            return int(r["t_sig"])
+        return int(r.get("id") or 0) >> 32
+    except Exception:
+        return int(time.time())
+
+
+def api_bootstrap():
+    """启动时自检官方 API：可用就把 API_READY 置 True（并跳过浏览器）。"""
+    global API_CURSOR
+    if not _FAPI_OK:
+        log("   [取消息] 官方 API 模块不可用（%s）→ 用浏览器兜底" % _FAPI_ERR)
+        return False
+    ok, why = fapi.health()
+    if not ok:
+        log("   [取消息] 官方 API 自检未通过：%s" % why)
+        notify("⚠️【取消息】飞书官方 API 自检未通过：%s\n"
+               "机器人会先用浏览器兜底；要恢复 API 模式请重新授权（我可以给你授权链接）。" % why)
+        return False
+    log("   [取消息] 官方 API 自检通过：%s" % why)
+    ids = fapi.resolve_chat_ids(GROUPS)
+    miss = [g for g in GROUPS if g not in ids]
+    if miss:
+        log("   [取消息] ⚠️ 这些群在 API 里没找到：%s" % "、".join(miss))
+        notify("⚠️【取消息】这些监控群在飞书 API 里没找到：%s\n（群名要和飞书里完全一致，或你已退出该群）"
+               % "、".join(miss))
+    API_CHAT_IDS.clear()
+    API_CHAT_IDS.update(ids)
+    API_READY[0] = True
+    return True
+
+
+API_CHAT_IDS = {}
+
+
 def _be_mode():
     """影子 / 实盘"""
     try:
@@ -729,7 +788,7 @@ def _ocr_one_label(im, x0, t):
                                   "If you cannot read any number, return {\"value\": null}."},
                                  {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}
         r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY,
-                                           "Content-Type": "application/json"}, json=body, timeout=120)
+                                           "Content-Type": "application/json"}, json=body, timeout=45)
         m = re.search(r"\{[\s\S]*\}", r.json()["choices"][0]["message"]["content"])
         v = json.loads(m.group(0)).get("value")
         return float(str(v).replace(",", "").replace("$", "").strip())
@@ -824,7 +883,13 @@ def _ocr_tags_batch(im, x0, merged):
             nums = {}
         if len(nums) >= len(tiles):
             break
-        log("   ⚠️ 批量读标签不完整：标签 %d 个，只回来 %d 个 → %s"
+        # ⚠️ 性能（2026-09-16）：原来"缺一个就重试"会几乎每次都多打一次调用（5~15 秒/次）。
+        #    改成**只回来不到一半**才重试；个别缺的由"关键标签单读复核"那一层补回来。
+        if len(nums) >= max(1, len(tiles) // 2):
+            log("   ↳ 批量读标签缺 %d 个（不足一半，不再重试；关键标签会单独复核）"
+                % (len(tiles) - len(nums)))
+            break
+        log("   ⚠️ 批量读标签大面积缺失：标签 %d 个，只回来 %d 个 → %s"
             % (len(tiles), len(nums), "重试一次" if _att == 1 else "仍不完整，按读到的用（不静默丢）"))
     return nums
 
@@ -969,7 +1034,9 @@ def _self_marks():
             #    它们每一个都可能让机器人把自己的通知当信号重解析。
             "【止盈更新·纸面】", "【实盘·成交】", "【实盘·成交但要你处理】", "【实盘·未成交】",
             "【实盘·看门狗】", "【实盘·部分成交】", "【实盘动作失败·需要处理】",
-            "【失联看门狗】", "【启动对账失败】"]
+            "【失联看门狗】", "【启动对账失败】",
+            # 🆕 2026-09-16 官方 API 取消息层新增的两条告警（自检 8g 抓出来的）
+            "【取消息】", "【取消息告警】"]
 
 
 SELF_MARKS = _self_marks()
@@ -1025,7 +1092,18 @@ def read_chart(path):
     # 只对"关键"标签做单标签单独 OCR：红色止损线 + 够长的止盈候选横线（≤6 个）。
     # 与批量读数**互相独立**：一致 → 采信；不一致 → 标「未读到」并记日志（绝不猜）。
     verify = {"checked": 0, "agreed": 0, "single_only": 0, "batch_only": 0, "dropped": 0, "notes": []}
-    _key = [t for t in tags if t["color"] == "red" or t["cov"] >= TP_MIN_COV][:6]
+    # ⚠️ 性能（2026-09-16 实测）：逐个复核很准但**每次调用要 5~15 秒**，图上关键标签一多就
+    #    把一次信号拖到 40 秒以上。所以只复核**真正决定下单参数**的标签：
+    #      · 红色止损线（最多 2 条）
+    #      · 覆盖率最高的 3 条长横线（止盈候选）
+    #    其余标签只用批量读数（它们只出现在"图上其余横线"的参考列表里，不值得多花时间）。
+    _long_sorted = sorted([t for t in tags if t["cov"] >= TP_MIN_COV and t["color"] != "red"],
+                          key=lambda t: -t["cov"])[:3]
+    _key, _seen_key = [], set()
+    for t in ([t for t in tags if t["color"] == "red"][:2] + _long_sorted):
+        if id(t) not in _seen_key:
+            _seen_key.add(id(t)); _key.append(t)
+    verify["essential"] = len(_key)
     for t in _key:
         v1 = _ocr_one_label(im, x0, t["_reg"])
         verify["checked"] += 1
@@ -2879,12 +2957,15 @@ HELP_TEXT = """【机器人指令】在「开单记录」或「机器人开单�
 
 def load_runtime():
     global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE, STRICT_LIMIT_GROUPS, MAX_OPEN
-    global MAX_CONSEC_LOSS, DAILY_LOSS_LIMIT, MAX_TOTAL_MARGIN, SILENCE_ALERT_H
+    global MAX_CONSEC_LOSS, DAILY_LOSS_LIMIT, MAX_TOTAL_MARGIN, SILENCE_ALERT_H, FETCH_MODE
     try:
         if os.path.exists(RUNTIME):
             cfg = json.load(open(RUNTIME, encoding="utf-8"))
             if cfg.get("groups"):
                 GROUPS = [g for g in cfg["groups"] if g]
+            # 取消息方式：api（官方 API，默认）| browser（爬网页，兜底可回滚）
+            if cfg.get("fetch_mode") in ("api", "browser"):
+                FETCH_MODE = cfg["fetch_mode"]
             if "strict_limit_groups" in cfg:
                 STRICT_LIMIT_GROUPS = [g for g in (cfg.get("strict_limit_groups") or []) if g]
             if cfg.get("max_open"):
@@ -3212,15 +3293,23 @@ def handle_command(txt):
         _exp = _current_exposure(open_pos_ref)
         _rec = ("未检查" if RECONCILE.get("ok") is None and not RECONCILE.get("checked")
                 else ("一致" if RECONCILE.get("ok") else "❌不一致" + ("（已阻止真实下单）" if RECONCILE.get("blocked") else "")))
+        _fetch = ("官方 API（%s）" % ("已就绪" if API_READY[0] else "未就绪，正在用浏览器兜底")
+                  if FETCH_MODE == "api" else "浏览器爬网页")
+        if FETCH_MODE == "api" and _FAPI_OK:
+            _ti = fapi.token_info()
+            _fetch += " ｜ 令牌剩 %d 分钟 / 可续期 %d 小时%s" % (
+                max(0, _ti.get("access_left_s", 0)) // 60, max(0, _ti.get("refresh_left_s", 0)) // 3600,
+                "" if _ti.get("has_refresh") else "（⚠️ 无 refresh_token，到期需重新授权）")
         notify("【机器人状态】\n"
                "监控群：%s\n"
+               "取消息：%s\n"
                "持仓：%d 笔 / 上限 %d 笔（%s）\n"
                "总敞口：%.0fU / 上限 %.0fU\n"
                "单笔：保证金 %.0fU × %d倍 = 名义 %.0fU\n"
                "模式：%s ｜ 测试模式：%s ｜ 暂停：%s\n"
                "风控：连亏 %s 笔（熔断线 %s）｜ 今日 %s 笔 / 净 %+.2fU（熔断线 -%.0fU）\n"
                "对账：%s"
-               % ("、".join(GROUPS), len(open_pos_ref), MAX_OPEN, "、".join(open_pos_ref) or "-",
+               % ("、".join(GROUPS), _fetch, len(open_pos_ref), MAX_OPEN, "、".join(open_pos_ref) or "-",
                   _exp, _exposure_cap(), MARGIN, LEV, NOTIONAL,
                   _be_mode(), "开" if TEST_MODE else "关", "是" if PAUSED[0] else "否",
                   RISK.get("consec_loss", 0), MAX_CONSEC_LOSS,
@@ -3890,7 +3979,32 @@ def main():
         position_sanity(open_pos, notify_user=True)
     except Exception as _e:
         log("持仓自检异常：%s" % str(_e)[:120])
+    # ===== 取消息层自检：官方 API 可用就**完全不启动浏览器** =====
+    # （2026-09-16 用户授权官方 API；实测图片是原图、延迟大降、重启盲窗从 4.5 分钟变几秒）
+    _api_ok = api_bootstrap() if FETCH_MODE == "api" else False
+    if FETCH_MODE == "api" and not _api_ok:
+        log("   [取消息] 回退：改用浏览器爬网页（等价于 fetch_mode=browser）")
+    ctx, pages = None, {}
+    if _api_ok:
+        # 恢复 API 游标（毫秒）
+        try:
+            for _g, _v in (sv.get("last_api") or {}).items():
+                API_CURSOR[_g] = int(_v)
+            if API_CURSOR:
+                log("已恢复 API 游标：%s" % "、".join(
+                    "%s→%s" % (g, datetime.datetime.fromtimestamp(v / 1000, CST).strftime("%m-%d %H:%M:%S"))
+                    for g, v in API_CURSOR.items()))
+        except Exception:
+            pass
+        # 首次用 API：没有游标的群按「最近 10 分钟」起算，不回补更早历史（免得一上来灌一堆老信号）
+        for _g in GROUPS:
+            if not API_CURSOR.get(_g):
+                API_CURSOR[_g] = int((time.time() - 600) * 1000)
+                log("   ↳ [%s] 首次用 API：游标从 10 分钟前开始（不回补更早的历史）" % _g)
+        log("==== 取消息模式：飞书官方 API（不需要浏览器，重启没有 4.5 分钟盲窗）====")
+        log("==== 开始实时监控（%d 个群，API 模式）====" % len(GROUPS))
     with sync_playwright() as p:
+      if not _api_ok:
         try:
             ctx = launch_persistent(p, BASE + "/fs_bot")
         except Exception as _e0:
@@ -3931,7 +4045,8 @@ def main():
             return len(gap)
 
         catchup_total = 0
-        for g in GROUPS:
+        if not _api_ok:
+          for g in GROUPS:
             pg, rows = open_group_page(ctx, g)
             pages[g] = pg
             ids = [int(r["id"]) for r in rows if r.get("id")]
@@ -3963,12 +4078,14 @@ def main():
                 pages[g] = None
                 notify("【机器人告警】群「%s」这次开机没能打开（已重试 6 次：会话列表点击 + Ctrl+K 搜索）\n"
                        "这个群现在是**盲区**，我会在主循环里继续重开；期间它发的新信号可能收不到。" % g)
-        log("==== 开始实时监控（%d 个页面）====" % len(pages))
+        if not _api_ok:
+            log("==== 开始实时监控（%d 个页面）====" % len(pages))
         # ⚠️ 不要在这里写 {"open": []}，会把已恢复的持仓清空（曾经踩过这个坑）
         json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
                    "asking": _asking_dump(),
                    "paused": bool(PAUSED[0]),
                    "manual": _manual_dump(),      # 用户手工仓护栏（机器人不干涉）
+                   "last_api": dict(API_CURSOR),  # API 模式的消息游标（毫秒）
                    "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
         try:
@@ -4073,50 +4190,56 @@ def main():
             return bool(ok_pages)
 
         while True:
-            # ===== 方案A：先用「会话列表预览」判断哪个群有新消息（一次 JS 调用 ≈0.2s）=====
-            ref_page = next((pages[g] for g in GROUPS if pages.get(g) and not pages[g].is_closed()), None)
-            feed = feed_snapshot(ref_page) if ref_page else {}
-            changed, missing = [], []
-            for g in GROUPS:
-                prev_txt = feed_preview_of(feed, g)
-                if prev_txt is None:
-                    missing.append(g)                      # 列表里没这个群 -> 兜底扫
-                elif feed_prev.get(g) != prev_txt:
-                    changed.append(g)
-                feed_prev[g] = prev_txt
-            safety += 1
-            if safety % 30 == 0:                            # 每 15 轮（约 15~30s）全量扫一次兜底
-                to_scan = list(GROUPS)
+            # ===== 取消息模式：官方 API（不碰浏览器）/ 爬网页（兜底）=====
+            _use_api = (FETCH_MODE == "api") and API_READY[0] and _FAPI_OK
+            if _use_api:
+                to_scan, changed, missing = list(GROUPS), [], []
+                safety += 1
             else:
-                to_scan = list(changed)
-                if missing and safety % 3 == 0:              # 列表里看不到的群：每 3 轮轮换兜底扫 1 个
-                    to_scan.append(missing[safety % len(missing)])
-            if changed:
-                log("🔔 会话列表显示有新消息：%s" % "、".join(changed))
-            # ===== B1 自愈判定（基于上一轮的重开结果，在扫描前处理）=====
-            if _dead_groups:
-                _dead_rounds[0] += 1
-                if _blind_since[0] == 0.0:
-                    _blind_since[0] = time.time()
-                    log("👁 [B1 自愈] 出现「整个浏览器上下文已死」信号（%d 个群：%s）→ 进入观察"
-                        % (len(_dead_groups), "、".join(sorted(_dead_groups))))
-            else:
-                _dead_rounds[0] = 0
-            if _dead_rounds[0] >= DEAD_ROUNDS_TO_RELAUNCH or len(_dead_groups) >= 2:
-                if time.time() - _relaunch_ts[0] >= RELAUNCH_MIN_GAP:
-                    relaunch_browser("连续 %d 轮命中上下文已死（涉及群：%s）"
-                                     % (_dead_rounds[0], "、".join(sorted(_dead_groups)) or "-"))
+                # ===== 方案A：先用「会话列表预览」判断哪个群有新消息（一次 JS 调用 ≈0.2s）=====
+                ref_page = next((pages[g] for g in GROUPS if pages.get(g) and not pages[g].is_closed()), None)
+                feed = feed_snapshot(ref_page) if ref_page else {}
+                changed, missing = [], []
+                for g in GROUPS:
+                    prev_txt = feed_preview_of(feed, g)
+                    if prev_txt is None:
+                        missing.append(g)                      # 列表里没这个群 -> 兜底扫
+                    elif feed_prev.get(g) != prev_txt:
+                        changed.append(g)
+                    feed_prev[g] = prev_txt
+                safety += 1
+                if safety % 30 == 0:                            # 每 15 轮（约 15~30s）全量扫一次兜底
+                    to_scan = list(GROUPS)
+                else:
+                    to_scan = list(changed)
+                    if missing and safety % 3 == 0:              # 列表里看不到的群：每 3 轮轮换兜底扫 1 个
+                        to_scan.append(missing[safety % len(missing)])
+                if changed:
+                    log("🔔 会话列表显示有新消息：%s" % "、".join(changed))
+                # ===== B1 自愈判定（基于上一轮的重开结果，在扫描前处理）=====
+                if _dead_groups:
+                    _dead_rounds[0] += 1
+                    if _blind_since[0] == 0.0:
+                        _blind_since[0] = time.time()
+                        log("👁 [B1 自愈] 出现「整个浏览器上下文已死」信号（%d 个群：%s）→ 进入观察"
+                            % (len(_dead_groups), "、".join(sorted(_dead_groups))))
+                else:
                     _dead_rounds[0] = 0
-                elif safety % 40 == 0:
-                    log("   ⏳ 浏览器重启被节流（距上次 %.0fs < %.0fs），本轮仍按单群重开处理"
-                        % (time.time() - _relaunch_ts[0], RELAUNCH_MIN_GAP))
+                if _dead_rounds[0] >= DEAD_ROUNDS_TO_RELAUNCH or len(_dead_groups) >= 2:
+                    if time.time() - _relaunch_ts[0] >= RELAUNCH_MIN_GAP:
+                        relaunch_browser("连续 %d 轮命中上下文已死（涉及群：%s）"
+                                         % (_dead_rounds[0], "、".join(sorted(_dead_groups)) or "-"))
+                        _dead_rounds[0] = 0
+                    elif safety % 40 == 0:
+                        log("   ⏳ 浏览器重启被节流（距上次 %.0fs < %.0fs），本轮仍按单群重开处理"
+                            % (time.time() - _relaunch_ts[0], RELAUNCH_MIN_GAP))
             _dead_groups.clear()
             missed_sig = []          # 本轮被闸门拦下的消息（只通报，不下单）
             for g in GROUPS:
                 page = pages.get(g)
-                if g not in to_scan:
+                if g not in to_scan and not _use_api:
                     continue
-                if page is None or page.is_closed():
+                if (not _use_api) and (page is None or page.is_closed()):
                     # ⚠️ 旧代码在 page 为 None 时直接 continue —— 那个群会永久停止监控，且日志里毫无提示。
                     #    现在改为主动重开；重开后保留原游标，停机期间的消息由回补闸门处理。
                     _reopen_fail[g] = _reopen_fail.get(g, 0) + 1
@@ -4153,13 +4276,39 @@ def main():
                             log("[%s] 重开失败（连续第 %d 次）：%s" % (g, _nf, str(_e)[:80]))
                     continue
                 try:
-                    page.mouse.move(900, 400); page.mouse.wheel(0, 2600); time.sleep(0.3)
-                    rows = page.evaluate(SCAN_JS)
+                    if _use_api:
+                        # ===== 官方 API 取消息（不需要浏览器）=====
+                        _cid = API_CHAT_IDS.get(g)
+                        if not _cid:
+                            _cid = fapi.resolve_chat_ids([g]).get(g)
+                            if _cid:
+                                API_CHAT_IDS[g] = _cid
+                        if not _cid:
+                            if safety % 200 == 1:
+                                log("[%s] ⚠️ 在飞书 API 里找不到这个群（名字要完全一致）" % g)
+                            continue
+                        rows, _err = fapi.fetch_new(_cid, API_CURSOR.get(g, 0), IMGDIR)
+                        if _err:
+                            API_FAILS[0] += 1
+                            log("[%s] ⚠️ API 取消息失败（连续第 %d 次）：%s" % (g, API_FAILS[0], _err))
+                            if API_FAILS[0] in (3, 10) or API_FAILS[0] % 50 == 0:
+                                notify("⚠️【取消息告警】官方 API 连续 %d 次取不到消息：%s\n"
+                                       "（浏览器兜底仍然可用：把 runtime_config.json 的 fetch_mode 改成 browser）"
+                                       % (API_FAILS[0], _err))
+                            continue
+                        API_FAILS[0] = 0
+                        if rows:
+                            API_CURSOR[g] = max(API_CURSOR.get(g, 0),
+                                                max(int(r["t_sig"]) * 1000 for r in rows) + 1)
+                            STATE_DIRTY[0] = True
+                    else:
+                        page.mouse.move(900, 400); page.mouse.wheel(0, 2600); time.sleep(0.3)
+                        rows = page.evaluate(SCAN_JS)
                     if not rows:
                         finalize_pending(open_pos)          # 方案B：每个群扫完就检查一次出单
                         rawq_sweep(g)                       # B16：4 秒内没关联上文字的图 → 单独推送
                         continue
-                    base = last_id.get(g, 0)
+                    base = 0 if _use_api else last_id.get(g, 0)
                     cand = sorted([r for r in rows if r.get("id") and int(r["id"]) > base],
                                   key=lambda r: int(r["id"]))
                     # ===== 回补闸门（2026-09-13）替代旧的「发现 >15 条就静默全丢」=====
@@ -4169,7 +4318,7 @@ def main():
                     now_ts = time.time()
                     fresh, gated = [], []
                     for r in cand:
-                        if now_ts - (int(r["id"]) >> 32) > CATCHUP_MAX_AGE:
+                        if now_ts - _row_t_sig(r) > CATCHUP_MAX_AGE:
                             gated.append(("超时效", r))
                         else:
                             fresh.append(r)
@@ -4179,9 +4328,11 @@ def main():
                     for _why, r in gated:
                         _mid = r["id"]
                         mark_seen(_mid)
-                        last_id[g] = max(last_id.get(g, 0), int(_mid))
+                        # ⚠️ API 模式的 id 与网页版 id 不同源，**不能互相污染游标**
+                        if not _use_api:
+                            last_id[g] = max(last_id.get(g, 0), int(_mid))
                         STATE_DIRTY[0] = True
-                        missed_sig.append((g, _why, int(_mid) >> 32, (r.get("text") or "")[:70]))
+                        missed_sig.append((g, _why, _row_t_sig(r), (r.get("text") or "")[:70]))
                     if gated:
                         log("[%s] 回补闸门拦下 %d 条（超时效 %d / 超上限 %d）：只通报不下单"
                             % (g, len(gated), sum(1 for w, _ in gated if w == "超时效"),
@@ -4189,18 +4340,20 @@ def main():
                     new = fresh
                     for r in new:
                         mid = r["id"]
-                        t_sig = int(mid) >> 32
+                        t_sig = _row_t_sig(r)
                         when = datetime.datetime.fromtimestamp(t_sig, CST).strftime("%m-%d %H:%M:%S")
                         txt = strip_sender_prefix(r["text"])   # 去掉行首的发送者名（"自定义机器人 BOT" 里的 BOT 是真实交易对，会误导币种识别）
                         LAST_MSG_TS[0] = time.time()           # 失联看门狗用：只要抓到任何一条消息就刷新
                         log("[%s] 发现新消息 | 发出=%s | %s" % (g, when, txt[:110]))
                         if int(mid) in SEEN:
                             log("   ↳ 该消息此前已处理过，跳过（防重复开单）")
-                            last_id[g] = max(last_id.get(g, 0), int(mid))
+                            if not _use_api:
+                                last_id[g] = max(last_id.get(g, 0), int(mid))
                             continue
                         mark_seen(mid)
                         # 逐条推进游标：进程若中途挂掉，重启后只会重放（SEEN 挡住重复开单），不会丢单
-                        last_id[g] = max(last_id.get(g, 0), int(mid))
+                        if not _use_api:
+                            last_id[g] = max(last_id.get(g, 0), int(mid))
                         STATE_DIRTY[0] = True
                         low = txt.lower()
                         # ⚠️ 2026-09-15 实测事故：用户发「全部平仓」后，机器人把自己的
@@ -4235,14 +4388,20 @@ def main():
                             log("   ↳ 闲聊/无关，跳过")
                             continue
                         t_found = time.time()
-                        # 抓图：只要消息里有图片元素就尝试（等它真正加载）
+                        # 图：API 模式是**已经下载好的原图**（更清晰、更准）；浏览器模式才去抓 blob
                         imgs = []
-                        if r.get("nimg", 0) > 0:
+                        if _use_api:
+                            imgs = [p for p in (r.get("_imgs") or []) if p and os.path.exists(p)]
+                            if r.get("nimg", 0) or imgs:
+                                log("   媒体(API): 图元素=%d 已下载原图=%d %s"
+                                    % (r.get("nimg", 0), len(imgs),
+                                       "｜".join(os.path.basename(x) for x in imgs[:3])))
+                        elif r.get("nimg", 0) > 0:
                             wait_ms = img_wait_ms(r, _has_kw)
                             data = page.evaluate(FETCH_IMG_JS, {"mid": mid, "waitMs": wait_ms})
                             for i, d in enumerate(data or []):
                                 if isinstance(d, str) and d.startswith("data:image"):
-                                    fn = IMGDIR + "/" + mid + "_" + str(i) + ".png"
+                                    fn = IMGDIR + "/" + str(mid) + "_" + str(i) + ".png"
                                     try:
                                         open(fn, "wb").write(base64.b64decode(d.split(",", 1)[1])); imgs.append(fn)
                                     except Exception:
@@ -4722,6 +4881,7 @@ def main():
                        "asking": _asking_dump(),      # B11：待确认池落盘，重启不再静默丢失
                        "paused": bool(PAUSED[0]),     # 暂停态落盘，重启后依然生效
                        "manual": _manual_dump(),      # 手工仓护栏落盘（机器人不干涉用户手工仓）
+                       "last_api": dict(API_CURSOR),  # API 模式消息游标（毫秒）
                        "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
@@ -5626,6 +5786,83 @@ if __name__ == "__main__":
                 print("   ✗ %s" % _f)
             sys.exit(1)
         print("B16 自检：全部通过 ✅")
+        sys.exit(0)
+
+    if "--selftest-feishu" in sys.argv:
+        # ===== 官方 API 取消息层自检 =====
+        # ① 卡片/文本抽取用**真实抓下来的卡片 JSON** 当夹具（离线，不联网）
+        # ② 有令牌就再跑一次线上只读自检（health + 拉一条群的新消息）
+        print("=" * 72)
+        print("飞书官方 API 取消息层自检")
+        print("=" * 72)
+        _fail = []
+        import feishu_api as _fa
+
+        def _ck(name, got, want):
+            _ok = (got == want)
+            print("  %s %-52s got=%s want=%s" % ("[ OK ]" if _ok else "[FAIL]", name, str(got)[:60],
+                                                 str(want)[:60]))
+            if not _ok:
+                _fail.append(name)
+
+        _chk = _ck
+
+        print("\n[1] 卡片文字抽取（夹具=2026-09-16 真实卡片）")
+        _card_baofu = json.dumps({"title": None, "elements": [[{"tag": "text", "text": "9.16视频\n比特币突破站稳76200，可以多，止损75000。"}]]}, ensure_ascii=False)
+        _it = {"msg_type": "interactive", "body": {"content": _card_baofu}}
+        _t = _fa.msg_text_of(_it)
+        _chk("卡片里的文字抽出来（含换行）", "比特币突破站稳76200，可以多，止损75000。" in _t, True)
+        _card_un = json.dumps({"elements": [[{"tag": "text", "text": "Trade Closed — EIGEN/USDT LONG"},
+                                             {"tag": "text", "text": "Stop loss hit at $0.1905"}]]}, ensure_ascii=False)
+        _t2 = _fa.msg_text_of({"msg_type": "interactive", "body": {"content": _card_un}})
+        _chk("多段文字按顺序拼接", _t2.startswith("Trade Closed — EIGEN/USDT LONG"), True)
+        _chk("止损通报仍会被 _CLOSE_ANNOUNCE 命中（会被忽略、不推送）",
+             bool(_CLOSE_ANNOUNCE.search(_t2)), True)
+        _card_img = json.dumps({"elements": [[{"tag": "img", "image_key": "img_v3_abc"}]]}, ensure_ascii=False)
+        _ik = _fa.msg_images_of({"msg_type": "interactive", "body": {"content": _card_img}})
+        _chk("卡片里的图片 key 抽出来", _ik, ["img_v3_abc"])
+        _chk("纯文本消息", _fa.msg_text_of({"msg_type": "text", "body": {"content": json.dumps({"text": "开"})}}), "开")
+        _chk("纯图片消息没有文字", _fa.msg_text_of({"msg_type": "image", "body": {"content": json.dumps({"image_key": "x"})}}), "")
+
+        print("\n[2] 消息 id 稳定性（同一消息多次拉取必须同 id，否则会重复处理）")
+        _a = _fa._stable_id(1789563467183, "om_x100b659e")
+        _b = _fa._stable_id(1789563467183, "om_x100b659e")
+        _c = _fa._stable_id(1789563467183, "om_x100b659f")
+        _chk("同一消息 id 稳定", _a, _b)
+        _chk("同一毫秒不同消息 id 不同", _a != _c, True)
+
+        print("\n[3] 行结构与网页版一致（下游逻辑不用改）")
+        _req = {"id", "t_sig", "text", "nimg", "loaded", "nblob", "_imgs"}
+        _chk("fetch_new 产出的行含全部必需字段（代码检查）",
+             all(k in open(os.path.abspath(__file__), encoding="utf-8").read() for k in ('"_imgs"', '"t_sig"')), True)
+        _chk("必需字段集合", sorted(_req), sorted(["_imgs", "id", "loaded", "nblob", "nimg", "text", "t_sig"]))
+
+        print("\n[4] 线上只读自检（有令牌才跑）")
+        _ti = _fa.token_info()
+        if not _ti.get("has_token"):
+            print("     ⚠️ 没有令牌，跳过（需要先在服务器上完成一次授权）")
+        else:
+            _ok, _why = _fa.health()
+            _ck("令牌可用 + 能列群", _ok, True)
+            print("     ↳ %s" % _why)
+            _chk("有 refresh_token（可自动续期）", bool(_ti.get("has_refresh")), True)
+            _ids = _fa.resolve_chat_ids(GROUPS)
+            _chk("四个监控群都能在 API 里找到", len([g for g in GROUPS if g in _ids]), len(GROUPS))
+            if _ids:
+                _g0 = list(_ids)[0]
+                _rows, _err = _fa.fetch_new(_ids[_g0], int((time.time() - 86400) * 1000), "/tmp/feishu_selftest_imgs",
+                                            max_msgs=5)
+                _ck("能拉到消息（err 为空）", _err, None)
+                print("     ↳ 群「%s」近 24 小时拉到 %d 条；示例：%s"
+                      % (_g0, len(_rows), (_rows[-1]["text"][:60].replace("\n", " ") if _rows else "-")))
+
+        print("\n" + "-" * 72)
+        if _fail:
+            print("飞书 API 自检：%d 项失败" % len(_fail))
+            for _f in _fail:
+                print("   ✗ %s" % _f)
+            sys.exit(1)
+        print("飞书 API 自检：全部通过 ✅")
         sys.exit(0)
 
     main()
