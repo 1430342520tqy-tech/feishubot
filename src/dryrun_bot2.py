@@ -4004,83 +4004,86 @@ def main():
                 log("   ↳ [%s] 首次用 API：游标从 10 分钟前开始（不回补更早的历史）" % _g)
         log("==== 取消息模式：飞书官方 API（不需要浏览器，重启没有 4.5 分钟盲窗）====")
         log("==== 开始实时监控（%d 个群，API 模式）====" % len(GROUPS))
-    with sync_playwright() as p:
-      if not _api_ok:
-        try:
-            ctx = launch_persistent(p, BASE + "/fs_bot")
-        except Exception as _e0:
-            # 启动失败最常见的原因：上一次崩溃残留下来的 Singleton 锁 / 孤儿 chrome 占着 profile。
-            # ⚠️ 只杀 ppid==1 的孤儿 chrome，绝不动正在被其它进程正常使用的浏览器。
-            log("浏览器首次启动失败：%s" % str(_e0)[:120])
-            log("   ↳ 清理孤儿 chrome + profile 锁后重试一次（只杀孤儿，不碰正常浏览器）")
-            _k = kill_profile_chrome(BASE + "/fs_bot", orphan_only=True)
-            if _k:
-                log("   ↳ 已清理孤儿 chrome：%s" % _k)
-            _g = clear_singleton_locks(BASE + "/fs_bot")
-            if _g:
-                log("   ↳ 已清理 profile 锁：%s" % _g)
-            ctx = launch_persistent(p, BASE + "/fs_bot")
-        pages = {}
-        # 打开页面后的统一处理：⚠️ 绝不把游标抬到"页面最新"，否则停机期间的消息会被静默吞掉
-        def adopt_page(g, rows):
-            """返回该群停机积压条数；None 表示没读到消息。仅对无游标的新群做初始化。"""
-            ids = [int(r["id"]) for r in rows if r.get("id")]
-            if not ids:
-                return None
-            newest = max(ids)
-            saved = last_id.get(g, 0)
-            if saved <= 0:
-                last_id[g] = newest
-                log("   ↳ [%s] 无历史游标（首次运行/新增群），游标初始化为页面最新 %s，不回补历史"
-                    % (g, datetime.datetime.fromtimestamp(newest >> 32, CST).strftime("%m-%d %H:%M:%S")))
-                return 0
-            gap = sorted([r for r in rows if r.get("id") and int(r["id"]) > saved],
-                         key=lambda r: int(r["id"]))
-            if gap:
-                log("   ↳ [%s] 停机期间积压 %d 条（%s ~ %s），本轮将按序回补"
-                    % (g, len(gap),
-                       datetime.datetime.fromtimestamp(int(gap[0]["id"]) >> 32, CST).strftime("%m-%d %H:%M"),
-                       datetime.datetime.fromtimestamp(int(gap[-1]["id"]) >> 32, CST).strftime("%m-%d %H:%M")))
-            else:
-                log("   ↳ [%s] 无积压，游标保持不变" % g)
-            return len(gap)
+    # 打开页面后的统一处理：⚠️ 绝不把游标抬到"页面最新"，否则停机期间的消息会被静默吞掉
+    # （只被浏览器模式用到；定义在 guard 之外，好让主循环里的"重开页面"分支也能调它）
+    def adopt_page(g, rows):
+        """返回该群停机积压条数；None 表示没读到消息。仅对无游标的新群做初始化。"""
+        ids = [int(r["id"]) for r in rows if r.get("id")]
+        if not ids:
+            return None
+        newest = max(ids)
+        saved = last_id.get(g, 0)
+        if saved <= 0:
+            last_id[g] = newest
+            log("   ↳ [%s] 无历史游标（首次运行/新增群），游标初始化为页面最新 %s，不回补历史"
+                % (g, datetime.datetime.fromtimestamp(newest >> 32, CST).strftime("%m-%d %H:%M:%S")))
+            return 0
+        gap = sorted([r for r in rows if r.get("id") and int(r["id"]) > saved],
+                     key=lambda r: int(r["id"]))
+        if gap:
+            log("   ↳ [%s] 停机期间积压 %d 条（%s ~ %s），本轮将按序回补"
+                % (g, len(gap),
+                   datetime.datetime.fromtimestamp(int(gap[0]["id"]) >> 32, CST).strftime("%m-%d %H:%M"),
+                   datetime.datetime.fromtimestamp(int(gap[-1]["id"]) >> 32, CST).strftime("%m-%d %H:%M")))
+        else:
+            log("   ↳ [%s] 无积压，游标保持不变" % g)
+        return len(gap)
 
-        catchup_total = 0
+    # ⚠️ 这里只有**浏览器模式**要启动 Chromium 并逐群开页；API 模式完全不碰浏览器。
+    #    （2026-09-16 沙箱端到端验证抓到过一个真 bug：主循环曾被误缩进到这个 guard 里面，
+    #      API 模式下会"启动完就退出" → pm2 无限重启。所以主循环必须在 guard 之外。）
+    catchup_total = 0          # 两种模式都要有这个变量（后面汇总通报会用到）
+    with sync_playwright() as p:
         if not _api_ok:
-          for g in GROUPS:
-            pg, rows = open_group_page(ctx, g)
-            pages[g] = pg
-            ids = [int(r["id"]) for r in rows if r.get("id")]
-            if ids:
-                log("[%s] 已打开 | 页面最新 %s | 本群游标 %s | 末条=%s" % (
-                    g, datetime.datetime.fromtimestamp(max(ids) >> 32, CST).strftime("%m-%d %H:%M:%S"),
-                    (datetime.datetime.fromtimestamp(last_id[g] >> 32, CST).strftime("%m-%d %H:%M:%S")
-                     if last_id.get(g) else "无"),
-                    (rows[-1].get("text") or "")[:36]))
-                _n = adopt_page(g, rows)
-                if _n:
-                    catchup_total += _n
-                try:                      # 方案C 前置调研：只读诊断，记录 URL 与 chat-id 候选
-                    _ci = pg.evaluate(CHATID_JS)
-                    log("   ↳ [%s] URL=%s ｜ chat-id 候选: %s"
-                        % (g, _ci.get("url"), " ; ".join(_ci.get("hits") or []) or "未找到"))
-                except Exception as _e:
-                    log("   ↳ [%s] chat-id 探测失败 %s" % (g, str(_e)[:60]))
-            else:
-                # ⚠️ 2026-09-16 实测缺陷：原来打不开也照样 pages[g]=pg（一个**没通过标题校验**的页面），
-                #    而主循环只在 pages[g] 为 None 或已关闭时才重开 → 这个群会**一直停在错误的页面上**：
-                #    既读不到该群消息（静默变瞎），又可能把别的会话的消息当成这个群的信号（串台）。
-                #    现在：关掉这个未经验证的页面、置 None（交给主循环持续重开），并**立即告警**。
-                log("[%s] 打开失败（未读到消息）→ 该群暂不监控，交给主循环持续重开" % g)
-                try:
-                    pg.close()
-                except Exception:
-                    pass
-                pages[g] = None
-                notify("【机器人告警】群「%s」这次开机没能打开（已重试 6 次：会话列表点击 + Ctrl+K 搜索）\n"
-                       "这个群现在是**盲区**，我会在主循环里继续重开；期间它发的新信号可能收不到。" % g)
-        if not _api_ok:
+            try:
+                ctx = launch_persistent(p, BASE + "/fs_bot")
+            except Exception as _e0:
+                # 启动失败最常见的原因：上一次崩溃残留下来的 Singleton 锁 / 孤儿 chrome 占着 profile。
+                # ⚠️ 只杀 ppid==1 的孤儿 chrome，绝不动正在被其它进程正常使用的浏览器。
+                log("浏览器首次启动失败：%s" % str(_e0)[:120])
+                log("   ↳ 清理孤儿 chrome + profile 锁后重试一次（只杀孤儿，不碰正常浏览器）")
+                _k = kill_profile_chrome(BASE + "/fs_bot", orphan_only=True)
+                if _k:
+                    log("   ↳ 已清理孤儿 chrome：%s" % _k)
+                _gk = clear_singleton_locks(BASE + "/fs_bot")
+                if _gk:
+                    log("   ↳ 已清理 profile 锁：%s" % _gk)
+                ctx = launch_persistent(p, BASE + "/fs_bot")
+            pages = {}
+            for g in GROUPS:
+                pg, rows = open_group_page(ctx, g)
+                pages[g] = pg
+                ids = [int(r["id"]) for r in rows if r.get("id")]
+                if ids:
+                    log("[%s] 已打开 | 页面最新 %s | 本群游标 %s | 末条=%s" % (
+                        g, datetime.datetime.fromtimestamp(max(ids) >> 32, CST).strftime("%m-%d %H:%M:%S"),
+                        (datetime.datetime.fromtimestamp(last_id[g] >> 32, CST).strftime("%m-%d %H:%M:%S")
+                         if last_id.get(g) else "无"),
+                        (rows[-1].get("text") or "")[:36]))
+                    _n = adopt_page(g, rows)
+                    if _n:
+                        catchup_total += _n
+                    try:                      # 方案C 前置调研：只读诊断，记录 URL 与 chat-id 候选
+                        _ci = pg.evaluate(CHATID_JS)
+                        log("   ↳ [%s] URL=%s ｜ chat-id 候选: %s"
+                            % (g, _ci.get("url"), " ; ".join(_ci.get("hits") or []) or "未找到"))
+                    except Exception as _e:
+                        log("   ↳ [%s] chat-id 探测失败 %s" % (g, str(_e)[:60]))
+                else:
+                    # ⚠️ 2026-09-16 实测缺陷：原来打不开也照样 pages[g]=pg（一个**没通过标题校验**的页面），
+                    #    而主循环只在 pages[g] 为 None 或已关闭时才重开 → 这个群会**一直停在错误的页面上**：
+                    #    既读不到该群消息（静默变瞎），又可能把别的会话的消息当成这个群的信号（串台）。
+                    #    现在：关掉这个未经验证的页面、置 None（交给主循环持续重开），并**立即告警**。
+                    log("[%s] 打开失败（未读到消息）→ 该群暂不监控，交给主循环持续重开" % g)
+                    try:
+                        pg.close()
+                    except Exception:
+                        pass
+                    pages[g] = None
+                    notify("【机器人告警】群「%s」这次开机没能打开（已重试 6 次：会话列表点击 + Ctrl+K 搜索）\n"
+                           "这个群现在是**盲区**，我会在主循环里继续重开；期间它发的新信号可能收不到。" % g)
             log("==== 开始实时监控（%d 个页面）====" % len(pages))
+        # ===== 以下两种模式都跑：落盘状态 → 预热行情 → 主循环 =====
         # ⚠️ 不要在这里写 {"open": []}，会把已恢复的持仓清空（曾经踩过这个坑）
         json.dump({"open": open_pos, "last": last_id, "seen": sorted(SEEN)[-800:], "risk": RISK,
                    "asking": _asking_dump(),
