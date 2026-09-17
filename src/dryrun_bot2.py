@@ -1044,7 +1044,9 @@ def _self_marks():
             "【实盘·看门狗】", "【实盘·部分成交】", "【实盘动作失败·需要处理】",
             "【失联看门狗】", "【启动对账失败】",
             # 🆕 2026-09-16 官方 API 取消息层新增的两条告警（自检 8g 抓出来的）
-            "【取消息】", "【取消息告警】"]
+            "【取消息】", "【取消息告警】",
+            # 🆕 2026-09-17：新加的"没看懂就回话"提示（[8g] 自检当场抓出来的，见 [8l]）
+            "【指令·没看懂】"]
 
 
 SELF_MARKS = _self_marks()
@@ -3176,8 +3178,14 @@ def _strip_time(x):
     """去掉行首的时间戳（如 "10:17 "）。"""
     return re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x or "", flags=re.I).strip()
 
-
-_REPLY_WORD = r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)"
+_REPLY_WORD = (r"(开|开仓|开单|开吧|可以开|确认开|确认|下单|建仓|买入|买|执行|"
+               r"不开|别开|不要|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)")
+# ⚠️ 2026-09-17 生产实测（用户报障"我回复开仓，机器人没有理我"）：
+#   原来这张表只有「开|不开|作废|全部开|…」，而且判据是 re.fullmatch（整句必须一字不差）。
+#   用户回的是「**开仓**」→ 既不 fullmatch、又不含币种 → _is_ask_reply 返回 False
+#   → 消息掉到信号门槛 → 生产日志 `09:00:21 ↳ 闲聊/无关，跳过`，**一句话都不回**。
+#   现在把日常说法都收进来（开仓/开单/建仓/下单/确认…），并配一条"没认出来也必须回话"
+#   的兜底（_chitchat_hint），保证"你叫它、它必须应"。
 
 
 def _is_ask_reply(t):
@@ -3204,6 +3212,61 @@ def _is_ask_reply(t):
         if bool(_co and re.search(r"开|买|作废|不要", _ct)) or bool(re.fullmatch(_REPLY_WORD, _ct)):
             return True, _ct
     return False, ""
+
+
+def _is_self_app_row(g, sender_type):
+    """这条消息是不是**我们自己发的通知**？（2026-09-17 自环事故的根治——这是第 4 次栽在自环上了）
+
+    实测数据（生产真数据，详见 feishu_api.fetch_new 的注释）：
+      · 机器人自己的通知：sender_type="app"（自定义机器人 webhook 发的）
+      · 用户本人发的：sender_type="user"
+      · **KOL 群里的博主信号也是 "app"**，而且 app_id 与我们自己的 webhook **完全相同**
+        （同一个平台应用，只有 tenant_key 不同）⇒ 绝不能用"凡 app 发的就跳过"一刀切，
+        那会把**真信号全部杀光**。
+
+    判据取「群 + 发送者类型」这个组合：
+      · CMD_GROUPS 是**我们自己的群**，里面只会有两种消息：你发的 / 机器人自己发的；
+      · 博主信号只出现在 KOL 群，那些群不在 CMD_GROUPS 里 → 完全不受影响；
+      · 拿不到 sender_type 时（浏览器兜底模式）返回 False = 保持原行为，绝不误杀。
+
+    09-17 09:26 事故：机器人自己发的分币通知「· LSK 做多：开仓=未读到…」被它自己读回来，
+    正文里有币种 LSK + 一个"开"字 → 被判成"用户回复：开 LSK" → 在用户**没有回复**的情况下
+    执行了开单流程。本函数就是把这个入口关掉。
+    """
+    if not sender_type:
+        return False
+    if str(sender_type).lower() != "app":
+        return False
+    return g in CMD_GROUPS
+
+
+_HINT_LAST = [0.0]
+
+
+def _chitchat_hint(g, sender_type, txt):
+    """指令群里、你发的、但既不是指令也不是信号的消息 → **必须回一句**，绝不静默。
+
+    2026-09-17 实测：用户回「开仓」被判「闲聊/无关，跳过」吞掉，用户完全不知道机器人收没收到
+    （用户原话："我回复开仓，机器人没有理我，这个bug必须修好"）。
+    规矩（与设计原则"绝不静默丢弃"一致）：只要你在这个群里说了像指令的话，机器人必须回应。
+    """
+    if g not in CMD_GROUPS:
+        return False
+    if str(sender_type or "").lower() != "user":
+        return False                       # 我们自己发的通知不回；别人发的也不回
+    t = (txt or "").strip()
+    if not t or len(t) > 40:
+        return False
+    if not re.search(r"开|关|仓|单|平|止|损|盈|确认|模式|持仓|状态|帮助|撤|停|继续|对账|手工仓|金额|杠杆|上限|监控", t):
+        return False
+    if time.time() - _HINT_LAST[0] < 20:
+        log("   💬 指令群里没认出来的消息（%s）—— 20 秒内已提示过一次，不重复刷屏" % t[:20])
+        return True
+    _HINT_LAST[0] = time.time()
+    notify("【指令·没看懂】「%s」我没认出来，所以**什么都没做**。\n"
+           "可用：开 / 开仓 / 不开 / 只开 BTC / 全部不开 ｜ 持仓情况 ｜ 帮助" % t[:30])
+    log("   💬 指令群里没认出来的消息 → 已回提示（绝不静默）")
+    return True
 
 
 def _handle_ask_reply(t):
@@ -3330,7 +3393,9 @@ def handle_command(txt):
     #   根因：飞书对**同一发送者的连续消息会省略时间戳**，而 strip_sender_prefix 的昵称规则
     #   要求"昵称后面必须跟时间"，于是昵称留在了文本里 → "整条就是『开』"这个判据失败。
     #   现在：**把"去掉开头昵称"的形态也算候选**，并允许首尾标点/emoji。
-    _REPLY_WORD = r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)"
+    # ⚠️ 2026-09-17：这里本来就有一份**重复的** _REPLY_WORD（函数内局部变量），
+    #    而 _is_ask_reply() 读的是**模块级**那一份 —— 等于"改了这里，以为改了判定，其实毫无作用"。
+    #    （与"自检抄一遍正则"是同一类坑。）现在删掉重复定义，判定只留模块级一份。
     _ok_reply, _ct_reply = _is_ask_reply(t)
     if _ok_reply:
         return _handle_ask_reply(_ct_reply)
@@ -4498,6 +4563,16 @@ def main():
                                 or "（你的指令：" in txt or "本次盈亏：" in txt \
                                 or "该档盈亏：" in txt or "累计：" in txt:
                             continue
+                        # 🆕 2026-09-17 自环根治（00:34「不开」与 09:26「没回复却开单」两次事故）：
+                        #   我们自己发的通知在飞书里是 sender_type="app"；CMD_GROUPS 是**我们自己的群**，
+                        #   里面只会有"你发的"和"机器人发的"两种消息 → 指令群里 app 发的消息一律跳过：
+                        #   既不当信号解析，也**绝不当成你的指令**。
+                        #   ⚠️ 绝不能写成"凡 app 发的都跳过"：博主信号**也是 app 发的**（实测
+                        #      黄金mansoor / UA-nurseneil2 的卡片全是 app，且 app_id 与我们相同），
+                        #      那样会把真信号全杀光。所以只在 CMD_GROUPS 里生效，KOL 群行为不变。
+                        if _is_self_app_row(g, r.get("sender_type")):
+                            log("   ↳ 这是我们自己的通知（app 发送 + 指令群）→ 不当信号、也不当指令")
+                            continue
                         # 指令优先：只有在指定指令群里、由你发的短消息才会被当成指令
                         if g in CMD_GROUPS:
                             try:
@@ -4517,6 +4592,9 @@ def main():
                         has_img = msg_has_image(r)
                         if not _has_kw and not has_img:
                             log("   ↳ 闲聊/无关，跳过")
+                            # 🆕 2026-09-17：在**指令群**里、**你**发的、像指令却没认出来的消息，
+                            #   必须回一句（用户报障"我回复开仓，机器人没有理我"就是栽在这里）。
+                            _chitchat_hint(g, r.get("sender_type"), txt)
                             continue
                         t_found = time.time()
                         # 图：API 模式是**已经下载好的原图**（更清晰、更准）；浏览器模式才去抓 blob
@@ -4618,7 +4696,7 @@ def main():
                                          "多币种消息，已按币拆开；本条解析结果如上，请你单独确认"
                                          + (("；另外：" + _soft) if _soft else ""),
                                          quiet=True)
-                                notify("· %s %s：开仓=%s 止损=%s 止盈=%s"
+                                notify("【信号·分币】· %s %s：开仓=%s 止损=%s 止盈=%s"
                                        % (_c, "做多" if _dir_ == "LONG" else "做空",
                                           _pp.get("entry") if _pp.get("entry") is not None else "未读到",
                                           _pp.get("stop") if _pp.get("stop") is not None else "未读到",
@@ -5806,6 +5884,24 @@ if __name__ == "__main__":
         _missing = sorted(m for m in _used if not any(m.startswith(s[:6]) or s in m for s in SELF_MARKS))
         print("  源码里用到的通知前缀 %d 个：%s" % (len(_used), "、".join(sorted(_used))[:150]))
         _chk("没有漏登记的机器人通知前缀", _missing, [])
+        # 🆕 2026-09-17：上面那条只扫【】前缀 —— 而 09:26 的事故恰恰是一条**完全没有【】前缀**的通知
+        #   （有一条通知是 notify 配上「· 」开头的正文）被机器人自己读回去、当成了"你的回复"。
+        #   所以再加一条：**每一条 notify 字面量的开头都必须是【**（允许前面有 1 个 emoji 标记）。
+        #   ⚠️ 扫描前先剔掉**整行注释**：注释里举例写出来的 notify(…) 不是真代码，
+        #      第一版就因为它误报了一条（自检自己给自己挖的坑，如实记在这）。
+        _src_nc = "\n".join(ln for ln in _src.splitlines() if not ln.lstrip().startswith("#"))
+        _bad_lead = []
+        for _m in re.finditer(r"notify\(\s*(?:f)?\"([^\"]{0,240})", _src_nc):
+            _lit = _m.group(1)
+            if not _lit:
+                continue
+            if _lit.startswith("\n") or _lit.startswith("\\n"):
+                continue                      # notify("\n".join(L))：前缀在列表首元素里，另有人眼可查
+            if re.match(r"^[^【]{0,3}【", _lit):
+                continue
+            _bad_lead.append(_lit[:24])
+        print("  没有【】前缀的 notify 字面量 %d 条：%s" % (len(_bad_lead), _bad_lead[:4]))
+        _chk("所有 notify(...) 字面量都以【 开头（防裸前缀通知再被自己读回来）", _bad_lead, [])
         _chk("SELF_MARKS 含【手工仓护栏】（2026-09-16 实测漏过）", "【手工仓护栏】" in SELF_MARKS, True)
         _chk("SELF_MARKS 含【机器人告警】", "【机器人告警】" in SELF_MARKS, True)
         _chk("机器人自己的告警不会被当信号（实测那条原文）",
@@ -5980,6 +6076,64 @@ if __name__ == "__main__":
         _chk("路由：整条「不开」被认下并原样交给处理器", _is_ask_reply("用户963038 不开"), (True, "不开"))
         _chk("路由：整条「开」被认下", _is_ask_reply("用户963038 开")[0], True)
         ASKING.clear(); PENDING.clear()
+
+        # ---------- ⑧l 自环根治 + 「叫得动」（2026-09-17 两次生产事故）----------
+        # 事故① 09:26 用户**没回复**，机器人却自动执行了开单流程：
+        #   它自己发的分币通知「· LSK 做多：开仓=未读到…」被读回来，正文含币种 LSK + 一个"开"字
+        #   → 判成"用户回复：开 LSK"。事故② 09:00 用户回「开仓」，机器人**一句话都不回**。
+        print("\n[8l] 自环根治（sender 判定）与「叫得动」：复现 09:26 / 09:00 两次生产事故")
+
+        # ① 09:26 事故复刻：机器人自己发的通知（app 发送 + 指令群）绝不进入指令/信号流程
+        _self_text = "· LSK 做多：开仓=未读到 止损=未读到 止盈=未读到"
+        _chk("事故复刻：那条通知（app 发送 + 指令群）→ 必须跳过",
+             _is_self_app_row("机器人开单通知", "app"), True)
+        _chk("同一句话若是你发的（user）→ 不能跳过（否则你会叫不动它）",
+             _is_self_app_row("机器人开单通知", "user"), False)
+        # ⚠️ 本轮最容易改错的地方：博主信号**也是 app 发的**，一刀切会把真信号全杀光
+        _chk("KOL 群里的 app 消息（博主信号）→ 绝不跳过",
+             _is_self_app_row("黄金mansoor", "app"), False)
+        _chk("KOL 群里的 user 消息 → 不跳过", _is_self_app_row("黄金mansoor", "user"), False)
+        _chk("浏览器兜底模式（无 sender_type）→ 保持原行为，不跳过",
+             _is_self_app_row("机器人开单通知", None), False)
+        _chk("那条通知现在也带【信号·分币】前缀（第二层防护）",
+             any(_m in "【信号·分币】" + _self_text for _m in SELF_MARKS), True)
+        # 对照留证：字面判定**仍然**会把它当回复 —— 所以"关掉入口"是必需的，不是可选的
+        _reset_asking(["LSK"])
+        _chk("（对照）它若真被送进路由仍会被认成回复 → 故入口必须关掉",
+             _is_ask_reply(_self_text)[0], True)
+        ASKING.clear(); PENDING.clear()
+
+        # ② 09:00 事故复刻：你回「开仓」→ 必须认下、必须真的开
+        _reset_asking(["LSK"]); _SENT.clear()
+        _chk("路由：「开仓」被认下（旧代码是 False）", _is_ask_reply("开仓")[0], True)
+        _handle_ask_reply("开仓")
+        _chk("回「开仓」→ 待确认清空（不再挂着）", list(ASKING), [])
+        _chk("回「开仓」→ 真的放行出单", bool(PENDING.get("LSK", {}).get("approved")), True)
+        _chk("回「开仓」→ 通知里写明「收到『开』」", any("收到「开」" in _s for _s in _SENT), True)
+        for _w in ("开单", "下单", "建仓", "确认", "开吧"):
+            _reset_asking(["LSK"])
+            _chk("日常说法「%s」也必须被认下" % _w, _is_ask_reply(_w)[0], True)
+        ASKING.clear(); PENDING.clear()
+
+        # ③ 扩词不许碰坏方向安全：所有"不开"类说法仍然一律不开
+        for _w in ("不开", "别开", "不要", "作废"):
+            _reset_asking(["UNI"]); _SENT.clear()
+            _handle_ask_reply(_w)
+            _chk("扩词后「%s」仍然绝不开仓（也不许顺手放行）" % _w,
+                 (not PENDING.get("UNI", {}).get("approved")) and (not ASKING.get("UNI")), True)
+        ASKING.clear(); PENDING.clear()
+
+        # ④「没认出来也必须回话」（用户原话：我回复开仓，机器人没有理我）
+        _HINT_LAST[0] = 0.0; _SENT.clear()
+        _chk("不像指令的闲聊 → 不打扰", _chitchat_hint("机器人开单通知", "user", "那个什么来着"), False)
+        _HINT_LAST[0] = 0.0; _SENT.clear()
+        _chk("像指令却没认出来 → 必须回一句", _chitchat_hint("机器人开单通知", "user", "开仓呀"), True)
+        _chk("回话里写清「什么都没做」并给出可用说法",
+             any(("没看懂" in _s) and ("什么都没做" in _s) and ("帮助" in _s) for _s in _SENT), True)
+        _chk("KOL 群里不乱回话", _chitchat_hint("黄金mansoor", "user", "开仓呀"), False)
+        _chk("机器人自己的通知不回话", _chitchat_hint("机器人开单通知", "app", "开仓呀"), False)
+        _chk("超长正文不乱回话（阈值 40 字）",
+             _chitchat_hint("机器人开单通知", "user", "开" * 41), False)
 
         # ⑧ 高危开关：否定词不许被当成"开"（实盘/测试模式原来用 `"开" in cmd` 判定）
         _chk("「实盘模式 不要开 确认」同时含 开+确认（所以必须靠否定词挡住）",

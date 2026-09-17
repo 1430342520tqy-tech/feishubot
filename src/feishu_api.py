@@ -341,8 +341,23 @@ def fetch_messages(chat_id, start_time=None, end_time=None, page_size=50, max_pa
 def fetch_new(chat_id, since_ms, img_dir, want_images=True, max_msgs=60, skip_ids=None):
     """拉"比 since_ms 新"的消息，产出与网页版 SCAN_JS **同结构**的行：
         {"id": int, "t_sig": int(秒), "text": str, "nimg": n, "loaded": n, "nblob": n,
-         "_imgs": [已下载的原图路径], "msg_id": str, "msg_type": str}
+         "_imgs": [已下载的原图路径], "msg_id": str, "msg_type": str,
+         "sender_type": "user"/"app"/None, "sender_id": str/None, "sender_id_type": str/None}
     这样下游的解析/审批/下单逻辑一行都不用改。
+
+    🆕 2026-09-17：把**发送者**一并带出来（自环防护用，实测数据在下面这段注释里）。
+
+    ⚠️ 实测（2026-09-17，生产真数据，别凭印象推翻）：
+      · 机器人自己的通知（自定义机器人 webhook 发的）→ {"sender_type": "app",
+          "id": "cli_c08abc1da138d00f", "id_type": "app_id"}
+      · 用户本人发的消息                              → {"sender_type": "user",
+          "id": "ou_ef47…", "id_type": "open_id"}
+      · **KOL 群里的博主信号同样是 "app"**（黄金mansoor / UA-nurseneil2 的卡片全是 app），
+        而且 app_id **和我们自己的 webhook 一模一样**（同一个平台应用），只有 tenant_key 不同。
+        ⇒ 所以绝对不能用"凡是 app 发的就跳过"来防自环 —— 那样会把**真信号全部杀光**。
+          正确做法：只在**我们自己的群**（CMD_GROUPS）里把 app 消息当成"自己的通知"（见
+          dryrun_bot2._is_self_app_row）。
+    
     skip_ids：已经处理过的消息 id 集合（传 SEEN 进来）——**在下载图片之前就跳过**，
               否则那 5 秒回看窗口里的图每轮都会被重复下载。
     """
@@ -368,9 +383,15 @@ def fetch_new(chat_id, since_ms, img_dir, want_images=True, max_msgs=60, skip_id
             p = download_image(mid, ik, img_dir)
             if p:
                 imgs.append(p)
+        _sd = it.get("sender") or {}
         rows.append({"id": _sid, "t_sig": cms // 1000, "text": txt,
                      "nimg": len(keys), "loaded": len(imgs), "nblob": len(imgs),
-                     "_imgs": imgs, "msg_id": mid, "msg_type": it.get("msg_type")})
+                     "_imgs": imgs, "msg_id": mid, "msg_type": it.get("msg_type"),
+                     # 发送者：id 是**字符串**（app 时是 app_id、user 时是 open_id），id_type 说明是哪种
+                     "sender_type": _sd.get("sender_type") or None,
+                     "sender_id": _sd.get("id") or None,
+                     "sender_id_type": _sd.get("id_type") or None,
+                     "sender_tenant": _sd.get("tenant_key") or None})
     return rows, None
 
 
