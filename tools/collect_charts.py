@@ -11,8 +11,8 @@
 
 产出：
     <out>/images/  20260901_143252_<msgid>_0.jpg   （文件名开头就是时间 → 天生按时间排序）
-    <out>/索引.csv       文件名,群,时间,消息文本前80字,图序号
-    <out>/标准答案.csv   文件名,群,时间,方向,开仓,止损,止盈1,止盈2,止盈3   ← 你只需要填后 6 列
+    <out>/index.csv      文件名,群,时间,消息文本前80字,图序号
+    <out>/truth.csv      文件名,群,时间,方向,开仓,止损,止盈1,止盈2,止盈3   ← 你只需要填后 6 列
 只读飞书（用户身份令牌），不下任何单；图片只写到 --out 目录。
 """
 import os
@@ -86,12 +86,12 @@ def main():
                              "时间": when.strftime("%Y-%m-%d %H:%M:%S"),
                              "消息文本前80字": txt[:80], "图序号": i})
     rows.sort(key=lambda r: (r["文件名"]))
-    idx_p = os.path.join(out, "索引.csv")
+    idx_p = os.path.join(out, "index.csv")
     with open(idx_p, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["文件名", "群", "时间", "消息文本前80字", "图序号"])
         w.writeheader()
         w.writerows(rows)
-    tru_p = os.path.join(out, "标准答案.csv")
+    tru_p = os.path.join(out, "truth.csv")
     with open(tru_p, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["文件名", "群", "时间", "方向", "开仓", "止损", "止盈1", "止盈2", "止盈3"])
