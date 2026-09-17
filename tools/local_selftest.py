@@ -38,8 +38,14 @@ H = "/tmp/local_selftest"
 STUBS = H + "/stubs"
 SANDBOX = H + "/sandbox"
 
-# 能跑的分支（feishu 要真网络、imgmerge 要真实图片 → 排除）
-BRANCHES = ["ledger", "exec", "chartllm", "parse", "tp", "b5", "b1", "approval"]
+# 能跑的分支：
+#   · feishu    → 要真网络（调飞书接口）
+#   · imgmerge  → 要真实图片
+#   · b1        → 要**真浏览器**：它的第 [2] 段就是"真启动浏览器再杀掉，看能不能自愈"，
+#                  而本机自检台把 playwright 桩成「自检台：不启动浏览器」→ 在这里必然崩
+#                  （2026-09-18 dev 分支实测踩到；不是逻辑错，是环境不匹配）
+#                  → b1 请到服务器上跑：python src/dryrun_bot2.py --selftest-b1
+BRANCHES = ["ledger", "exec", "chartllm", "parse", "tp", "b5", "approval"]
 KEYS = ("自检：", "通过 ✅", "全部通过")
 
 # 币种表：生产机上由单独的抓取脚本生成，本机给一份够用的

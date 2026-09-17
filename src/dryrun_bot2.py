@@ -50,6 +50,30 @@ LOGF = _P["LOGF"]
 TRADES = _P["TRADES"]
 STATE = _P["STATE"]
 
+# 🆕 2026-09-18（dev 分支实测发现）：自检里要读**真实部署目录**的文件（生产 run.log / state.json /
+#   runtime_config.json）时，**不能直接用 BASE** —— 在 dev 目录或 /tmp 沙箱里跑自检时，
+#   BASE 指向的是那个新目录，那些文件根本不存在 → 自检直接 FileNotFoundError 崩掉
+#   （实测：b1 分支在全新目录里就是崩在这一步）。
+#   这里统一成"部署目录优先、BASE 兜底、两处都没有就返回 None（调用方自己容错）"。
+PROD_BASE = os.environ.get("SIGNALBOT_PROD_BASE") or "/home/ubuntu/signal-bot"
+
+
+def _prod_file(rel):
+    for _b in (PROD_BASE, BASE):
+        _p = os.path.join(_b, rel)
+        if os.path.exists(_p):
+            return _p
+    return None
+
+
+def _mtime_str(rel):
+    """自检里打印"部署文件最后修改时间"用；文件不在就明确写出来，不崩。"""
+    _p = _prod_file(rel)
+    if not _p:
+        return "（找不到该文件）"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(_p)))
+
+
 # 密钥：变量名与来源只在 config.py 里定义一次（**只从 .env / 环境变量读**）
 DS_KEY = config.secrets()["deepseek_api_key"]
 DS_API = "https://api.deepseek.com/chat/completions"
@@ -1393,7 +1417,11 @@ def _self_marks():
             # 🆕 2026-09-16 官方 API 取消息层新增的两条告警（自检 8g 抓出来的）
             "【取消息】", "【取消息告警】",
             # 🆕 2026-09-17：新加的"没看懂就回话"提示（[8g] 自检当场抓出来的，见 [8l]）
-            "【指令·没看懂】"]
+            "【指令·没看懂】",
+            # 🆕 2026-09-18：配置收敛到 .env 时新增的启动告警（[8g] 自检在 dev 分支上当场抓到：
+            #    这两个前缀没登记 → 机器人会把自己的启动告警当成博主信号重新解析，
+            #    而这正是历史上出过 4 次的自环坑）。
+            "【启动告警】", "【启动失败】"]
 
 
 SELF_MARKS = _self_marks()
@@ -6545,9 +6573,10 @@ if __name__ == "__main__":
         import shutil
         _T = "/tmp/b1_selftest"
         # ① 按交接文档第十一节第 16 条：生产路径全部重定向到 /tmp（这就是隔离的证明）
-        _prod_log = BASE + "/v21/run.log"
-        _before_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
-        _before_size = os.path.getsize(_prod_log)
+        _prod_log = _prod_file("v21/run.log")     # 🆕 部署目录优先；在 dev/沙箱里没有也不会崩
+        _before_lines = (sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+                         if _prod_log else 0)
+        _before_size = os.path.getsize(_prod_log) if _prod_log else 0
         RUNTIME = _T + "/runtime_config.json"
         TRADES = _T + "/trades_dryrun.jsonl"
         STATE = _T + "/state.json"
@@ -6652,13 +6681,18 @@ if __name__ == "__main__":
 
         # ---------- ④ 隔离复核：生产文件一行都没动 ----------
         print("\n[3] 隔离复核")
-        _after_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        _after_lines = (sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+                        if _prod_log else _before_lines)
         # ⚠️ 判据修正（2026-09-16）：原来拿"行数不变"当隔离判据，但机器人进程本身每 10 秒写一条
         #    心跳，只要它活着行数必然涨 → 这个断言会**永远误报**（B1 自检要跑好几分钟，必中）。
         #    真判据：自检开始【之后新增】的那些行里，不许有本次自检写入的内容。
-        with open(_prod_log, "rb") as _f:
-            _f.seek(_before_size)
-            _appended = _f.read().decode("utf-8", "replace")
+        _appended = ""
+        if _prod_log:
+            with open(_prod_log, "rb") as _f:
+                _f.seek(_before_size)
+                _appended = _f.read().decode("utf-8", "replace")
+        else:
+            print("  （找不到部署日志 → 跳过「自检有没有写进生产日志」这项检查）")
         _leak = [l for l in _appended.splitlines()
                  if ("B1 自检" in l or "b1_selftest" in l or "自愈" in l and "B1" in l)]
         print("  生产 run.log 行数：自检前 %d → 自检后 %d（新增 %d 行）  %s"
@@ -6667,12 +6701,8 @@ if __name__ == "__main__":
         print("      ↳ 新增行示例：%s" % ((_appended.splitlines() or ["-"])[-1][:70]))
         if _leak:
             _fail.append("隔离：生产 run.log 被写入（%d 行）" % len(_leak))
-        print("  生产 state.json mtime          = %s"
-              % time.strftime("%Y-%m-%d %H:%M:%S",
-                              time.localtime(os.path.getmtime(BASE + "/v21/state.json"))))
-        print("  生产 runtime_config.json mtime = %s"
-              % time.strftime("%Y-%m-%d %H:%M:%S",
-                              time.localtime(os.path.getmtime(BASE + "/runtime_config.json"))))
+        print("  生产 state.json mtime          = %s" % _mtime_str("v21/state.json"))
+        print("  生产 runtime_config.json mtime = %s" % _mtime_str("runtime_config.json"))
         print("  自检当前时间                   = %s（上面两个 mtime 不应等于它）"
               % time.strftime("%Y-%m-%d %H:%M:%S"))
         print("  /tmp 自检产物：%s" % ", ".join(sorted(os.listdir(_T))))
@@ -6691,8 +6721,9 @@ if __name__ == "__main__":
         # 完全隔离在 /tmp：不碰生产配置/状态/日志，不发飞书，不下单
         import shutil
         _T = "/tmp/approval_selftest"
-        _prod_log = BASE + "/v21/run.log"
-        _before = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        _prod_log = _prod_file("v21/run.log")     # 🆕 同上：部署目录优先，dev/沙箱里没有也不崩
+        _before = (sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+                   if _prod_log else 0)
         shutil.rmtree(_T, ignore_errors=True)
         os.makedirs(_T, exist_ok=True)
         RUNTIME = _T + "/runtime_config.json"
@@ -6863,12 +6894,11 @@ if __name__ == "__main__":
 
         # ---------- ⑩ 隔离复核 ----------
         print("\n[10] 隔离复核")
-        _after = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        _after = (sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+                  if _prod_log else _before)
         _chk("生产 run.log 未被写入", _after, _before)
         print("  /tmp 产物：%s" % ", ".join(sorted(os.listdir(_T))))
-        print("  生产 runtime_config.json mtime = %s"
-              % time.strftime("%Y-%m-%d %H:%M:%S",
-                              time.localtime(os.path.getmtime(BASE + "/runtime_config.json"))))
+        print("  生产 runtime_config.json mtime = %s" % _mtime_str("runtime_config.json"))
 
         print("\n" + "-" * 70)
         if _fail:
@@ -7744,13 +7774,18 @@ if __name__ == "__main__":
 
         # ---------- ⑨ 隔离复核 ----------
         print("\n[9] 隔离复核（生产零写入）")
-        _after_lines = sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+        _after_lines = (sum(1 for _ in open(_prod_log, encoding="utf-8", errors="replace"))
+                        if _prod_log else _before_lines)
         # ⚠️ 不能拿"生产 run.log 行数不变"当隔离判据 —— 机器人自己每 10 秒就写一条心跳，
         #    行数必然会涨（第一次跑就这么误报了一次）。真判据是：
         #    **自检开始之后新增的那些行里，不许有任何一行来自本次自检**。
-        with open(_prod_log, "rb") as _f:
-            _f.seek(_before_size)
-            _appended = _f.read().decode("utf-8", "replace")
+        _appended = ""
+        if _prod_log:
+            with open(_prod_log, "rb") as _f:
+                _f.seek(_before_size)
+                _appended = _f.read().decode("utf-8", "replace")
+        else:
+            print("  （找不到部署日志 → 跳过「自检有没有写进生产日志」这项检查）")
         _leak = [l for l in _appended.splitlines()
                  if ("B16" in l or "📎" in l or "只识别到图" in l
                      or "imgmerge_selftest" in l or "已暂存" in l or "回填关联" in l)]
