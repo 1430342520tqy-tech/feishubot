@@ -401,6 +401,11 @@ def startup_reconcile():
                      % (s, real[s].get("positionAmt")))
         # 用户 2026-09-16 明确要求：交易所有、纸面没有的仓 = **用户手工仓，机器人不得有任何干涉**
         MANUAL_COINS.add(s[:-4] if s.endswith("USDT") else s)
+    # 🆕 2026-09-17：名单只会加不会减 → 按交易所实时持仓把"已经平仓的"移出去（用户实测报障）
+    _stale = _manual_prune(rsyms)
+    if _stale:
+        notify("ℹ️【手工仓护栏】已把**已经平仓**的币从名单移除：%s\n"
+               "（按交易所实时持仓核对；这些币以后有新信号会照常走审批）" % "、".join(_stale))
     if MANUAL_COINS:
         log("   [手工仓] 已登记 %d 个币为你的手工仓（机器人不会对它们发任何真单）：%s"
             % (len(MANUAL_COINS), "、".join(sorted(MANUAL_COINS))))
@@ -551,6 +556,26 @@ def manual_block(coin, action):
 
 def _manual_dump():
     return sorted(MANUAL_COINS)
+
+
+def _manual_prune(real_syms):
+    """按**交易所实时持仓**核对手工仓名单，把已经平仓的移出去。返回被移除的币（已排序）。
+
+    🆕 2026-09-17 用户实测报障：名单里还留着 LSK / XAU / XAUT（他早已平仓），
+    原因是这套名单**只会加、不会减**（每次启动从 state.json 原样恢复 + 只 add 新发现的），
+    唯一删除途径是手动发「解除手工仓 X」。危害不只是显示：
+    护栏里的币会被 `manual_block` **拒绝开新仓** → 这三个币即使来了真信号也会被拒。
+    ⚠️ 只在"读交易所持仓成功"时才会被调用（读失败时 startup_reconcile 已经 return，不会误删）。
+    """
+    _have = {str(s)[:-4] if str(s).endswith("USDT") else str(s) for s in (real_syms or [])}
+    _stale = sorted(c for c in list(MANUAL_COINS) if c not in _have)
+    for _c in _stale:
+        MANUAL_COINS.discard(_c)
+    if _stale:
+        log("   [手工仓] 按交易所实时持仓移除已平仓的 %d 个：%s（名单现在=%s）"
+            % (len(_stale), "、".join(_stale), "、".join(sorted(MANUAL_COINS)) or "空"))
+        STATE_DIRTY[0] = True
+    return _stale
 
 
 def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
@@ -748,7 +773,10 @@ def _cls(r, g, b):
     if g > 110 and r < 130 and b < 170: return "green"
     return None
 
-def _coverage(px, w, y0, y1):
+def _coverage(px, w, y0, y1, bg=(2, 24, 21)):
+    """一行里"与背景色差异足够大"的像素占比（= 这条线上有多少像素是被画出来的）。
+    🆕 2026-09-17：背景色改成**可传参** —— 浅色主题（白底）的图必须传白底，
+    否则"与深色底不同"对白底恒成立，覆盖率会恒等于 1.0，线判定全乱（实测过）。"""
     xa, xb = int(w * 0.06), int(w * 0.72)
     best = 0.0
     for yy in range(y0, y1):
@@ -756,7 +784,7 @@ def _coverage(px, w, y0, y1):
         for x in range(xa, xb, 2):
             r, g, b = px[x, yy]
             tot += 1
-            if abs(r - 2) + abs(g - 24) + abs(b - 21) > 30: cnt += 1
+            if abs(r - bg[0]) + abs(g - bg[1]) + abs(b - bg[2]) > 30: cnt += 1
         if tot and cnt / tot > best: best = cnt / tot
     return round(best, 3)
 
@@ -804,6 +832,17 @@ def _ocr_one_label(im, x0, t):
         return None
 
 
+def _same_number_loose(v1, v2):
+    """两次读数是不是**同一个数**（容忍小数点/千分位解析差异）。
+    🆕 2026-09-17 实测（黄金群那张浅色图）：同一个标签，两次读数分别是
+      `4257.925` 与 `4257925.0` —— 数字序列完全相同，只是小数点在解析时丢了。
+    旧逻辑按"相对差 ≤0.5%"判 → 差 1000 倍 → 判"不一致 → 未读到"，
+    结果**整张图的开仓/止损/止盈全部读不出**。这里按"数字序列"再判一次。"""
+    d1 = re.sub(r"[^0-9]", "", str(v1))
+    d2 = re.sub(r"[^0-9]", "", str(v2))
+    return bool(d1) and d1 == d2
+
+
 def two_read_ok(v_batch, v_single, tol=0.005):
     """两次**互相独立**的读数（批量拼图 / 单标签单独读）是否一致。
     返回 (是否可用, 采用值, 说明)。用户要求：不一致就标「未读到」，绝不猜。"""
@@ -816,6 +855,10 @@ def two_read_ok(v_batch, v_single, tol=0.005):
     v1, v2 = float(v_batch), float(v_single)
     if abs(v1 - v2) / max(abs(v2), 1e-9) <= tol:
         return True, v2, "两次一致"
+    if _same_number_loose(v_batch, v_single):
+        # 数字序列一致、只是小数点位置不同 → 取带小数点的那个（图上价格都带小数）
+        pick = v1 if ("." in str(v_batch) and "." not in str(v_single)) else v2
+        return True, pick, "两次数字序列一致（小数点解析差异）"
     return False, None, "两次读数不一致（%s vs %s）→ 按未读到处理" % (v1, v2)
 
 
@@ -1015,13 +1058,215 @@ def nearest_label_value(tags, predicted, tol=0.015):
     return best
 
 
-def _line_y(px, w, y0, y1):
+# ================= 🆕 2026-09-17 通用色块读图（**不看颜色**）=================
+# 用户原话（2026-09-17）：
+#   「第一张和第二张，分别是 ua 和黄金群发的开单图，ua 他用的是红色和绿色框，黄金群用的是灰色和蓝色框，
+#     你不管他是什么颜色，你要能够读出止盈止损和开仓价…你不能够死板地只用红色和绿色去区分是否为开仓信号。」
+# 实测（用户给的 4 张真图 + 服务器上的原图）：
+#   · 黄金那张（浅色主题）：蓝区 y=60..569（509px 高）、灰区 y=573..652（79px 高）→ 交界≈570
+#     = 开仓 4258 ｜ 止盈 4380（上面那块大的）｜ 止损 4239（下面那块小的）✓ 与图上标注一致
+#   · ua 那张（深色主题，半透明填充）：绿区在上、红区在下，共用边 = 开仓 4.3167
+# ⇒ 通用判据只有两条：**两片颜色均匀的填充区** + **谁大谁小**。颜色只当交叉校验。
+ZONE_QUANT = 8            # 颜色量化步长（把近似色归成一档）
+ZONE_TOL = 16             # 同色容差
+ZONE_MIN_COVER = 0.10     # 一行里该颜色至少占扫描宽度的 10% 才算"大片"
+ZONE_MIN_H = 18           # 一个区至少这么高（像素）
+ZONE_GAP = 10             # 两个区相隔多少像素内算"共用一条边"
+ZONE_MERGE_GAP = 30       # 同一块填充被横线（实测是那条白色虚线）切成两段时，隔多远仍算同一块
+
+
+def _zone_family(rgb):
+    """颜色只给一个**提示**：红/橙/褐/灰 → 偏止损空间；绿/蓝/青/白 → 偏止盈空间。
+    ⚠️ 它**只做交叉校验**，绝不单独用来判断角色 —— 每个群的配色不一样（用户 2026-09-17 明确要求）。
+    实测两组配色都能对上：ua 红+绿、黄金群 灰+蓝。"""
+    r, g, b = rgb[0], rgb[1], rgb[2]
+    mx, mn = max(rgb), min(rgb)
+    if mx - mn < 18:                     # 灰/白/黑（无彩色）
+        return "loss_hint" if mx < 245 else "profit_hint"
+    if r >= g and r >= b:
+        return "loss_hint"               # 红 / 橙 / 褐
+    if g >= r and g >= b:
+        return "profit_hint"             # 绿
+    if b >= r and b >= g:
+        return "profit_hint"             # 蓝 / 青
+    return "unknown"
+
+
+def find_zones(px, w, h):
+    """**不看颜色**地找博主用工具画的两片填充区（止损空间 / 止盈空间）。
+
+    做法：逐行统计"这一行里哪个颜色占了足够宽度"，再把颜色接近、纵向相连的行并成一个个"区"；
+    最后把整张图的底色（占行数最多的那个颜色）排除掉。
+    返回按高度从大到小排序的 [{"rgb","y0","y1","h","x0","x1"}]。
+    """
+    xa, xb = int(w * 0.04), int(w * 0.80)          # 只扫图表区，排除右侧价格轴
+    xs = list(range(xa, xb, 3))
+    if len(xs) < 10:
+        return []
+    need = max(8, int(len(xs) * ZONE_MIN_COVER))
+    bycol = {}
+    for y in range(h):
+        cnt = {}
+        for x in xs:
+            c = px[x, y]
+            k = (c[0] // ZONE_QUANT * ZONE_QUANT,
+                 c[1] // ZONE_QUANT * ZONE_QUANT,
+                 c[2] // ZONE_QUANT * ZONE_QUANT)
+            cnt[k] = cnt.get(k, 0) + 1
+        for k, n in cnt.items():
+            if n >= need:
+                bycol.setdefault(k, []).append(y)
+    if not bycol:
+        return []
+    # 底色 = 出现行数最多的颜色（整张图的背景），排除
+    bg = max(bycol.items(), key=lambda kv: len(kv[1]))[0]
+    segs = []
+    for k, ys in bycol.items():
+        if k == bg:
+            continue
+        # 🆕 2026-09-17 两种配色各踩过一个坑，判据必须同时避开：
+        #   ① 深色主题：背景还有第二个色调（(0,24,16) 旁边有 (0,16,16)），
+        #      它被当成"止损区" → 止损读成 4.2731（正确是 4.156）；
+        #   ② 浅色主题：灰色止损区的颜色是 (240,240,240)，离白底(248,248,248)只有 8 ——
+        #      **绝不能用"与背景接近"排除**，否则把真止损区杀掉（实测就是这么错的）。
+        #   所以只排除"**又深又无彩**"的颜色（那是背景/UI 底色），不碰任何浅色。
+        _mx, _mn = max(k), min(k)
+        if _mx < 40 and (_mx - _mn) < 20:
+            continue
+        ys = sorted(set(ys))
+        cur = [ys[0], ys[0]]
+        for y in ys[1:]:
+            if y - cur[1] <= 3:
+                cur[1] = y
+            else:
+                segs.append((k, cur[0], cur[1]))
+                cur = [y, y]
+        segs.append((k, cur[0], cur[1]))
+    # 合并"颜色接近 + 纵向重叠"的段（量化会把同一片区域拆成相邻几档色）
+    merged = []
+    for k, y0, y1 in sorted(segs, key=lambda t: (t[1], t[2])):
+        hit = None
+        for m in merged:
+            if (abs(m["rgb"][0] - k[0]) <= ZONE_QUANT
+                    and abs(m["rgb"][1] - k[1]) <= ZONE_QUANT
+                    and abs(m["rgb"][2] - k[2]) <= ZONE_QUANT
+                    and not (y1 < m["y0"] - ZONE_MERGE_GAP or y0 > m["y1"] + ZONE_MERGE_GAP)):
+                hit = m
+                break
+        if hit:
+            hit["y0"] = min(hit["y0"], y0)
+            hit["y1"] = max(hit["y1"], y1)
+        else:
+            merged.append({"rgb": k, "y0": y0, "y1": y1})
+    out = []
+    _scan_w = max(1, xb - xa)
+    for m in merged:
+        mh = m["y1"] - m["y0"]
+        if mh < ZONE_MIN_H:
+            continue
+        # 🆕 2026-09-17 实测（ua 那张状态图）：手机截图的**顶栏/底栏**也是大片同色，
+        #   结果被当成"止盈区"→ 开仓/止损/止盈全读成垃圾（5.3083/5.3083/5.3083）。
+        #   判据：贴住图片最上/最下边的、或者几乎占满整个扫描宽度的，都是 UI 而不是博主画的框。
+        if m["y0"] <= 3 or m["y1"] >= h - 4:
+            continue
+        ymid = (m["y0"] + m["y1"]) // 2
+        xh = [x for x in xs
+              if abs(px[x, ymid][0] - m["rgb"][0]) <= ZONE_TOL
+              and abs(px[x, ymid][1] - m["rgb"][1]) <= ZONE_TOL
+              and abs(px[x, ymid][2] - m["rgb"][2]) <= ZONE_TOL]
+        _w = (max(xh) - min(xh)) if xh else 0
+        # 🆕 2026-09-17 实测（黄金群那张）：**止损区横向占满整幅图**（这笔单子画得更早），
+        #   所以"占满整宽就是 UI 条"这条判据会误杀真色块 → 必须再加"很扁"这个条件才排除。
+        if _w >= _scan_w * 0.95 and mh < h * 0.08:
+            continue                                  # 又宽又扁 = UI 条/分隔线，不是仓位框
+        out.append({"rgb": m["rgb"], "y0": m["y0"], "y1": m["y1"], "h": mh,
+                    "x0": (min(xh) if xh else 0), "x1": (max(xh) if xh else 0), "w": _w})
+    out.sort(key=lambda z: -z["h"])
+    return out
+
+
+def read_zones(tags, zones, f, tp_tiers=3):
+    """用"两片填充区"的几何关系读出 方向 / 开仓 / 止损 / 止盈（**不看颜色**）。
+
+    规则（用户 2026-09-17 定）：
+      · 两个区**共用的那条边 = 开仓价**
+      · **小的那块 = 止损空间**，其远端边 = 止损价
+      · **大的那块 = 止盈空间**，远端边 = 末档止盈；框内的长横线 = 分档止盈
+      · 止损空间在**下方** → 做多；在**上方** → 做空
+      · 颜色只做交叉校验：颜色提示与"大小关系"矛盾 → conf="conflict"（不猜，标"需你确认"送审批）
+    """
+    if len(zones) < 2:
+        return None
+    # 取"上下相邻"的两块里最高的一对（相邻 = 共用一条边）
+    cand = None
+    for i in range(len(zones)):
+        for j in range(i + 1, len(zones)):
+            a, b = zones[i], zones[j]
+            top, bot = (a, b) if a["y0"] <= b["y0"] else (b, a)
+            gap = bot["y0"] - top["y1"]
+            if -ZONE_GAP <= gap <= ZONE_GAP * 2:
+                area = top["h"] + bot["h"]
+                if cand is None or area > cand[0]:
+                    cand = (area, top, bot)
+    if not cand:
+        return None
+    _area, top, bot = cand
+    if top["h"] == bot["h"]:
+        return None
+    if bot["h"] < top["h"]:
+        loss, prof, direction = bot, top, "LONG"      # 止损空间在下方 → 做多
+    else:
+        loss, prof, direction = top, bot, "SHORT"     # 止损空间在上方 → 做空
+    junc_y = (top["y1"] + bot["y0"]) // 2
+    sl_y = loss["y1"] if direction == "LONG" else loss["y0"]
+    tp_y = prof["y0"] if direction == "LONG" else prof["y1"]
+    pred = {"entry": axis_price(f, junc_y) if f else None,
+            "sl": axis_price(f, sl_y) if f else None,
+            "tp": axis_price(f, tp_y) if f else None}
+    entry = nearest_label_value(tags, pred["entry"], 0.02) if pred["entry"] else None
+    sl = nearest_label_value(tags, pred["sl"], 0.02) if pred["sl"] else None
+    tp_far = nearest_label_value(tags, pred["tp"], 0.02) if pred["tp"] else None
+    info = {"dir": direction, "junction_y": junc_y,
+            "edges": {"entry": junc_y, "sl": sl_y, "tp": tp_y},
+            "zone_loss": [loss["y0"], loss["y1"]], "zone_profit": [prof["y0"], prof["y1"]],
+            "rgb_loss": list(loss["rgb"]), "rgb_profit": list(prof["rgb"]), "pred": pred}
+    if not (entry and sl and tp_far):
+        info["why"] = "认出了两片色块，但边上的价格标签没读准（开仓=%s 止损=%s 止盈=%s）" % (entry, sl, tp_far)
+        info["ok"] = False
+        return info
+    rr = prof["h"] / float(max(1, loss["h"]))
+    fam_loss, fam_prof = _zone_family(loss["rgb"]), _zone_family(prof["rgb"])
+    conf = "high"
+    if fam_loss == "profit_hint" and fam_prof == "loss_hint":
+        conf = "conflict"                     # 颜色提示与"大小关系"完全相反 → 不猜
+    elif fam_loss == fam_prof:
+        conf = "low"
+    if rr < 1.0:
+        conf = "conflict"                     # 止盈空间比止损空间还小，不合常理
+    # 止盈空间里的长横线 = 分档止盈（按离入场由近到远）
+    inside = []
+    for t in tags:
+        v = t.get("value")
+        if not isinstance(v, (int, float)) or v <= 0 or t.get("cov", 0) < TP_MIN_COV:
+            continue
+        ly = t.get("line_y") or t.get("y")
+        if min(junc_y, tp_y) + 5 < ly < max(junc_y, tp_y) - 5:
+            if (v > entry) if direction == "LONG" else (v < entry):
+                inside.append(v)
+    near = sorted({round(x, 8) for x in inside}, key=lambda v: abs(v - entry))
+    tps = sorted(set(near[:tp_tiers - 1]) | {round(tp_far, 8)})
+    info.update({"ok": True, "entry": entry, "sl": sl, "tps": tps, "tps_all": tps,
+                 "conf": conf, "rr": round(rr, 2), "fam": [fam_loss, fam_prof]})
+    return info
+
+
+def _line_y(px, w, y0, y1, bg=(2, 24, 21)):
     """在 [y0,y1] 行里找"覆盖最好"的那一行 —— 那就是**线自己的行**。
     为什么不能用标签区域中心：区域里还含"印在线上方的那行标签文字"，
     中心会被文字往上拽十几到几十像素（实测这就是 0.5%~5% 的价格误差来源）。"""
     best, best_y = 0.0, (y0 + y1) // 2
     for yy in range(max(0, y0), y1 + 1):
-        c = _coverage(px, w, yy, yy + 1)
+        c = _coverage(px, w, yy, yy + 1, bg)
         if c > best:
             best, best_y = c, yy
     return round(best, 3), best_y
@@ -1052,13 +1297,120 @@ def _self_marks():
 SELF_MARKS = _self_marks()
 
 
+# ================= 🆕 2026-09-17 主题自适应（浅色底图也要能读）=================
+# 实测（用户 2026-09-17 给的黄金群那张）：它是**浅色主题（白底）**，而整套读图代码一直假设深色底：
+#   · `_cls` 是给"白字印在深底上"写的 → 浅底上的深色数字一律返回 None → **标签一个都找不到**；
+#   · `_coverage` 把"与 (2,24,21) 不同"当成"有线" → 白底上整行都算有线 → 覆盖率恒为 1.0 → 线判定全乱。
+# 处理：先判主题，浅色底换一个"与背景差异够大就算一类"的分类器；深色底**一行不改**（不破坏已调好的读法）。
+BG_DARK = (2, 24, 21)
+
+
+def _theme_and_bg(px, w, h):
+    """返回 (theme, bg)：theme ∈ {"dark","light"}；bg = 采样里最常见的那种颜色。"""
+    cnt = {}
+    for y in range(0, h, 7):
+        for x in range(int(w * 0.03), int(w * 0.75), 7):
+            c = px[x, y]
+            k = (c[0] // 8 * 8, c[1] // 8 * 8, c[2] // 8 * 8)
+            cnt[k] = cnt.get(k, 0) + 1
+    if not cnt:
+        return "dark", BG_DARK
+    bg = max(cnt.items(), key=lambda kv: kv[1])[0]
+    return ("light" if max(bg) > 190 else "dark"), bg
+
+
+def _cls_light(r, g, b, bg):
+    """浅色底的标签分类：**与背景差异够大**就归类，否则算背景。"""
+    if abs(r - bg[0]) + abs(g - bg[1]) + abs(b - bg[2]) <= 36:
+        return None
+    mx, mn = max(r, g, b), min(r, g, b)
+    if mx - mn < 40:
+        return "white" if mx > 200 else ("grey" if mx > 110 else "dark")
+    if r >= g and r >= b:
+        return "red" if (g < 110 and b < 110) else "orange"
+    if g >= r and g >= b:
+        return "green"
+    return "blue"
+
+
+def _edge_price_by_vision(im, w, h, edges):
+    """把三条边所在的**横条**裁出来，一次调用让视觉模型读"每条线右边对应的价格"。
+
+    用户原话（2026-09-17）：「重点在于那条线右边对应的价格，就是开仓价格」。
+    为什么需要它：浅色主题（白底）的图上，工具自己的小标签是**细字**，批量 OCR 经常读空，
+    但右侧价格轴 / 线上标注的数字是清楚的 —— 让模型只看这一条横条，成功率完全不同。
+    edges = {"entry": y, "sl": y, "tp": y}；返回 {"entry":..,"sl":..,"tp":..}（缺的键不出现）。
+    """
+    try:
+        tiles = []
+        for k in ("entry", "sl", "tp"):
+            y = int(edges.get(k) or 0)
+            y0 = max(0, y - 18)
+            y1 = min(h, y + 18)
+            if y1 - y0 < 8:
+                return {}
+            c = im.crop((0, y0, w, y1))
+            sc = 3 if c.width * 3 <= 2200 else 2
+            tiles.append(c.resize((c.width * sc, c.height * sc), Image.LANCZOS))
+        _hdr = ("这是**同一张 K 线图**上三条水平线各自所在的横条，顺序是：第1张=开仓线、"
+                "第2张=止损线、第3张=止盈线。请读出**每条线右边对应的价格数字**"
+                "（可能是线右侧的标签，也可能是最右侧价格轴上的数字）。"
+                "只输出 JSON：{\"entry\":<数字>,\"sl\":<数字>,\"tp\":<数字>}；读不到就写 null。")
+        content = [{"type": "text", "text": _hdr}]
+        for t in tiles:
+            import io
+            buf = io.BytesIO()
+            t.convert("RGB").save(buf, format="PNG")
+            content.append({"type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,"
+                                                 + base64.b64encode(buf.getvalue()).decode()}})
+        body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+                "messages": [{"role": "system", "content": "只读图上真实可见的数字，不确定就 null。"},
+                             {"role": "user", "content": content}]}
+        r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY,
+                                          "Content-Type": "application/json"},
+                          json=body, timeout=180)
+        txt = r.json()["choices"][0]["message"]["content"]
+        m = re.search(r"\{[\s\S]*\}", txt)
+        if not m:
+            log("   ⚠️ 按位置读数：模型没给出 JSON：%s" % str(txt)[:120])
+            return {}
+        d = json.loads(m.group(0))
+        out = {}
+        for k in ("entry", "sl", "tp"):
+            v = d.get(k)
+            if isinstance(v, str):
+                v = re.sub(r"[^0-9.]", "", v)
+            try:
+                fv = float(v)
+                if fv > 0:
+                    out[k] = fv
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        log("   ⚠️ 按位置读数失败：%s" % str(e)[:120])
+        return {}
+
+
 def read_chart(path):
     im = Image.open(path).convert("RGB"); w, h = im.size
     px = im.load()
-    x0, x1 = int(w * 0.76), int(w * 0.985)
+    _theme, _bg = _theme_and_bg(px, w, h)
+    if _theme == "light":
+        # 浅色底的图（实测黄金群那张）：价格标签是右侧的**普通文字**、且贴在最右边一列，
+        # 不像深色主题那样是一块实心色块 → 扫描带要放宽到最右，连续像素门槛要放低。
+        x0, x1, _run_min = int(w * 0.74), w, 12
+    else:
+        x0, x1, _run_min = int(w * 0.76), int(w * 0.985), 35
     band = im.crop((x0, 0, x1, h)); bw, bh = band.size
     bpx = band.load()
-    grid = [[_cls(*bpx[x, y]) for x in range(bw)] for y in range(bh)]
+    if _theme == "light":
+        grid = [[_cls_light(bpx[x, y][0], bpx[x, y][1], bpx[x, y][2], _bg)
+                 for x in range(bw)] for y in range(bh)]
+        log("   🎨 浅色主题图（白底）→ 用与背景差异判标签；背景=%s" % (_bg,))
+    else:
+        grid = [[_cls(*bpx[x, y]) for x in range(bw)] for y in range(bh)]
     rects = []
     for y in range(bh):
         x = 0
@@ -1067,7 +1419,7 @@ def read_chart(path):
             if not c: x += 1; continue
             x2 = x
             while x2 + 1 < bw and grid[y][x2 + 1] == c: x2 += 1
-            if x2 - x + 1 >= 35: rects.append({"c": c, "y": y, "x": x, "x2": x2})
+            if x2 - x + 1 >= _run_min: rects.append({"c": c, "y": y, "x": x, "x2": x2})
             x = x2 + 1
     groups = []
     for r in sorted(rects, key=lambda r: r["y"]):
@@ -1095,7 +1447,7 @@ def read_chart(path):
         except Exception:
             fv = None                      # ⚠️ 读不出也不许丢标签（下面会用单标签复核救回来）
         yc = (t["y1"] + t["y2"]) // 2
-        _cov, _ly = _line_y(px, w, max(0, yc - 25), min(h - 1, yc + 25))
+        _cov, _ly = _line_y(px, w, max(0, yc - 25), min(h - 1, yc + 25), _bg)
         tags.append({"y": yc, "line_y": _ly, "color": t["c"], "value": fv,
                      "text": str(v) if v is not None else None, "_reg": t, "cov": _cov})
     # ===== 关键标签逐个复核（用户 2026-09-16 选定）=====
@@ -1143,8 +1495,76 @@ def read_chart(path):
             verify["dropped"] += 1
             log("   ⚠️ 读图标签违反单调性 → 按未读到处理（%s，y=%d）" % (t["color"], t["y"]))
     tags = [t for t in tags if t.get("value")]
-    # ===== 🆕 几何优先：认得出"工具色框"就按框的语义定角色 =====
+    # ===== 🆕 2026-09-17 通用色块读图（**不看颜色**）—— 先走这条 =====
+    # 用户明确要求：「ua 用红绿框、黄金群用灰蓝框，你不管他什么颜色，都要读出止盈/止损/开仓价」。
+    # 判据只有"两片颜色均匀的填充区 + 谁大谁小"，颜色仅作交叉校验。旧的"只认暗红/暗绿"退居兜底。
     geo = {}
+    _axis = fit_axis_scale([(t.get("line_y") or t["y"], t["value"])
+                            for t in tags if t["cov"] >= TP_MIN_COV])
+    _zones = find_zones(px, w, h)
+    _zr = read_zones(tags, _zones, _axis) if len(_zones) >= 2 else None
+    if _zr and _zr.get("ok"):
+        log("   🧩 色块读图: %s | 开仓 %s 两区交界 y=%d | 止损 %s 止损区 y=%s | 止盈 %s | "
+            "置信=%s 盈亏比=%s 颜色提示=%s"
+            % (_zr["dir"], _zr["entry"], _zr["junction_y"], _zr["sl"], _zr["zone_loss"],
+               _zr["tps"], _zr["conf"], _zr["rr"], _zr["fam"]))
+        return {"ok": True, "sl": _zr["sl"], "entry": _zr["entry"],
+                "tps_all": _zr["tps_all"], "tps": _zr["tps"][:TP_TIERS], "tags": tags,
+                "lines": [{"value": t["value"], "color": t["color"], "cov": t["cov"]}
+                          for t in tags if t["cov"] >= TP_MIN_COV],
+                "verify": verify, "geo": geo, "zones": _zr, "mode": "zones"}
+    if _zr and not _zr.get("ok") and _theme == "light":
+        # 🆕 浅色主题兜底：色块认出来了、但小标签读不出 → 按"**那条线右边对应的价格**"再读一次
+        #    （用户 2026-09-17 原话：「重点在于那条线右边对应的价格，就是开仓价格」）
+        #    ⚠️ 只在浅色主题图上用这一条：深色主题的标签本来就读得好，没必要冒险。
+        _vp = _edge_price_by_vision(im, w, h, _zr.get("edges") or {})
+        _e, _s, _t = _vp.get("entry"), _vp.get("sl"), _vp.get("tp")
+        _good = bool(_e and _s and _t and
+                     ((_s < _e < _t) if _zr["dir"] == "LONG" else (_s > _e > _t)))
+        if _good:
+            # ⚠️⚠️ 2026-09-17 自检当场抓到的坑：视觉读数把 `6.513` 读成 `6513`（小数点丢了），
+            #   而"止损<开仓<止盈"的**大小关系照样成立** → 光看顺序会静默采用错价位。
+            #   所以再加两道：① 与图上已读到的其它标签**量级要相符**；② 三个价位不许差得离谱。
+            _ref = [t["value"] for t in tags
+                    if isinstance(t.get("value"), (int, float)) and t["value"] > 0]
+            if _ref:
+                _med = sorted(_ref)[len(_ref) // 2]
+                if not all(0.2 <= float(v) / _med <= 5.0 for v in (_e, _s, _t)):
+                    _good = False
+                    log("   ⚠️ 按位置读数与图上其它标签量级不符（读数 %s/%s/%s ｜ 图上标签中位 %s）→ 不采用"
+                        % (_e, _s, _t, _med))
+            if _good:
+                _rng = max(_e, _s, _t) / max(1e-9, min(_e, _s, _t))
+                if _rng > 3.0:
+                    _good = False
+                    log("   ⚠️ 按位置读数三个价位相差 %.2f 倍（不合常理）→ 不采用" % _rng)
+            _ty = _zr["edges"]["tp"]
+            _inside = []
+            for t in tags:
+                v = t.get("value")
+                ly = t.get("line_y") or t.get("y")
+                if not isinstance(v, (int, float)) or v <= 0 or t.get("cov", 0) < TP_MIN_COV:
+                    continue
+                if min(_zr["junction_y"], _ty) + 5 < ly < max(_zr["junction_y"], _ty) - 5:
+                    _inside.append(v)
+            _tps = sorted(set([round(x, 8) for x in _inside][:TP_TIERS - 1]) | {round(_t, 8)})
+            log("   🧩 色块 + 按位置读数：%s ｜ 开仓 %s（两区交界）｜ 止损 %s（止损区远端）｜ 止盈 %s"
+                % (_zr["dir"], _e, _s, _tps))
+            _zr2 = dict(_zr)
+            _zr2.update({"ok": True, "entry": _e, "sl": _s, "tps": _tps, "tps_all": _tps,
+                         "conf": "vision_edges", "why": None})
+            return {"ok": True, "sl": _s, "entry": _e, "tps_all": _tps,
+                    "tps": _tps[:TP_TIERS], "tags": tags,
+                    "lines": [{"value": t["value"], "color": t["color"], "cov": t["cov"]}
+                              for t in tags if t["cov"] >= TP_MIN_COV],
+                    "verify": verify, "geo": geo, "zones": _zr2, "mode": "zones+vision"}
+        log("   ↳ 按位置读数没通过校验（开仓=%s 止损=%s 止盈=%s 方向=%s）→ 退回旧的按颜色/标签规则"
+            % (_e, _s, _t, _zr["dir"]))
+        log("   ⚠️ 认出了两片色块但边上价格没读准 → 退回旧的按颜色/标签规则：%s" % _zr.get("why"))
+    if len(_zones) >= 2:
+        log("   ↳ 色块识别（不看颜色）找到 %d 片填充区：%s"
+            % (len(_zones), [(z["rgb"], z["y0"], z["y1"]) for z in _zones[:4]]))
+    # ===== 几何优先（旧）：认得出"工具色框"就按框的语义定角色 =====
     try:
         boxes = find_fill_boxes(px, w, h)
         if "green" in boxes and "red" in boxes:
@@ -1830,6 +2250,108 @@ def rawq_attach_pending(group, imgs, chart, meta=None, txt="", mid=None, now=Non
 def fmt_price(v):
     return ("%.8g" % v) if isinstance(v, (int, float)) else "未读到"
 
+# ================= 🆕 2026-09-17 "已持仓状态图 / 账户截图"不推送 =================
+# 用户原话：「第三张和第四张，分别是黄金群和 ua 群的已持仓状态，他们就是发群里说一下开仓情况，
+#   这种不要理会。」实测（用户给的 4 张真图）：
+#   · 状态图上的点位与**刚发过的那张开单图完全相同**（黄金 4258/4239/4380、ua 4.32/4.156/…）；
+#   · 券商账户截图（MT4 那种）连价位都读不出。
+# 判据两条：① 点位与最近见过的同一笔重复 → 持仓进展通报；② 读不出点位 + 视觉判为账户截图。
+# 两条都**不推送，但只写日志、绝不静默消失**（可用指令调出来看；图仍会并入同群文字信号）。
+IMG_SIG_SEEN = []           # 最近见过的"图上信号"点位：[{coin, entry, sl, tps, ts}]
+IMG_SIG_TTL = 12 * 3600     # 记忆保留 12 小时
+IMG_SIG_MAX = 80
+
+
+def _img_sig_dump():
+    _now = time.time()
+    keep = [r for r in IMG_SIG_SEEN if _now - float(r.get("ts") or 0) <= IMG_SIG_TTL]
+    return keep[-IMG_SIG_MAX:]
+
+
+def _img_sig_remember(chart, coin=None):
+    """把这次从图上读到的点位记下来，供后面识别"同一笔的进展通报"。"""
+    if not (chart and chart.get("ok") and chart.get("entry")):
+        return
+    IMG_SIG_SEEN.append({"coin": (str(coin).upper() if coin else None),
+                         "entry": chart.get("entry"), "sl": chart.get("sl"),
+                         "tps": list(chart.get("tps") or []), "ts": time.time()})
+    del IMG_SIG_SEEN[:-IMG_SIG_MAX]
+    STATE_DIRTY[0] = True
+
+
+def _near(a, b, tol=0.005):
+    try:
+        return bool(a and b and abs(float(a) - float(b)) / max(abs(float(b)), 1e-9) <= tol)
+    except Exception:
+        return False
+
+
+def _img_is_repeat(chart, coin=None):
+    """这张图的点位是不是"最近刚见过的那一笔"？是 → 视为持仓进展通报。"""
+    if not (chart and chart.get("ok") and chart.get("entry")):
+        return False
+    _e = chart.get("entry")
+    for r in _img_sig_dump():
+        if not _near(_e, r.get("entry"), 0.005):
+            continue
+        _hit = _near(chart.get("sl"), r.get("sl"), 0.005)
+        if not _hit:
+            for a in (chart.get("tps") or []):
+                for b in (r.get("tps") or []):
+                    if _near(a, b, 0.005):
+                        _hit = True
+                        break
+                if _hit:
+                    break
+        if _hit:
+            return True
+    return False
+
+
+def _img_kind_by_vision(path):
+    """读不出点位时问一次视觉模型：这张图是 K 线图，还是券商/交易所账户截图？
+    用途：把"账户截图"这类**非信号图**识别出来（用户要求不要推送）。"""
+    try:
+        ext = str(path).rsplit(".", 1)[-1].lower()
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+                "messages": [{"role": "system", "content": "只输出 JSON，不要解释。"},
+                             {"role": "user", "content": [
+                                 {"type": "text", "text":
+                                  "这张图是：①一张K线/行情图（可能有博主画的开仓/止损/止盈线）"
+                                  "②券商或交易所的账户/持仓截图（有余额、净值、保证金、持仓列表）"
+                                  "③其他。只输出 {\"kind\":\"chart\" 或 \"account\" 或 \"other\"}"},
+                                 {"type": "image_url",
+                                  "image_url": {"url": "data:image/%s;base64,%s"
+                                                       % ("png" if ext == "png" else "jpeg", b64)}}]}],
+                }
+        r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY,
+                                          "Content-Type": "application/json"},
+                          json=body, timeout=120)
+        m = re.search(r"\{[\s\S]*\}", r.json()["choices"][0]["message"]["content"])
+        return (json.loads(m.group(0)).get("kind") or "").lower() if m else ""
+    except Exception as e:
+        log("   ⚠️ 图片类型判定失败：%s" % str(e)[:100])
+        return ""
+
+
+def _img_should_skip(g, r):
+    """True = 判为"已持仓状态图/账户截图"→ 不推送（只写日志）。"""
+    ch = r.get("chart") or {}
+    meta = r.get("meta") or {}
+    if _img_is_repeat(ch, meta.get("coin")):
+        log("   📎 [图] 点位与最近刚见过的同一笔一致 → 判为「持仓进展通报」，不推送")
+        return True
+    if not ch.get("ok"):
+        _imgs = r.get("imgs") or []
+        _k = _img_kind_by_vision(_imgs[0]) if _imgs else ""
+        if _k == "account":
+            log("   📎 [图] 视觉判定=券商账户/持仓截图 → 不推送")
+            return True
+    return False
+
+
 def _push_img_only(group, rec, now=None):
     """用户要求③：4 秒内没关联上文字 → 单独推送【这张图自己包含的信息】，缺失的一律"未读到"。"""
     now = now or time.time()
@@ -1845,7 +2367,10 @@ def _push_img_only(group, rec, now=None):
         dirc = (meta.get("direction") or "").upper()
         dirc_cn = "做多 LONG" if dirc == "LONG" else ("做空 SHORT" if dirc == "SHORT" else "未读到")
         L.append("图上读到（来源：chart）：币种 %s ｜ 方向 %s" % (coin or "未读到", dirc_cn))
-        L.append("止损：%s（图上红色线，来源：chart）" % fmt_price(ch.get("sl")))
+        if ch.get("entry"):
+            # 🆕 2026-09-17：开仓价**读到了就要说出来**（用户当天报障"开仓价为空"）
+            L.append("开仓：%s（图上两区交界 = 开仓价，来源：chart）" % fmt_price(ch.get("entry")))
+        L.append("止损：%s（图上止损空间远端，来源：chart）" % fmt_price(ch.get("sl")))
         if ch.get("tps"):
             L.append("止盈（图上横线，来源：chart，按离入场由近到远）：%s"
                      % " / ".join(fmt_price(x) for x in ch["tps"]))
@@ -1858,12 +2383,24 @@ def _push_img_only(group, rec, now=None):
         if _others:
             L.append("图上其余横线（不当止盈，供你参考）：%s"
                      % "、".join(fmt_price(x["value"]) for x in _others[:4]))
+        _zc = (ch.get("zones") or {}).get("conf")
+        if _zc and _zc != "high":
+            L.append("⚠️ 图上「哪个框是止损、哪个是止盈」的判断置信度=%s"
+                     "（颜色提示与大小关系不完全一致）→ 请你确认" % _zc)
     else:
         L.append("这张图已抓到并保存，但没能读出可用的点位（来源：chart）：%s"
                  % (ch.get("why") or "未知原因"))
+    # 🆕 2026-09-17：这一段原来是**写死的**（读到了也照样印"未读到的：开仓/入场价"）——
+    #   用户当天报障"开仓价识别为空"就是被这句话误导的。现在按**实读**写。
+    _miss = []
+    if not (ch.get("ok") and ch.get("entry")):
+        _miss.append("开仓/入场价")
+    _miss += ["加仓点位", "来源文字"]
     L.append("")
-    L.append("**未读到的（绝不猜）**：开仓/入场价、加仓点位、来源文字 —— 4 秒内本群没有等到"
-             "带币种的文字，图上也没有可确认的开仓价。")
+    L.append("**未读到的（绝不猜）**：%s —— %s。"
+             % ("、".join(_miss),
+                "4 秒内本群没有等到带币种的文字，图上也没读出可确认的开仓价"
+                if not (ch.get("ok") and ch.get("entry")) else "这几项图上没有"))
     L.append("本条只做通报，**不会下单**。要开单请补发文字信号（机器人不会替你猜缺失的点位）。")
     notify("\n".join(L))
 
@@ -1878,7 +2415,11 @@ def rawq_sweep(group=None, now=None):
             if (now - r.get("ts", 0)) < RAWQ_WAIT:
                 continue
             r["pushed"] = True
+            # 🆕 迁为持仓进展通报 / 账户截图 → 不推送（只写日志，绝不静默丢）
+            if _img_should_skip(g, r):
+                continue
             _push_img_only(g, r, now)
+            _img_sig_remember(r.get("chart"), (r.get("meta") or {}).get("coin"))
             log("   📎 [图] %.0f 秒内没等到带币种的文字 → 已单独推送（图=%d 张，图上有止损=%s）"
                 % (now - r.get("ts", now), len(r.get("imgs") or []),
                    bool((r.get("chart") or {}).get("sl"))))
@@ -4145,6 +4686,12 @@ def main():
             for _c in (sv.get("manual") or []):
                 if _c:
                     MANUAL_COINS.add(str(_c).upper())
+            # 🆕 2026-09-17：图上信号的"点位记忆"（识别"同一笔的进展通报"用）
+            for _r in (sv.get("img_sig_seen") or []):
+                if isinstance(_r, dict) and _r.get("entry"):
+                    IMG_SIG_SEEN.append(_r)
+            if IMG_SIG_SEEN:
+                log("已恢复图上信号点位记忆 %d 条（用于识别持仓进展通报）" % len(IMG_SIG_SEEN))
             if MANUAL_COINS:
                 log("已恢复手工仓护栏：%s（机器人不会对它们发任何真单）"
                     % "、".join(sorted(MANUAL_COINS)))
@@ -4269,6 +4816,7 @@ def main():
                    "asking": _asking_dump(),
                    "paused": bool(PAUSED[0]),
                    "manual": _manual_dump(),      # 用户手工仓护栏（机器人不干涉）
+                   "img_sig_seen": _img_sig_dump(),   # 图上信号点位记忆（识别持仓进展通报）
                    "last_api": dict(API_CURSOR),  # API 模式的消息游标（毫秒）
                    "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
@@ -5091,6 +5639,7 @@ def main():
                        "asking": _asking_dump(),      # B11：待确认池落盘，重启不再静默丢失
                        "paused": bool(PAUSED[0]),     # 暂停态落盘，重启后依然生效
                        "manual": _manual_dump(),      # 手工仓护栏落盘（机器人不干涉用户手工仓）
+                       "img_sig_seen": _img_sig_dump(),   # 图上信号点位记忆（识别持仓进展通报）
                        "last_api": dict(API_CURSOR),  # API 模式消息游标（毫秒）
                        "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
@@ -6134,6 +6683,56 @@ if __name__ == "__main__":
         _chk("机器人自己的通知不回话", _chitchat_hint("机器人开单通知", "app", "开仓呀"), False)
         _chk("超长正文不乱回话（阈值 40 字）",
              _chitchat_hint("机器人开单通知", "user", "开" * 41), False)
+
+        # ---------- ⑧m 不看颜色的色块读图 + 状态图不推送 + 手工仓名单自动核对 ----------
+        print("\n[8m] 色块读图（不看颜色）/ 持仓状态图不推送 / 手工仓名单按交易所实时核对")
+        # ① 两套配色、同一套判据（用户 2026-09-17：「不能只认红色和绿色」）
+        _f_gold = {"a": -0.2394, "b": 4394.84}          # 黄金那张图的实测价格轴 y→价格
+        _tag_gold = [{"value": 4258.0, "y": 571, "line_y": 571, "cov": 1.0, "color": "dark"},
+                     {"value": 4239.0, "y": 651, "line_y": 651, "cov": 1.0, "color": "grey"},
+                     {"value": 4380.0, "y": 62, "line_y": 62, "cov": 0.8, "color": "blue"}]
+        _z_grey_blue = [{"rgb": (216, 224, 248), "y0": 62, "y1": 569, "h": 507, "x0": 0, "x1": 100, "w": 100},
+                        {"rgb": (240, 240, 240), "y0": 574, "y1": 651, "h": 77, "x0": 0, "x1": 100, "w": 100}]
+        _r1 = read_zones(_tag_gold, _z_grey_blue, _f_gold) or {}
+        _chk("黄金那张（灰+蓝）→ 做多", _r1.get("dir"), "LONG")
+        _chk("黄金那张 → 开仓=两区交界 4258", _r1.get("entry"), 4258.0)
+        _chk("黄金那张 → 止损=小框远端 4239", _r1.get("sl"), 4239.0)
+        _chk("黄金那张 → 止盈=大框远端 4380", _r1.get("tps"), [4380.0])
+        _chk("黄金那张 → 颜色提示与大小关系一致（高置信）", _r1.get("conf"), "high")
+        _f_lit = {"a": -0.001391, "b": 6.6939}          # ua 那张（LIT）的实测价格轴
+        _tag_lit = [{"value": 4.3167, "y": 1709, "line_y": 1709, "cov": 1.0, "color": "white"},
+                    {"value": 4.156, "y": 1821, "line_y": 1821, "cov": 1.0, "color": "red"},
+                    {"value": 6.0137, "y": 489, "line_y": 489, "cov": 0.9, "color": "green"}]
+        _z_red_green = [{"rgb": (24, 72, 40), "y0": 489, "y1": 1703, "h": 1214, "x0": 0, "x1": 100, "w": 100},
+                        {"rgb": (88, 32, 40), "y0": 1716, "y1": 1821, "h": 105, "x0": 0, "x1": 100, "w": 100}]
+        _r2 = read_zones(_tag_lit, _z_red_green, _f_lit) or {}
+        _chk("ua 那张（红+绿）→ 同一套代码给出同样结论", (_r2.get("dir"), _r2.get("entry"), _r2.get("sl")),
+             ("LONG", 4.3167, 4.156))
+        _chk("ua 那张 → 止盈=大框远端 6.0137", _r2.get("tps"), [6.0137])
+        # ② 颜色提示与"大小关系"矛盾时**不许瞎猜**（改成 conflict，交给审批时人工确认）
+        # 造法：**小的（=止损空间，在下方）用"盈利色"绿、大的（=止盈空间，在上方）用"止损色"灰**
+        _z_conflict = [{"rgb": (240, 240, 240), "y0": 62, "y1": 569, "h": 507, "x0": 0, "x1": 100, "w": 100},
+                       {"rgb": (24, 72, 40), "y0": 574, "y1": 651, "h": 77, "x0": 0, "x1": 100, "w": 100}]
+        _r3 = read_zones(_tag_gold, _z_conflict, _f_gold) or {}
+        _chk("颜色提示反了（绿在上=盈利色却在止盈位）→ 标 conflict 不硬判", _r3.get("conf"), "conflict")
+        # ③ 持仓状态图（同一笔的进展通报）→ 不推送
+        IMG_SIG_SEEN.clear()
+        _img_sig_remember({"ok": True, "entry": 4258.0, "sl": 4239.0, "tps": [4380.0]}, "XAU")
+        _chk("同一笔的进展通报 → 判为重复（不推送）",
+             _img_is_repeat({"ok": True, "entry": 4258.05, "sl": 4239.0, "tps": [4380.0]}), True)
+        _chk("新的一笔（点位不同）→ 不算重复",
+             _img_is_repeat({"ok": True, "entry": 4300.0, "sl": 4250.0, "tps": [4500.0]}), False)
+        _chk("读不出点位的图 → 不算重复（交给账户截图判定）", _img_is_repeat({"ok": False}), False)
+        IMG_SIG_SEEN.clear()
+        # ④ 手工仓名单按交易所实时持仓核对（用户报障：LSK/XAU/XAUT 已平仓却还在名单里）
+        MANUAL_COINS.clear()
+        for _c in ("BTC", "LSK", "XAU", "XAUT"):
+            MANUAL_COINS.add(_c)
+        _removed = _manual_prune({"BTCUSDT", "DASHUSDT", "USELESSUSDT"})
+        _chk("已平仓的从名单移除", _removed, ["LSK", "XAU", "XAUT"])
+        _chk("名单只剩真实有仓的", sorted(MANUAL_COINS), ["BTC"])
+        _chk("真实有仓的绝不被误删", "BTC" in MANUAL_COINS, True)
+        MANUAL_COINS.clear()
 
         # ⑧ 高危开关：否定词不许被当成"开"（实盘/测试模式原来用 `"开" in cmd` 判定）
         _chk("「实盘模式 不要开 确认」同时含 开+确认（所以必须靠否定词挡住）",
