@@ -788,15 +788,11 @@ def _coverage(px, w, y0, y1, bg=(2, 24, 21)):
         if tot and cnt / tot > best: best = cnt / tot
     return round(best, 3)
 
-def _vision(img_path):
-    b64 = base64.b64encode(open(img_path, "rb").read()).decode()
-    body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
-            "messages": [{"role": "system", "content": "Read the price number printed in this chart label. STRICT JSON only."},
-                         {"role": "user", "content": [{"type": "text", "text": "Return {\"text\":\"<digits exactly as printed>\",\"value\":<number>}"},
-                          {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}
-    r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY, "Content-Type": "application/json"}, json=body, timeout=180)
-    m = re.search(r"\{[\s\S]*\}", r.json()["choices"][0]["message"]["content"])
-    return json.loads(m.group(0))
+# 🆕 2026-09-17 清理：原来的 `_vision(img_path)` 是**死代码**（定义后无人调用），
+#   而且它把图片格式写死成 PNG（实际是 jpg）。已删除；读标签走 `_ocr_tags_batch` /
+#   `_ocr_one_label`，浅色图的价格走 `_edge_price_by_vision`。
+
+
 
 def _ocr_one_label(im, x0, t):
     """**单个标签单独一次 OCR**（用户 2026-09-16 选定方案）。
@@ -1056,6 +1052,28 @@ def nearest_label_value(tags, predicted, tol=0.015):
         if d <= tol and (best_d is None or d < best_d):
             best, best_d = v, d
     return best
+
+
+# ================= 🆕 2026-09-17 门口的"像不像信号"关键词表 =================
+# 用户要求（2026-09-17）：「把解析支持的关键词都补进门口表（只少丢消息，不会误开单）」。
+# 背景：这张表原来只有 18 个词，导致「Stop 76000」「Buy BTC 77000」「入场 4250」「多单」
+#   「目标位」这类消息**在送 AI 之前**就被判"闲聊"丢掉 —— 这就是"关键词永远补不完"的根源。
+# ⚠️ 放宽只会"少丢消息"：真正决定开单的仍是 解析 → 数值校验 → 你审批。
+# ⚠️ 闲聊不会因此被推送：推送只发生在"有币种+图/价位"或"有数字+价位关键词"这两类（见主循环）。
+# 提到模块级是为了能被自检直接查（原来的局部变量测不到）。
+SIG_KW_GATE = [
+    "long", "Long", "LONG", "short", "Short", "SHORT",
+    "Entry", "entry", "CMP", "cmp", "Buy", "buy", "Buying",
+    "Sell", "sell", "Selling", "Stop", "stop", "SL", "sl",
+    "Target", "target", "Targets", "TP", "tp",
+    "take profit", "Take Profit", "Limit", "limit",
+    "close", "Close", "Closed", "DCA", "dca",
+    "做多", "做空", "多单", "空单", "多头", "空头", "买多", "卖空",
+    "接多", "接空", "追多", "追空", "看多", "看空",
+    "止损", "止盈", "止损位", "止盈位", "目标位", "目标",
+    "入场", "进场", "开仓", "加仓", "补仓", "挂单", "限价",
+    "条件单", "平仓", "减仓", "跌破", "站稳", "突破",
+]
 
 
 # ================= 🆕 2026-09-17 通用色块读图（**不看颜色**）=================
@@ -1798,6 +1816,11 @@ _AMBIG_TICKERS = {
     "NEAR", "LINK", "SAND", "MASK", "GALA", "APE", "RUNE", "FLOW", "BAND", "STORJ",
     "DOT", "KSM", "ICP", "SSV", "ID", "AI", "GO", "NFT", "DAO", "LONG", "SHORT",
     "CLOSE", "OPEN", "STOP", "ENTRY", "TARGETS", "RISK", "PNL", "CMP", "SL", "TP",
+    # 🆕 2026-09-17 生产实测（用户 LSK 卡片）：正文里的 `Take Profits:` 被当成币种 TAKE
+    #   （TAKEUSDT 是真实合约）→ 单币消息被误判成"多币种"，走进了不读图的分支。
+    #   放进歧义词表只影响"大小写不敏感的第二遍"；真正大写写 TAKE 时仍会被认出（第一遍区分大小写）。
+    "TAKE", "PROFIT", "PROFITS", "HARD", "RISK", "LOSS", "TARGET", "TARGETS",
+    "LONG", "SHORT", "ENTRY", "BREAK", "ABOVE", "BELOW", "SUPPORT", "RESISTANCE",
 }
 
 def fast_parse(txt):
@@ -1853,7 +1876,11 @@ def fast_parse(txt):
     # ⚠️ B5 修复：原来用 `[^0-9]{0,14}` 当间隔，它会**跳过标点**去吃后面的数字 ——
     #    实测「4250止损，4350到4450分批止盈」被读成 止损=4350（其实是止盈位）。
     #    改成不允许跨越标点（，。；,;、！？换行），并补上【数字在关键词前】的写法（「4250止损」）。
-    _GAP = r"[^0-9，。；;、！!？?\n]{0,10}"
+    # 🆕 2026-09-17 用户要求：「% 不参与价格」。
+    #   原来「止损3%」「带个3%止损」会被这条价格正则读成 **止损=3**（一个荒谬的价位），
+    #   而正确的百分比止损正则（下面 ②）反而拿不到值 → 百分比止损基本都走审批或被拦。
+    #   现在把 `%` 从"间隔"里排除 → 带 % 的写法不再被当价格，交给 ② 的 stopPct 处理。
+    _GAP = r"[^0-9%，。；;、！!？?\n]{0,10}"
     for pat in (r"close under\s*\$?([0-9]*\.?[0-9]+)",
                 r"\bSL\s*[:：=]?\s*\$?([0-9]*\.?[0-9]+)",
                 r"stop[ -]?loss\s*[:：=]?\s*\$?([0-9]*\.?[0-9]+)",
@@ -1867,7 +1894,9 @@ def fast_parse(txt):
             except Exception:
                 pass
     add = None
-    mm = re.search(r"(?:DCA|Dca|dca|加仓)[^0-9]{0,14}\$?([0-9]*\.?[0-9]+)", txt)
+    # 🆕 2026-09-17：与止损那条保持一致 —— 不许跨越标点/百分号去吃下一句的数字
+    mm = re.search(r"(?:DCA|Dca|dca|加仓|补仓)\s*[^0-9%，。；;、！!？?\n]{0,6}"
+                   r"(?:价|位|价格)?\s*[:：=]?\s*\$?([0-9]*\.?[0-9]+)", txt)
     if mm:
         try: add = float(mm.group(1))
         except Exception: pass
@@ -1891,18 +1920,26 @@ def fast_parse(txt):
     #    用户的测试「第一止盈74500 第二止盈70500」曾被整条漏掉第二档（16:17 实测）。
     #    分段规则：每个止盈类关键词后取到【下一个任意关键词】为止，
     #    这样既不会漏档，也不会把紧跟着的止损/加仓数字误当成止盈。
-    _BOUND = (r"(?:止盈|目标位?|targets?|(?:TP|Tp|tp)\s?\d?|止损|stop[ -]?loss|SL|"
+    _BOUND = (r"(?:止盈|目标位?|targets?|take\s*profits?|(?:TP|Tp|tp)\s?\d?|止损|stop[ -]?loss|SL|"
               r"加仓|DCA|入场|进场|Entry)")
     _kw = list(re.finditer(_BOUND, txt, re.I))
     for _i, _m in enumerate(_kw):
-        if not re.match(r"(?:止盈|目标位?|targets?|(?:TP|Tp|tp)\s?\d?)", _m.group(0), re.I):
+        if not re.match(r"(?:止盈|目标位?|targets?|take\s*profits?|(?:TP|Tp|tp)\s?\d?)",
+                        _m.group(0), re.I):
             continue                                   # 只管止盈类关键词
         _end = _kw[_i + 1].start() if _i + 1 < len(_kw) else len(txt)
         _seg = txt[_m.end():_end]
         _nums = []
-        for _x in re.findall(r"[0-9]*\.?[0-9]+", _seg):
+        # 🆕 2026-09-17 用户要求「% 不参与价格」：卡片里 `TP1: $0.6690 (+52.00%)` 的 `52.00%`
+        #   以前被当成止盈档（实测 targets = [0.669, 52.0, 1.0]）。现在先把**整段百分比表达式**
+        #   （含 `1-3%` 这种区间写法）从候选文本里剔掉，再做数字扫描 —— 否则 `1-3%` 里的 `1`
+        #   因为后面不是紧跟 % 而漏网（自检第一版实测到的坑）。
+        _seg = re.sub(r"[0-9]*\.?[0-9]+\s*(?:[-~～至]\s*[0-9]*\.?[0-9]+\s*)?%", " ", _seg)
+        for _mx in re.finditer(r"([0-9]*\.?[0-9]+)(\s*%)?", _seg):
+            if _mx.group(2):
+                continue
             try:
-                _nums.append(float(_x))
+                _nums.append(float(_mx.group(1)))
             except Exception:
                 pass
         # 「止盈1 0.24 …」中紧跟关键词的单个 1~4 是档位序号，不是价格
@@ -1964,6 +2001,13 @@ def fast_parse(txt):
             out_stop_pct = float(_msp.group(1))
         except Exception:
             pass
+    if out_stop_pct and stop is not None:
+        # 🆕 2026-09-17：明确写了百分比止损时，**以百分比为准**。
+        #   否则「入场100 止损3%」里"数字+止损"那条规则会把入场价 100 当成止损。
+        #   （与 AI prompt 一致：给了 stopPct 就 stop 留 null。）
+        log("   ↳ 同时读到百分比止损 %.2f%% 与一个价位止损 %s → 以百分比为准（那个数字更可能是入场价）"
+            % (out_stop_pct, stop))
+        stop = None
     # ③ 止损区间（⚠️ 同样不许跨越标点：实测「4250止损，4350到4450分批止盈」里
     #    旧写法把止盈区间 4350~4450 读成了止损区间）
     _msr = re.search(r"止损\s*[:：=]?\s*\$?([0-9]*\.?[0-9]+)\s*"
@@ -2287,23 +2331,27 @@ def _near(a, b, tol=0.005):
 
 
 def _img_is_repeat(chart, coin=None):
-    """这张图的点位是不是"最近刚见过的那一笔"？是 → 视为持仓进展通报。"""
+    """这张图的点位是不是"最近刚见过的那一笔"？是 → 视为持仓进展通报。
+
+    ⚠️ 2026-09-17 实测修正：原来要求"**开仓价**先对上"才继续比，但状态图的读数会偏
+    （黄金那张的状态图把开仓读成 4298，而正确是 4258；止损位反而对上了 4258.022）。
+    改成：**两个价位对得上就算同一笔**（候选的 开仓/止损/各档止盈 与记忆里的集合两两比），
+    这样"读偏一项、其余对得上"也能识别出来；真正的新信号不会有两项都撞上。
+    """
     if not (chart and chart.get("ok") and chart.get("entry")):
         return False
-    _e = chart.get("entry")
+    _lv = [chart.get("entry"), chart.get("sl")] + list(chart.get("tps") or [])
+    _lv = [v for v in _lv if isinstance(v, (int, float)) and v > 0]
+    if len(_lv) < 2:
+        return False
     for r in _img_sig_dump():
-        if not _near(_e, r.get("entry"), 0.005):
-            continue
-        _hit = _near(chart.get("sl"), r.get("sl"), 0.005)
-        if not _hit:
-            for a in (chart.get("tps") or []):
-                for b in (r.get("tps") or []):
-                    if _near(a, b, 0.005):
-                        _hit = True
-                        break
-                if _hit:
-                    break
-        if _hit:
+        _rv = [r.get("entry"), r.get("sl")] + list(r.get("tps") or [])
+        _rv = [v for v in _rv if isinstance(v, (int, float)) and v > 0]
+        _hit = 0
+        for a in _lv:
+            if any(_near(a, b, 0.005) for b in _rv):
+                _hit += 1
+        if _hit >= 2:
             return True
     return False
 
@@ -2666,6 +2714,11 @@ def _approval_lines(coin, p, d):
     if _lg:
         out.append("分批建仓：%d 个点位 %s（保证金等分）"
                    % (len(_lg), "、".join(_fmt_num(x) for x in _lg)))
+    # 🆕 2026-09-17 清理死代码（用户要求"清"）：`add_price` 以前**解析了却从不显示**。
+    #   它是有用信息（博主的加仓点位），现在接到审批里；没有就不显示这一行。
+    _addp = p.get("add_price")
+    if isinstance(_addp, (int, float)) and _addp:
+        out.append("加仓点位：%s（博主给的加仓位，机器人**不会自动加仓**，只提示）" % _fmt_num(_addp))
     out.append("保证金：%.0fU ｜ 杠杆：%d 倍 ｜ 名义：%.0fU" % (MARGIN, LEV, MARGIN * LEV))
     if isinstance(stop, (int, float)) and stop:
         out.append("止损位：%s" % _fmt_num(stop))
@@ -2834,24 +2887,69 @@ def find_all_coins(txt):
     return hits
 
 
+def coins_in_order(txt):
+    """按**在文字里出现的先后**返回币种（去重）。
+    🆕 2026-09-17：多币种拆段原来用 `sorted(find_all_coins(...))[0]` = **字母序第一**，
+    而不是文中最先提到的 —— 例如「ETH 做空 2465，BTC 站稳 76200 多」写在同一行时，
+    字母序会挑中 BTC（B 在 E 前面），**哪怕 ETH 是先写的** → 方向/点位可能安到错的币上。
+    """
+    up = (txt or "").upper()
+    hits = []
+    for c in find_all_coins(txt):
+        pos = None
+        m = re.search(r"\$?" + re.escape(c) + r"(?![A-Za-z0-9])", up)
+        if m:
+            pos = m.start()
+        else:                                # 中文/俗称写法：用别名表反查位置
+            for al, cv in _NAME_MAP.items():
+                if cv == c:
+                    _m2 = re.search(re.escape(al.strip().upper()), up)
+                    if _m2:
+                        pos = _m2.start() + 0.5
+                        break
+        if pos is not None:
+            hits.append((pos, c))
+    seen, out = set(), []
+    for _pos, c in sorted(hits):
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def split_by_coin(txt):
-    """把一条多币种消息按句切成【每币一段】—— 「原油Cl跌破97空…。 Sol突破102.5多…。」
-    返回 [(币种, 该段原文), ...]"""
+    """把一条多币种消息按【句子】切成"每币一段"。
+
+    🆕 2026-09-17 修掉两个生产实测缺陷：
+      ① **按换行切段会丢价位行**（用户 LSK 卡片事故）：卡片是"标题一行、价位各占一行"，
+         旧写法按换行切、只保留"含币种的那一行" → `$0.4401 (limit)`、`Stop Loss:`、`TP1:` 全被丢，
+         解析器只拿到 27 字符的标题行 → 开仓/止损/止盈全"未读到"。
+         现在：换行**不再**当句子边界；含币种的行开新段，**不含币种但像价位/方向的行并进上一段**。
+      ② 一行多币时取"字母序第一" → 改成**文中最先出现的那个**（见 coins_in_order）。
+    """
     t = strip_sender_prefix(txt)
+    _units = []
+    for _ln in re.split(r"\n+", t):
+        _parts = [p.strip() for p in re.split(r"[。；;！!？?]+", _ln) if p.strip()]
+        _units.extend(_parts or [""])
     out, seen = [], set()
-    for seg in re.split(r"[。；;！!？?\n]+", t):
-        seg = seg.strip()
+    _cont_re = re.compile(r"[0-9]|做多|做空|多单|空单|看多|看空|接多|接空|追多|追空|买|卖|"
+                          r"止损|止盈|入场|进场|开仓|加仓|目标|条件单|限价|挂单|"
+                          r"LONG|SHORT|Entry|CMP|TP|SL|stop|target|limit|profit", re.I)
+    for seg in _units:
         if not seg:
             continue
-        cs = sorted(find_all_coins(seg))
-        if not cs:
-            continue
-        c = cs[0]                      # 一句话里只认第一个币（其余交给 AI 兜）
-        if c in seen:
-            continue
-        seen.add(c)
-        out.append((c, seg))
-    return out
+        _cs = coins_in_order(seg)
+        if _cs:
+            c = _cs[0]
+            if c in seen:
+                continue
+            seen.add(c)
+            out.append((c, seg))
+        elif out and _cont_re.search(seg):
+            out[-1] = (out[-1][0], out[-1][1] + "\n" + seg)      # 续行并进上一段
+    # 只认"至少带一个数字或方向词"的段（防假币种把单币消息拆成多币种）
+    return [(c, s) for (c, s) in out if _cont_re.search(s)]
 
 
 def _timing_line(p, prefix="⏱ 从信号发出到推送"):
@@ -3402,16 +3500,20 @@ _NAME_MAP = {
     "瑞波": "XRP", "瑞波币": "XRP", "RIPPLE": "XRP", "币安币": "BNB", "艾达": "ADA", "艾达币": "ADA",
     "波卡": "DOT", "雪崩": "AVAX", "莱特币": "LTC", "柚子": "EOS", "波场": "TRX", "特朗普币": "TRUMP",
     # 贵金属 / 大宗
-    "黄金": "XAU", "金": "XAU", "GOLD": "XAU", "XAUUSD": "XAU",
-    "白银": "XAG", "银": "XAG", "SILVER": "XAG",
-    "原油": "CL", "石油": "CL", "油": "CL", "OIL": "CL", "WTI": "CL", "CRUDE": "CL",
+    # 🆕 2026-09-17 用户要求"收窄别名表"：原来有单字键「金」「银」「油」——
+    #   它们会在任何含这个字的句子里命中（"资金""现金""石油""原油"…），把闲聊误判成信号。
+    #   现在只保留**明确的多字写法**。
+    "黄金": "XAU", "GOLD": "XAU", "XAUUSD": "XAU",
+    "白银": "XAG", "SILVER": "XAG",
+    "原油": "CL", "石油": "CL", "OIL": "CL", "WTI": "CL", "CRUDE": "CL",
     "天然气": "NATGAS", "GAS": "NATGAS",
     # 美股代币（币安有对应 USDT 永续）
     "闪迪": "SNDK", "SANDISK": "SNDK", "海力士": "SKHY", "SK海力士": "SKHY", "SKHYNIX": "SKHY", "HYNIX": "SKHY",
     "特斯拉": "TSLA", "TESLA": "TSLA", "英伟达": "NVDA", "NVIDIA": "NVDA", "苹果": "AAPL", "APPLE": "AAPL",
     "微软": "MSFT", "MICROSOFT": "MSFT", "谷歌": "GOOGL", "GOOGLE": "GOOGL", "亚马逊": "AMZN", "AMAZON": "AMZN",
     "奈飞": "NFLX", "NETFLIX": "NFLX", "超微": "AMD", "英特尔": "INTC", "INTEL": "INTC", "美光": "MU",
-    " coinbase": "COIN", "COINBASE": "COIN", "微策略": "MSTR", "策略": "MSTR", "帕兰提尔": "PLTR", "PLTR": "PLTR",
+    # 🆕 2026-09-17 收窄：删掉键 `" coinbase"`（带前导空格，本身就是坏的写法）与泛词「策略」→MSTR
+    "COINBASE": "COIN", "微策略": "MSTR", "帕兰提尔": "PLTR", "PLTR": "PLTR",
     "阿里": "BABA", "阿里巴巴": "BABA", "拼多多": "PDD", "游戏驿站": "GME", "标普": "SPY", "纳斯达克": "QQQ",
 }
 
@@ -5128,9 +5230,8 @@ def main():
                                     continue
                             except Exception as _e:
                                 log("   指令处理异常 " + str(_e)[:90])
-                        SIG_KW = ["long", "Long", "LONG", "short", "Short", "SHORT", "Entry", "CMP",
-                                  "做多", "做空", "止损", "止盈", "平仓", "减仓", "close", "Closed", "TP", "SL"]
-                        _has_kw = any(k in txt for k in SIG_KW)
+                        # 门口关键词表在模块级 SIG_KW_GATE（便于自检直接校验，见 [8n]）
+                        _has_kw = any(k in txt for k in SIG_KW_GATE)
                         # ⚠️ B16 修复（2026-09-15 实测）：原来是
                         #    has_img = loaded>0 or nimg>=2 —— 要求"图已经加载完"或"≥2 个图片元素"。
                         #    单张图**还没加载完**时 nimg=1 / loaded=0 → 被当成"没图、也没信号词" →
@@ -5194,6 +5295,22 @@ def main():
                         if len(_segs) >= 2:
                             log("   ↳ 多币种消息，按币拆开：%s" % [c for c, _ in _segs])
                             _names = []
+                            # 🆕 2026-09-17 用户报障修复：多币种分支原来**完全不读图**
+                            #   （"图白下载了"）。现在读一次；**只有图上币种与该段币种一致时**
+                            #   才把图上点位并进去 —— 绝不把同一张图的止损/止盈挂到别的币上。
+                            _mc_chart, _mc_meta = {}, {}
+                            if imgs:
+                                try:
+                                    _mc_chart = read_chart_cached(imgs[0]) or {}
+                                    _mc_meta = read_chart_meta(imgs[0]) or {}
+                                except Exception as _e:
+                                    log("   ⚠️ 多币种分支读图异常：%s" % str(_e)[:100])
+                                if _mc_chart.get("ok"):
+                                    log("   ↳ 多币种分支已读图：图上币种=%s ｜ 止损 %s 开仓 %s 止盈 %s"
+                                        % (_mc_meta.get("coin") or "-", _mc_chart.get("sl"),
+                                           _mc_chart.get("entry"), _mc_chart.get("tps")))
+                                else:
+                                    log("   ↳ 多币种分支：图已读但没读出可用点位（不静默丢）")
                             for _c, _seg in _segs:
                                 _cf = fast_parse(_seg) or {}
                                 if AI_FIRST[0]:
@@ -5213,7 +5330,14 @@ def main():
                                     log("   ↳ %s 段没解析出方向 → 只记录不询问" % _c)
                                     continue
                                 PENDING.pop(_c, None)
-                                _pp = merge_pending(_c, g, info=_ci, txt=_seg,
+                                _use_chart = (_mc_chart if (_mc_chart.get("ok")
+                                                            and (_mc_meta.get("coin") or "").upper() == _c)
+                                              else None)
+                                if _mc_chart.get("ok") and not _use_chart:
+                                    log("   ↳ 多币种分支：图上的币种(%s)与这一段(%s)不一致 → 只留图、不用图上的点位"
+                                        % (_mc_meta.get("coin") or "-", _c))
+                                _pp = merge_pending(_c, g, info=_ci, txt=_seg, chart=_use_chart,
+                                                    imgs=(imgs if _use_chart else None),
                                                     t_sig=t_sig, stamps={"found": t_found, "img": 0.0,
                                                                          "parse": time.time(), "chart": 0.0})
                                 _pp["dir"] = _dir_
@@ -5331,7 +5455,7 @@ def main():
                             mc, mc_ok = resolve_coin(_meta.get("coin"))
                             if _meta.get("is_chart") and mc and mc_ok:
                                 coin = mc
-                                dirc = dirc or ((_meta.get("direction") or "").upper() or "LONG")
+                                dirc = dirc or ((_meta.get("direction") or "").upper() or None)
                                 log("   图上读到币种: %s %s" % (coin, dirc))
                         # 这条消息的【文字】本身到底提供了什么？（B16：区分"文字信号"与"只有图"）
                         _text_info = any(info.get(k) for k in
@@ -5427,9 +5551,29 @@ def main():
                                                if k in ("direction", "entry", "stop", "targets")},
                                               txt[:200]))
                                 else:
-                                    notify("【信号·未能识别】%s\n识别到币种 %s%s，但没能解析出方向/点位 "
-                                           "→ **未下单**，等你确认\n原文：%s"
-                                           % (coin, coin,
+                                    # 🆕 2026-09-17 用户要求：**没识别出方向 / 缺开仓价** 时也要推送，
+                                    #   并把"读到了什么、缺了什么"一条条写清楚（绝不猜、不默认做多）。
+                                    _tps0 = sorted(set((info or {}).get("targets") or []))
+                                    _miss0 = []
+                                    if not (info or {}).get("direction"):
+                                        _miss0.append("方向")
+                                    if (info or {}).get("entry") is None:
+                                        _miss0.append("开仓价")
+                                    if (info or {}).get("stop") is None:
+                                        _miss0.append("止损")
+                                    if not _tps0:
+                                        _miss0.append("止盈")
+                                    notify("【信号·未能识别】%s\n"
+                                           "识别到币种 **%s**，但没读全 → **未下单**，等你确认\n"
+                                           "读到：方向=%s ｜ 开仓=%s ｜ 止损=%s ｜ 止盈=%s\n"
+                                           "缺的：%s%s\n"
+                                           "（缺的一律写「未读到」，绝不替你猜）\n原文：%s"
+                                           % (g, coin,
+                                              (info or {}).get("direction") or "未读到",
+                                              fmt_price((info or {}).get("entry")),
+                                              fmt_price((info or {}).get("stop")),
+                                              (" / ".join(fmt_price(x) for x in _tps0) if _tps0 else "未读到"),
+                                              "、".join(_miss0) or "无",
                                               ("，图已抓到 %d 张（读了但没读出可用的方向/点位）" % len(imgs))
                                               if imgs else "，无图",
                                               txt[:200]))
@@ -5491,17 +5635,26 @@ def main():
                     last_id.pop(_g, None)
                     _chg.append("移除 %s" % _g)
                     log("[热加载] 已关闭不再监控的群页面：%s" % _g)
-                for _g in [x for x in GROUPS if x not in pages]:              # 新增 -> 立刻开页面
-                    log("[热加载] 新增监控群 %s，正在开页面（约 1 分钟）…" % _g)
-                    try:
-                        _pg, _rows = open_group_page(ctx, _g)
-                        pages[_g] = _pg
-                        adopt_page(_g, _rows)                                 # 无游标则从页面最新起步
-                        _chg.append("新增 %s" % _g)
-                    except Exception as _e:
+                # 🆕 2026-09-17：API 模式下**根本没有浏览器页面**（page=None），
+                #   原来这里会去开页 → 每个群都报一次"开页失败"，还要发一条误导性通知。
+                #   API 模式下新增群只需要游标（下一轮轮询自动开始取消息）。
+                if FETCH_MODE == "api":
+                    for _g in [x for x in GROUPS if x not in pages]:
                         pages[_g] = None
-                        log("[热加载] %s 开页失败：%s" % (_g, str(_e)[:80]))
-                        _chg.append("新增 %s（开页失败）" % _g)
+                        log("[热加载] API 模式新增监控群 %s（无需开页面，下一轮轮询自动开始取消息）" % _g)
+                        _chg.append("新增 %s（API 模式，无需开页）" % _g)
+                else:
+                    for _g in [x for x in GROUPS if x not in pages]:          # 新增 -> 立刻开页面
+                        log("[热加载] 新增监控群 %s，正在开页面（约 1 分钟）…" % _g)
+                        try:
+                            _pg, _rows = open_group_page(ctx, _g)
+                            pages[_g] = _pg
+                            adopt_page(_g, _rows)                             # 无游标则从页面最新起步
+                            _chg.append("新增 %s" % _g)
+                        except Exception as _e:
+                            pages[_g] = None
+                            log("[热加载] %s 开页失败：%s" % (_g, str(_e)[:80]))
+                            _chg.append("新增 %s（开页失败）" % _g)
                 _new = ("、".join(GROUPS), MARGIN, LEV, bool(TEST_MODE))
                 if _chg or _new != _old:
                     log("[热加载] 生效：%s -> %s" % (_old, _new))
@@ -6720,6 +6873,8 @@ if __name__ == "__main__":
         _img_sig_remember({"ok": True, "entry": 4258.0, "sl": 4239.0, "tps": [4380.0]}, "XAU")
         _chk("同一笔的进展通报 → 判为重复（不推送）",
              _img_is_repeat({"ok": True, "entry": 4258.05, "sl": 4239.0, "tps": [4380.0]}), True)
+        _chk("状态图把开仓读偏了、但止损/止盈对上 → 仍判重复（实测：4298 vs 4258）",
+             _img_is_repeat({"ok": True, "entry": 4298.115, "sl": 4258.022, "tps": [4380.0]}), True)
         _chk("新的一笔（点位不同）→ 不算重复",
              _img_is_repeat({"ok": True, "entry": 4300.0, "sl": 4250.0, "tps": [4500.0]}), False)
         _chk("读不出点位的图 → 不算重复（交给账户截图判定）", _img_is_repeat({"ok": False}), False)
@@ -6733,6 +6888,35 @@ if __name__ == "__main__":
         _chk("名单只剩真实有仓的", sorted(MANUAL_COINS), ["BTC"])
         _chk("真实有仓的绝不被误删", "BTC" in MANUAL_COINS, True)
         MANUAL_COINS.clear()
+
+        # ---------- ⑧n 用户 2026-09-17 定的规则：门口表扩容 / 拆段不丢价位行 / % 不当价格 / 别名收窄 ----------
+        print("\n[8n] 门口关键词扩容、多币种拆段、百分比不当价格、别名表收窄")
+        for _k in ("Stop", "Buy", "入场", "多单", "目标位", "take profit", "Limit", "止盈位"):
+            _chk("门口关键词含 %s（原来在门口就被当闲聊丢掉）" % _k, _k in SIG_KW_GATE, True)
+        _card = ("LSK/USDT — LONG (Leverage)\n\nSignal by Prestige | UnityEntry:\n$0.4401 (limit)\n"
+                 "Stop Loss:\n$0.3842 (-12.70%)\nHard\nRisk:\n1R\nTake Profits:\n"
+                 "TP1: $0.6690 (+52.00%)\n\nUnity Academy • Risk maximum 1-3% per trade")
+        _cs = split_by_coin(_card)
+        _chk("LSK 卡片 → 只拆出 1 段（不再被 Take Profits 拆成多币种）", len(_cs), 1)
+        _chk("该段保住了价位行（0.4401 / Stop Loss / TP1）",
+             bool(_cs) and all(x in _cs[0][1] for x in ("0.4401", "Stop Loss", "TP1")), True)
+        _multi = split_by_coin("原油CL跌破97空，100.7止损，93止盈。 Sol突破102.5多，止损100，止盈107到110。")
+        _chk("真·多币种仍然拆得开（2 段）", [c for c, _ in _multi], ["CL", "SOL"])
+        _chk("同一行两个币 → 取文中最先出现的（ETH，而不是字母序第一的 BTC）",
+             [c for c, _ in split_by_coin("ETH 做空 2465，BTC 站稳 76200 多")], ["ETH"])
+        _r_pct = fast_parse("BTC 做多 入场100 止损3%") or {}
+        _chk("「止损3%」不再被当成价格（stop 必须为 None）", _r_pct.get("stop"), None)
+        _chk("「止损3%」被认成百分比止损 3%", _r_pct.get("stopPct"), 3.0)
+        _chk("「带个3%止损」同样按百分比处理",
+             (fast_parse("BTC 做多 入场100 带个3%止损") or {}).get("stopPct"), 3.0)
+        _r_card = fast_parse(_card) or {}
+        _chk("卡片止盈不含百分比垃圾（52.0 / 1.0）", _r_card.get("targets"), [0.669])
+        _chk("卡片开仓价仍读到 0.4401", _r_card.get("entry"), 0.4401)
+        _chk("卡片止损仍读到 0.3842", _r_card.get("stop"), 0.3842)
+        for _bad in ("金", "银", "油", "策略", " coinbase"):
+            _chk("别名表已删掉易误命中的键 %r" % _bad, _bad in _NAME_MAP, False)
+        _chk("「资金费率」不再误判成 XAU", find_coin_in_text("资金费率很高"), None)
+        _chk("「黄金」仍认 XAU", find_coin_in_text("黄金站上4258"), "XAU")
 
         # ⑧ 高危开关：否定词不许被当成"开"（实盘/测试模式原来用 `"开" in cmd` 判定）
         _chk("「实盘模式 不要开 确认」同时含 开+确认（所以必须靠否定词挡住）",
