@@ -1540,42 +1540,64 @@ def read_chart(path):
         _good = bool(_e and _s and _t and
                      ((_s < _e < _t) if _zr["dir"] == "LONG" else (_s > _e > _t)))
         if _good:
-            # ⚠️⚠️ 2026-09-17 自检当场抓到的坑：视觉读数把 `6.513` 读成 `6513`（小数点丢了），
+            # ⚠️ 2026-09-17 自检当场抓到的坑：视觉读数把 `6.513` 读成 `6513`（小数点丢了），
             #   而"止损<开仓<止盈"的**大小关系照样成立** → 光看顺序会静默采用错价位。
-            #   所以再加两道：① 与图上已读到的其它标签**量级要相符**；② 三个价位不许差得离谱。
+            #   所以再加三道校验：
+            #   ① 与图上其它标签量级相符 —— 但**只在标签自身自洽时**才用它当参照
+            #      （浅色图上标签经常读得很脏，实测中位数都能是 43 万，那种参照没意义）；
+            #   ② 与**像素几何**自洽 —— 价格比例必须跟 y 距离的比例一致，**不依赖任何标签**
+            #      （黄金那张：像素比 0.157 / 价格比 0.155 = 0.99 ✓；UNI 读错那次：0.108 vs 1.05 → 差 9.7 倍 ✗）；
+            #   ③ 三个价位不许差得离谱。
             _ref = [t["value"] for t in tags
                     if isinstance(t.get("value"), (int, float)) and t["value"] > 0]
-            if _ref:
+            if _ref and max(_ref) / max(1e-9, min(_ref)) <= 20:
                 _med = sorted(_ref)[len(_ref) // 2]
                 if not all(0.2 <= float(v) / _med <= 5.0 for v in (_e, _s, _t)):
                     _good = False
                     log("   ⚠️ 按位置读数与图上其它标签量级不符（读数 %s/%s/%s ｜ 图上标签中位 %s）→ 不采用"
                         % (_e, _s, _t, _med))
             if _good:
+                _junc = _zr["junction_y"]
+                _dpx_sl = abs(_junc - _zr["edges"]["sl"])
+                _dpx_tp = abs(_junc - _zr["edges"]["tp"])
+                _dpr_sl = abs(float(_e) - float(_s))
+                _dpr_tp = abs(float(_t) - float(_e))
+                if _dpx_sl > 5 and _dpx_tp > 5 and _dpr_tp > 0:
+                    _r_px = _dpx_sl / float(_dpx_tp)
+                    _r_pr = _dpr_sl / float(_dpr_tp)
+                    if not (0.5 <= (_r_pr / _r_px) <= 2.0):
+                        _good = False
+                        log("   ⚠️ 按位置读数与像素几何不自洽（像素比 %.3f vs 价格比 %.3f，差 %.1f 倍）→ 不采用"
+                            % (_r_px, _r_pr, (_r_pr / _r_px)))
+            if _good:
                 _rng = max(_e, _s, _t) / max(1e-9, min(_e, _s, _t))
                 if _rng > 3.0:
                     _good = False
                     log("   ⚠️ 按位置读数三个价位相差 %.2f 倍（不合常理）→ 不采用" % _rng)
-            _ty = _zr["edges"]["tp"]
-            _inside = []
-            for t in tags:
-                v = t.get("value")
-                ly = t.get("line_y") or t.get("y")
-                if not isinstance(v, (int, float)) or v <= 0 or t.get("cov", 0) < TP_MIN_COV:
-                    continue
-                if min(_zr["junction_y"], _ty) + 5 < ly < max(_zr["junction_y"], _ty) - 5:
-                    _inside.append(v)
-            _tps = sorted(set([round(x, 8) for x in _inside][:TP_TIERS - 1]) | {round(_t, 8)})
-            log("   🧩 色块 + 按位置读数：%s ｜ 开仓 %s（两区交界）｜ 止损 %s（止损区远端）｜ 止盈 %s"
-                % (_zr["dir"], _e, _s, _tps))
-            _zr2 = dict(_zr)
-            _zr2.update({"ok": True, "entry": _e, "sl": _s, "tps": _tps, "tps_all": _tps,
-                         "conf": "vision_edges", "why": None})
-            return {"ok": True, "sl": _s, "entry": _e, "tps_all": _tps,
-                    "tps": _tps[:TP_TIERS], "tags": tags,
-                    "lines": [{"value": t["value"], "color": t["color"], "cov": t["cov"]}
-                              for t in tags if t["cov"] >= TP_MIN_COV],
-                    "verify": verify, "geo": geo, "zones": _zr2, "mode": "zones+vision"}
+            if _good:
+                # ⚠️⚠️ 2026-09-17 二次自检抓到的坑：上面两道校验把 _good 置 False 之后，
+                #   这段**照样继续构造并返回**了那个读数 —— 等于"检查了但没拦住"。
+                #   现在整个"采用"分支都在 if _good 里面（校验不通过就绝不返回）。
+                _ty = _zr["edges"]["tp"]
+                _inside = []
+                for t in tags:
+                    v = t.get("value")
+                    ly = t.get("line_y") or t.get("y")
+                    if not isinstance(v, (int, float)) or v <= 0 or t.get("cov", 0) < TP_MIN_COV:
+                        continue
+                    if min(_zr["junction_y"], _ty) + 5 < ly < max(_zr["junction_y"], _ty) - 5:
+                        _inside.append(v)
+                _tps = sorted(set([round(x, 8) for x in _inside][:TP_TIERS - 1]) | {round(_t, 8)})
+                log("   🧩 色块 + 按位置读数：%s ｜ 开仓 %s（两区交界）｜ 止损 %s（止损区远端）｜ 止盈 %s"
+                    % (_zr["dir"], _e, _s, _tps))
+                _zr2 = dict(_zr)
+                _zr2.update({"ok": True, "entry": _e, "sl": _s, "tps": _tps, "tps_all": _tps,
+                             "conf": "vision_edges", "why": None})
+                return {"ok": True, "sl": _s, "entry": _e, "tps_all": _tps,
+                        "tps": _tps[:TP_TIERS], "tags": tags,
+                        "lines": [{"value": t["value"], "color": t["color"], "cov": t["cov"]}
+                                  for t in tags if t["cov"] >= TP_MIN_COV],
+                        "verify": verify, "geo": geo, "zones": _zr2, "mode": "zones+vision"}
         log("   ↳ 按位置读数没通过校验（开仓=%s 止损=%s 止盈=%s 方向=%s）→ 退回旧的按颜色/标签规则"
             % (_e, _s, _t, _zr["dir"]))
         log("   ⚠️ 认出了两片色块但边上价格没读准 → 退回旧的按颜色/标签规则：%s" % _zr.get("why"))
@@ -6917,6 +6939,123 @@ if __name__ == "__main__":
             _chk("别名表已删掉易误命中的键 %r" % _bad, _bad in _NAME_MAP, False)
         _chk("「资金费率」不再误判成 XAU", find_coin_in_text("资金费率很高"), None)
         _chk("「黄金」仍认 XAU", find_coin_in_text("黄金站上4258"), "XAU")
+
+        # ---------- ⑧o B7：幂等键 / 503·限频 / 挂单后核对（用户要求"不重复下单"）----------
+        print("\n[8o] B7 下单幂等：状态未知时**绝不盲目重试**（用幂等键先查再决定）")
+        if not _BEXEC_OK:
+            _chk("binance_exec 可导入（B7 前置）", _BEXEC_OK, True)
+        else:
+            import binance_exec as _bx
+            _sleep0 = _bx.time.sleep
+            _bx.time.sleep = lambda *_a: None            # 测试里不等退避
+            _cids = [_bx.new_cid("mo") for _ in range(3)]
+            _chk("幂等键唯一", len(set(_cids)), 3)
+            _chk("幂等键合法（≤36 字符、只含字母数字）",
+                 all(len(c) <= 36 and c.isalnum() for c in _cids), True)
+            _calls = {"n": 0, "cids": []}
+
+            def _fake_req(method, path, params=None, signed=True, test=False, timeout=20):
+                _calls["n"] += 1
+                if path.endswith("/order") and params and "newClientOrderId" in params:
+                    _calls["cids"].append(params["newClientOrderId"])
+                return {"ok": 1}
+            _req0 = _bx._req
+            _bx._req = _fake_req
+            try:
+                _r = _bx.post_idempotent("/fapi/v1/order", {"symbol": "BTCUSDT"}, tag="mo")
+                _chk("正常下单：一次成功、带上幂等键", (_r.get("ok"), len(_calls["cids"])), (1, 1))
+            except Exception as _e:
+                _chk("正常下单：一次成功、带上幂等键", "异常 %s" % str(_e)[:60], "1 次成功")
+            # ① 明确被拒（余额不足）→ 绝不重试
+            _calls["n"] = 0
+
+            def _reject(method, path, params=None, signed=True, test=False, timeout=20):
+                _calls["n"] += 1
+                raise _bx.BinanceError("HTTP 400: {'code': -2019, 'msg': 'Margin is insufficient.'}")
+            _bx._req = _reject
+            try:
+                _bx.post_idempotent("/fapi/v1/order", {"symbol": "BTCUSDT"}, tag="mo")
+                _chk("明确被拒 → 直接抛错", "没抛错", "抛错")
+            except _bx.BinanceError as _e:
+                _chk("明确被拒 → 直接抛错且**只尝试 1 次**（绝不重试）",
+                     (_calls["n"], "2019" in str(_e) or "Margin" in str(_e)), (1, True))
+            # ② 限频 -1003 → 退避后重试，最终成功
+            _calls["n"] = 0
+
+            def _rl(method, path, params=None, signed=True, test=False, timeout=20):
+                _calls["n"] += 1
+                if _calls["n"] == 1:
+                    raise _bx.BinanceError("HTTP 429: {'code': -1003, 'msg': 'Too many requests.'}")
+                return {"ok": 2}
+            _bx._req = _rl
+            try:
+                _r = _bx.post_idempotent("/fapi/v1/order", {"symbol": "BTCUSDT"}, tag="mo")
+                _chk("限频 -1003 → 退避重试后成功", (_r.get("ok"), _calls["n"]), (2, 2))
+            except Exception as _e:
+                _chk("限频 -1003 → 退避重试后成功", "异常 %s" % str(_e)[:60], "重试成功")
+            # ③ 503（状态未知）→ 用幂等键查到"其实已经下进去了" → 直接采用，**不再下单**
+            _calls["n"] = 0
+            _sent = []
+
+            def _amb_then_found(method, path, params=None, signed=True, test=False, timeout=20):
+                if method == "GET":
+                    return {"orderId": 999, "status": "NEW"}
+                _calls["n"] += 1
+                _sent.append(params.get("newClientOrderId"))
+                raise _bx.BinanceError("HTTP 503: Service Unavailable")
+            _bx._req = _amb_then_found
+            try:
+                _r = _bx.post_idempotent("/fapi/v1/order", {"symbol": "BTCUSDT"}, tag="mo")
+                _chk("503 但幂等键查到了 → 采用查到的单、**只下过 1 次**（不重复下单）",
+                     (_r.get("_recovered"), _calls["n"]), (True, 1))
+            except Exception as _e:
+                _chk("503 但幂等键查到了 → 采用查到的单", "异常 %s" % str(_e)[:60], "采用")
+            # ④ 503 + 查不到 → 用**同一个幂等键**重试（这是安全的关键）
+            _calls["n"] = 0
+            _sent = []
+
+            def _amb_then_ok(method, path, params=None, signed=True, test=False, timeout=20):
+                if method == "GET":
+                    raise _bx.BinanceError("HTTP 400: {'code': -2013, 'msg': 'Order does not exist.'}")
+                _calls["n"] += 1
+                _sent.append(params.get("newClientOrderId"))
+                if _calls["n"] == 1:
+                    raise _bx.BinanceError("HTTP 503: Service Unavailable")
+                return {"ok": 3}
+            _bx._req = _amb_then_ok
+            try:
+                _r = _bx.post_idempotent("/fapi/v1/order", {"symbol": "BTCUSDT"}, tag="mo")
+                _chk("503 且查不到 → 重试成功，且两次用的是**同一个幂等键**",
+                     (_r.get("ok"), len(set(_sent)), len(_sent)), (3, 1, 2))
+            except Exception as _e:
+                _chk("503 且查不到 → 重试成功且同键", "异常 %s" % str(_e)[:60], "重试成功")
+            # ⑤ 一直未知 → 抛"不要再自动重试"（绝不无限重试）
+            _calls["n"] = 0
+
+            def _always_amb(method, path, params=None, signed=True, test=False, timeout=20):
+                if method == "GET":
+                    raise _bx.BinanceError("HTTP 400: {'code': -2013, 'msg': 'Order does not exist.'}")
+                _calls["n"] += 1
+                raise _bx.BinanceError("HTTP 503: Service Unavailable")
+            _bx._req = _always_amb
+            try:
+                _bx.post_idempotent("/fapi/v1/order", {"symbol": "BTCUSDT"}, tag="mo", tries=2)
+                _chk("一直状态未知 → 抛错让人工核对", "没抛错", "抛错")
+            except _bx.BinanceError as _e:
+                _chk("一直状态未知 → 抛错且提示「不要再自动重试」",
+                     ("不要再自动重试" in str(_e), _calls["n"]), (True, 2))
+            _bx._req = _req0
+            # ⑥ 挂单后核对：止损/止盈缺一个都要能报出来
+            _bx.algo_present = lambda *_a, **_k: None
+            _bx.open_orders = lambda *_a, **_k: [{"price": "110.0", "orderId": 7}]
+            try:
+                _bv = _bx.bracket_verify("BTCUSDT", "LONG", stop=95.0, tps=[{"price": 110.0}, {"price": 120.0}])
+                _chk("核对：止损缺失被列出", any("止损" in x for x in _bv["missing"]), True)
+                _chk("核对：缺的那档止盈被列出", any("120" in x for x in _bv["missing"]), True)
+                _chk("核对：已挂上的那档判为 OK", _bv["tps"][0]["ok"], True)
+            except Exception as _e:
+                _chk("bracket_verify 可运行", "异常 %s" % str(_e)[:60], "可运行")
+            _bx.time.sleep = _sleep0
 
         # ⑧ 高危开关：否定词不许被当成"开"（实盘/测试模式原来用 `"开" in cmd` 判定）
         _chk("「实盘模式 不要开 确认」同时含 开+确认（所以必须靠否定词挡住）",

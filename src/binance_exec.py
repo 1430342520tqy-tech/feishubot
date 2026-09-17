@@ -39,6 +39,7 @@ import datetime
 import urllib.parse
 import urllib.request
 import urllib.error
+import threading
 
 BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
 CFG = os.path.join(BASE, "config.json")
@@ -259,7 +260,7 @@ def market_open(symbol, dir_, notional_usdt, lev=LEV):
     if not LIVE[0]:
         return {"shadow": True, "would_send": p, "mark": px}
     set_leverage(symbol, lev)
-    r = _req("POST", "/fapi/v1/order", p, signed=True)
+    r = post_idempotent("/fapi/v1/order", p, tag="mo")      # 🆕 B7：带幂等键，状态未知不盲目重试
     audit("market_open_resp", p, r, mode="LIVE")
     return r
 
@@ -274,7 +275,7 @@ def limit_open(symbol, dir_, price, notional_usdt, lev=LEV):
     if not LIVE[0]:
         return {"shadow": True, "would_send": p}
     set_leverage(symbol, lev)
-    r = _req("POST", "/fapi/v1/order", p, signed=True)
+    r = post_idempotent("/fapi/v1/order", p, tag="lo")      # 🆕 B7
     audit("limit_open_resp", p, r, mode="LIVE")
     return r
 
@@ -287,7 +288,7 @@ def place_tp_limit(symbol, dir_, price, qty):
     audit("place_tp", p, mode="LIVE" if LIVE[0] else "shadow")
     if not LIVE[0]:
         return {"shadow": True, "would_send": p}
-    r = _req("POST", "/fapi/v1/order", p, signed=True)
+    r = post_idempotent("/fapi/v1/order", p, tag="tp")      # 🆕 B7
     audit("place_tp_resp", p, r, mode="LIVE")
     return r
 
@@ -312,7 +313,9 @@ def place_sl_stop_market(symbol, dir_, stop_price, qty):
     audit("place_sl", p, mode="LIVE" if LIVE[0] else "shadow")
     if not LIVE[0]:
         return {"shadow": True, "would_send": p, "endpoint": "POST /fapi/v1/algoOrder"}
-    r = _req("POST", "/fapi/v1/algoOrder", p, signed=True)
+    # 🆕 B7：Algo 条件单接口不支持按幂等键查 → 状态未知时改用「按触发价核对在不在」
+    r = post_idempotent("/fapi/v1/algoOrder", p, tag="sl",
+                        verify=lambda: algo_present(symbol, stop_price))
     audit("place_sl_resp", p, r, mode="LIVE")
     return r
 
@@ -390,7 +393,7 @@ def close_position_market(symbol, dir_, qty=None):
     audit("close_market", p, mode="LIVE" if LIVE[0] else "shadow")
     if not LIVE[0]:
         return {"shadow": True, "would_send": p}
-    r = _req("POST", "/fapi/v1/order", p, signed=True)
+    r = post_idempotent("/fapi/v1/order", p, tag="cl")      # 🆕 B7：平仓同样带幂等键
     audit("close_market_resp", p, r, mode="LIVE")
     return r
 
@@ -553,19 +556,166 @@ def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=L
     return plan
 
 
+# ==================== 🆕 2026-09-17 B7：幂等键 / 503·限频 / 挂单后核对 ====================
+# 用户要求：「能够真实下单、**不重复下单**、能够**准确无误挂好单**」。
+#
+# 为什么必须有幂等键（clientOrderId）：
+#   币安返回 503/网关错误/网络超时时，**订单可能已经成交**（官方说法叫"执行状态未知"）。
+#   没有幂等键就没法安全重试 —— 盲目重试就是**下重单**（真金白银的重复仓位）。
+#   有了幂等键：任何"状态未知"都能**先拿它去查这笔单到底在不在**，再决定重试还是收手。
+# 三类错误必须区别对待（这是本模块的核心）：
+#   ① 明确被拒（余额不足 -2019 / 低于最小额 -4164 / 参数错）→ **绝不重试**，直接抛
+#   ② 限频（-1003 / 429）→ 退避重试（这种是"没下进去"，重试安全）
+#   ③ 状态未知（5xx / 超时 / -1006 / -1007）→ **先用幂等键查**：查到=已下单；查不到=用同一个键重试
+_CID_SEQ = [0]
+_CID_LOCK = threading.Lock()
+AMBIG_MARKERS = ("HTTP 5", "HTTP 429", "timed out", "TimeoutError", "URLError",
+                 "ConnectionReset", "RemoteDisconnected", "IncompleteRead",
+                 "-1007", "-1006", "Unknown", "服务暂时不可用", "Internal error")
+RATE_MARKERS = ("-1003", "TOO_MANY_REQUESTS", "-1015")
+
+
+def new_cid(tag="o"):
+    """交易所幂等键。币安硬要求：≤36 字符、只允许 [A-Za-z0-9_-]。"""
+    with _CID_LOCK:
+        _CID_SEQ[0] += 1
+        n = _CID_SEQ[0]
+    t = "".join(ch for ch in str(tag or "o") if ch.isalnum())[:8]
+    return ("dsh%s%s%04d" % (t, datetime.datetime.utcnow().strftime("%m%d%H%M%S"), n % 10000))[:36]
+
+
+def order_by_cid(symbol, cid, quiet=False):
+    """按幂等键查订单（用来判断"这笔单到底下没下"）。查不到返回 None。"""
+    try:
+        return _req("GET", "/fapi/v1/order", {"symbol": symbol, "origClientOrderId": cid})
+    except BinanceError as e:
+        if not quiet:
+            audit("order_by_cid_miss", {"symbol": symbol, "cid": cid}, str(e))
+        return None
+
+
+def algo_present(symbol, trigger_price, qty=None, tol=0.002):
+    """在"未成交的条件单"里找这笔止损在不在。
+    （Algo 条件单接口不支持按幂等键查，所以按**触发价**匹配；数量可选用来看是否一致。）"""
+    try:
+        rows = open_algo_orders(symbol) or []
+    except BinanceError as e:
+        audit("algo_present_fail", {"symbol": symbol}, str(e))
+        return None
+    for r in (rows or []):
+        try:
+            tp = float(r.get("triggerPrice") or r.get("stopPrice") or 0)
+        except Exception:
+            tp = 0.0
+        if tp and abs(tp - float(trigger_price)) / max(1e-9, float(trigger_price)) <= tol:
+            return r
+    return None
+
+
+def post_idempotent(path, params, tag="o", tries=3, verify=None):
+    """**带幂等键的下单唯一安全入口**（三处区别对待见文件顶部说明）。
+    verify：状态未知时用来核对"在不在"的函数（默认按幂等键查订单；止损传 algo_present）。"""
+    p = dict(params)
+    cid = p.get("newClientOrderId") or new_cid(tag)
+    p["newClientOrderId"] = cid
+    last = None
+    for i in range(max(1, int(tries))):
+        try:
+            r = _req("POST", path, p, signed=True)
+            if isinstance(r, dict):
+                r["_cid"] = cid
+            return r
+        except BinanceError as e:
+            last = e
+            msg = str(e)
+            if any(m in msg for m in RATE_MARKERS):
+                audit("post_ratelimit_retry", {"path": path, "cid": cid, "try": i + 1}, msg)
+                time.sleep(1.5 * (i + 1))
+                continue
+            if not any(m in msg for m in AMBIG_MARKERS):
+                raise                       # 明确被拒 → 绝不重试（避免真下重单）
+            got = (verify or (lambda: order_by_cid(p.get("symbol"), cid, quiet=True)))()
+            if got:
+                if isinstance(got, dict):
+                    got["_cid"] = cid
+                    got["_recovered"] = True
+                audit("post_recovered_by_cid", {"path": path, "cid": cid}, got)
+                return got
+            audit("post_unknown_retry", {"path": path, "cid": cid, "try": i + 1}, msg)
+            time.sleep(1.2 * (i + 1))
+    raise BinanceError(
+        "下单状态未知（已用幂等键 %s 查过、重试 %d 次仍未确认）：%s —— **不要再自动重试**，"
+        "请人工到币安核对这笔单是否存在。" % (cid, tries, last))
+
+
+def bracket_verify(symbol, dir_, stop=None, tps=None, tol=0.004):
+    """挂完单后**回头核对**（用户要求"准确无误挂好单"）：
+    止损在不在（条件单）、每一档止盈在不在（未成交委托）。
+    返回 {"sl": True/False/None, "tps": [...], "missing": [...]}；None = 查不到（读接口失败）。"""
+    out = {"sl": None, "tps": [], "missing": []}
+    if stop:
+        got = algo_present(symbol, float(stop))
+        out["sl"] = bool(got)
+        if not got:
+            out["missing"].append("止损 %s（条件单）" % stop)
+    rows = None
+    try:
+        rows = open_orders(symbol) or []
+    except BinanceError as e:
+        audit("bracket_verify_fail", {"symbol": symbol}, str(e))
+    for t in (tps or []):
+        try:
+            want = float(t.get("price") if isinstance(t, dict) else t)
+        except Exception:
+            continue
+        hit = None
+        for r in (rows or []):
+            try:
+                px = float(r.get("price") or 0)
+            except Exception:
+                px = 0.0
+            if px and abs(px - want) / max(1e-9, want) <= tol:
+                hit = r
+                break
+        out["tps"].append({"price": want, "ok": bool(hit), "orderId": (hit or {}).get("orderId")})
+        if not hit and rows is not None:
+            out["missing"].append("止盈 %s（限价单）" % want)
+    return out
+
+
 def after_entry_filled(symbol, dir_, tps, stop, qty):
-    """成交监听专用：入场成交后再挂止盈（限价）+ 止损（Algo STOP_MARKET）"""
-    out = {"tps": [], "sl": None}
+    """入场成交后：挂止盈（限价）+ 止损（Algo STOP_MARKET），**挂完立刻回头核对**。
+
+    🆕 2026-09-17（B7 配套，用户要求"准确无误挂好单"）：
+      · 每一笔都带幂等键（见 place_tp_limit / place_sl_stop_market）；
+      · 挂完调 bracket_verify 核对"止损在不在、每一档止盈在不在"，
+        把 missing 一起返回 —— 上层会据此**告警**（实盘下这是必须人来看的情况）。
+    """
+    out = {"tps": [], "sl": None, "verify": None, "missing": []}
+    tp_specs = []
     for t in (tps or [])[:3]:
         try:
-            out["tps"].append(place_tp_limit(symbol, dir_, float(t["price"]), float(t["qty"])))
+            _px = float(t["price"]) if isinstance(t, dict) else float(t)
+            _q = float(t["qty"]) if isinstance(t, dict) else float(qty)
+            out["tps"].append(place_tp_limit(symbol, dir_, _px, _q))
+            tp_specs.append({"price": _px})
         except BinanceError as e:
             out["tps"].append(str(e))
+            out["missing"].append("止盈挂单失败：%s" % str(e)[:80])
     if stop:
         try:
             out["sl"] = place_sl_stop_market(symbol, dir_, float(stop), qty)
         except BinanceError as e:
             out["sl"] = str(e)
+            out["missing"].append("止损挂单失败：%s" % str(e)[:80])
+    # ===== 🆕 B7：挂完**回头核对**，别只看返回值就以为挂上了 =====
+    try:
+        _bv = bracket_verify(symbol, dir_, stop=(float(stop) if stop else None), tps=tp_specs)
+        out["verify"] = _bv
+        if _bv.get("missing"):
+            out["missing"].extend(_bv["missing"])
+    except Exception as e:
+        out["missing"].append("挂单核对异常：%s" % str(e)[:80])
     audit("after_entry_filled", {"symbol": symbol, "dir": dir_, "tps": tps,
                                  "stop": stop, "qty": qty}, out)
     return out
