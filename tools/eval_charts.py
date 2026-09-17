@@ -17,7 +17,7 @@
     · 开仓/止损：相对误差 ≤ 0.5% 算对
     · 每档止盈：只要**命中任意一档**（相对误差 ≤ 0.5%）就算这一档对
     · 方向：必须完全一致
-⚠️ 隔离：RUN/LOGF/NOTIFY_CFG/STATE/TRADES/IMGDIR 全部重定向到 /tmp，**不碰生产**。
+⚠️ 隔离：`SIGNAL_BOT_BASE` 指向 /tmp 沙箱 + `SIGNALBOT_SILENT=1`（一条飞书都不发），**不碰生产**。
 """
 import os
 import sys
@@ -26,13 +26,17 @@ import glob
 import json
 import time
 
-sys.path.insert(0, "/home/ubuntu/signal-bot")
+# 项目根目录：环境变量优先（见 src/config.py）。
+# ⚠️ 生产机上 .py 平铺在根目录，git 仓库里在 src/ —— 两个位置都加，两种布局都能跑。
+_SB_BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
+sys.path.insert(0, os.path.join(_SB_BASE, "src"))
+sys.path.insert(0, _SB_BASE)
 import dryrun_bot2 as bot          # noqa: E402
 
 _T = "/tmp/eval_charts"
+os.environ["SIGNALBOT_SILENT"] = "1"      # 先关掉通知（配置改走 .env 后的统一静默开关）
 bot.RUN = _T
 bot.LOGF = _T + "/eval.log"
-bot.NOTIFY_CFG = _T + "/notify.json"      # 不存在 → 不发飞书
 bot.STATE = _T + "/state.json"
 bot.TRADES = _T + "/eval.jsonl"
 bot.IMGDIR = _T + "/imgs"

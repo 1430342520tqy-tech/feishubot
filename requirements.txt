@@ -1,0 +1,19 @@
+# feishubot 依赖（直接依赖，四个）
+#
+# 安装：
+#     python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
+#     ./venv/bin/playwright install chromium        # 只有回退浏览器模式才需要
+#
+# ⚠️ **上服务器后请立刻锁版本**（本文件故意不写死版本号：服务器上装的才是被实测过的，
+#    写一个我没验证过的版本号反而会把服务器降级）：
+#     ./venv/bin/pip freeze > requirements.lock.txt
+#    然后以后重装用：./venv/bin/pip install -r requirements.lock.txt
+
+requests        # 飞书/AI 的 HTTP 调用
+pillow          # 读图的图像处理（import PIL）
+ccxt            # 取行情最新价（price_of）
+playwright      # 飞书网页取消息的兜底模式（回退 fetch_mode=browser 时才用）
+
+# 说明：除这 4 个外，其余 import 全是 Python 标准库或本仓库自己的模块。
+# ⚠️ 回退浏览器模式还需要 Chromium：`./venv/bin/playwright install chromium`（约 150MB，
+#    常驻约 2.7GB 内存）—— API 模式不需要，装 swap 后再考虑回退。

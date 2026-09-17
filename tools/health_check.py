@@ -4,7 +4,7 @@
 """
 import json, os, re, subprocess, time
 
-BASE = "/home/ubuntu/signal-bot"
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
 V21 = os.path.join(BASE, "v21")
 OK, BAD, WARN = "[OK]  ", "[!!]  ", "[?]   "
 problems = []

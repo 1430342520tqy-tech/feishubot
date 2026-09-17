@@ -8,31 +8,50 @@
 - 全链路计时：信号发出 → 发现 → 抓图 → 解析 → 读图 → 下单(纸面) → 推送
 """
 import os, re, sys, json, time, base64, datetime, threading, hashlib, math, itertools
+
+# .env 由 config 统一加载（必须在 DISPLAY 的 setdefault 之前，否则 .env 里的 DISPLAY 不生效）
+import config
+
 os.environ.setdefault("DISPLAY", ":99")
 import requests
 from PIL import Image
 from playwright.sync_api import sync_playwright
 import ccxt
 
-BASE = "/home/ubuntu/signal-bot"
-RUN = BASE + "/v21"
-IMGDIR = RUN + "/imgs"
-LOGF = RUN + "/run.log"
-TRADES = RUN + "/trades_dryrun.jsonl"
-STATE = RUN + "/state.json"
-NOTIFY_CFG = BASE + "/notify.json"
-_CFG = {}
+# 飞书推送的唯一出口（详见 notifier.py 头部：配置路径必须由调用方传入，否则会弄坏测试隔离）
+import notifier
+
+# 真实层账本 + 对账器（见 ledger.py 头部：这是"币安上到底还剩多少"的唯一来源）
+import ledger
+
+# 整图直读的读图器（可选，默认不用；见 chart_llm.py 头部）
 try:
-    _here = os.path.dirname(os.path.abspath(__file__))
-except Exception:
-    _here = BASE
-for _p in (BASE + "/config.json", os.path.join(_here, "config.json")):
-    try:
-        if os.path.exists(_p):
-            _CFG = json.load(open(_p, encoding="utf-8")); break
-    except Exception:
-        pass
-DS_KEY = os.environ.get("DEEPSEEK_API_KEY") or _CFG.get("deepseek_api_key", "")
+    import chart_llm
+    _CHARTLLM_OK, _CHARTLLM_ERR = True, ""
+except Exception as _e:
+    chart_llm = None
+    _CHARTLLM_OK, _CHARTLLM_ERR = False, str(_e)[:120]
+
+# 读图方式开关："geo" = 现有（像素几何 + 模型读数），"llm" = 整图直读。
+# ⚠️ 默认 geo。切 llm 前必须先用 tools/eval_charts.py 在同一批图上比过准确率 ——
+#    现有那条路是 4 天返工 9 次换来的，不能凭感觉换掉。
+CHART_READER = ["geo"]
+CHART_LLM_READS = [2]      # 整图直读时同一张图读几次（≥2 才有一致性校验）
+
+# 路径只有一个来源：`config.base()`（读环境变量 SIGNAL_BOT_BASE，默认生产路径）。
+BASE = config.base()
+# 路径只有 config.paths() 一处定义。
+# ⚠️ 这些名字**必须留在本模块** —— 自检与 tools/ 靠改写它们把生产路径重定向到 /tmp
+#    （例：eval_charts.py 设 bot.RUN）。
+_P = config.paths(BASE)
+RUN = _P["RUN"]
+IMGDIR = _P["IMGDIR"]
+LOGF = _P["LOGF"]
+TRADES = _P["TRADES"]
+STATE = _P["STATE"]
+
+# 密钥：变量名与来源只在 config.py 里定义一次（**只从 .env / 环境变量读**）
+DS_KEY = config.secrets()["deepseek_api_key"]
 DS_API = "https://api.deepseek.com/chat/completions"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -93,20 +112,10 @@ def notify(text):
     #    在唯一出口统一剥掉，免得每条通知各写一遍、也免得审批单看起来一团乱。
     text = str(text).replace("**", "")
     log("[通知] " + text.replace("\n", " | ")[:200])
-    cfg = {}
-    try:
-        if os.path.exists(NOTIFY_CFG):
-            cfg = json.load(open(NOTIFY_CFG, encoding="utf-8"))
-    except Exception:
-        cfg = {}
-    hook = cfg.get("feishu_webhook")
+    # 地址由 notifier 从 .env / 环境变量现取；静默开关也在那边（自检与离线工具一律不发）
+    hook = notifier.resolve_webhook()
     if hook:
-        try:
-            r = requests.post(hook, json={"msg_type": "text", "content": {"text": text}}, timeout=20).json()
-            if r.get("code") not in (0, None):
-                log("   webhook 返回: " + json.dumps(r, ensure_ascii=False)[:160])
-        except Exception as e:
-            log("   webhook 失败: " + str(e)[:120])
+        notifier.send(hook, text, log=log)
 
 # ---------------- 真实下单层（影子模式）----------------
 # 把每一笔纸面动作同步交给 binance_exec：默认 LIVE=False → **只生成"将要对币安发什么单"的计划，
@@ -201,15 +210,17 @@ def _be_mode():
 # 所以：限价入场 → 只下入场腿 → 登记到 ENTRY_WATCH → 轮询成交 → 成交后挂止盈(限价)+止损(Algo)。
 ENTRY_WATCH = {}          # coin -> {sym, dir, order_ids, tps, stop, deadline, assumed_entry}
 FILL_TIMEOUT = 1800       # 30 分钟没成交 → 撤单并通知你
-_WATCH_NOTIFIED = set()   # 通知去重
 
 
 _LIVE_ALERTS = set()      # 告警去重，避免刷屏
 
 
-def _live_alert(action, coin, err, extra=""):
+def _live_alert(action, coin, err, extra="", naked=True):
     """真实下单动作失败 → 必须【大喊】，绝不能只写一行日志（评估 P0-1：绝不静默丢弃）。
-    同时登记到 NAKED_WATCH，交给每轮的裸仓看门狗自动补挂。"""
+
+    naked=True（默认）同时登记到 NAKED_WATCH，交给每轮的裸仓看门狗自动补挂。
+    naked=False 用于“**只是发现异常、不需要补挂止损**”的情况（如周期对账发现数量不符）——
+    否则会把一个数量问题误登记成“裸仓”，让看门狗去重挂止损。"""
     key = "%s|%s" % (action, coin)
     log("   🔴 [真实动作失败] %s %s: %s" % (action, coin, str(err)[:160]))
     if key in _LIVE_ALERTS:
@@ -223,7 +234,8 @@ def _live_alert(action, coin, err, extra=""):
                "建议你打开币安 App 核对一次。" % (action, coin, str(err)[:200], extra))
     except Exception:
         pass
-    NAKED_WATCH.add(coin)
+    if naked:
+        NAKED_WATCH.add(coin)
     return key
 
 
@@ -263,6 +275,65 @@ def watch_naked():
             NAKED_WATCH.discard(coin)
         except Exception as e:
             _live_alert("裸仓看门狗补挂", coin, e, "该仓位止损 %s 仍未挂上" % sl)
+
+
+# ===== 周期对账（第2步后半段）：管“数量对不上” =====
+# 与 watch_naked 的分工：
+#   · watch_naked     → 管“有仓但没止损”（保护单丢了）
+#   · watch_reconcile → 管“纸面以为平了一部分、真实没平”（数量脱节）
+# ⚠️ 本函数**只检测 + 告警，绝不自动改单/改账**。
+#    原因：自动纠偏会把“错的状态”静默写成“对的”，在没有实盘验证过的环境里比不纠更危险。
+RECON_GRACE = 120       # 秒：纸面刚变动（记了止盈/移了止损）后给真实成交留的宽限期
+
+
+def watch_reconcile():
+    """周期性比对“纸面折算数量”与“交易所真实数量”。只读。"""
+    if not _BEXEC_OK or not bexec.LIVE[0]:
+        return
+    live = {c: tr for c, tr in open_pos_ref.items()
+            if tr.get("real_layer") == "实盘" and not tr.get("pending_fill")}
+    if not live:
+        return
+    try:
+        real = ledger.real_ledger(bexec, with_sl=False)
+    except Exception as e:
+        # 读不到 ⇒ 未知。**绝不因此推断成“没有仓”**。
+        log("   [周期对账] 读真实持仓失败（当未知处理，不推断）：%s" % str(e)[:100])
+        return
+    now = time.time()
+    paper_syms, paper_qty, fresh = set(), {}, set()
+    for c, tr in live.items():
+        sym = c.upper() + "USDT"
+        paper_syms.add(sym)
+        if now - float(tr.get("_paper_changed") or 0) < RECON_GRACE:
+            fresh.add(sym)          # 刚变动过 → 真实成交可能还在路上，本轮跳过
+            continue
+        try:
+            paper_qty[sym] = real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
+        except Exception:
+            pass
+    _res = ledger.reconcile(
+        paper_syms, real, paper_qty=paper_qty, live=True,
+        ignored={c if str(c).upper().endswith("USDT") else str(c).upper() + "USDT"
+                 for c in MANUAL_COINS})
+    _seen = set()
+    for d in _res["diffs"]:
+        if d["symbol"] in fresh:
+            continue
+        _seen.add(d["coin"])
+        if d["kind"] == "qty_mismatch":
+            _live_alert("周期对账·数量不符", d["coin"], d["detail"],
+                        "纸面记录与交易所真实数量已脱节。机器人**不会自动改**，请人工核对。",
+                        naked=False)
+        elif d["kind"] == "only_paper":
+            _live_alert("周期对账·仓位已不在交易所", d["coin"], d["detail"],
+                        "交易所上已无此仓 → 可能止损触发或被手动平掉了，纸面记录可能已过时。",
+                        naked=False)
+        # only_real（孤儿仓）由启动对账 + 手工仓护栏管，这里不重复告警
+    for c in live:
+        if c not in _seen:
+            _clear_live_alert("周期对账·数量不符", c)
+            _clear_live_alert("周期对账·仓位已不在交易所", c)
 
 
 # ===== 风控闸门（2026-09-15，评估 P1）=====
@@ -308,8 +379,8 @@ def _risk_roll_day():
 def _risk_on_close(tr):
     """每笔结单后更新风控计数，并在触线时熔断（暂停交易 + 告警）"""
     _risk_roll_day()
-    net = float(tr.get("pnl_net") if tr.get("pnl_net") is not None
-                else (float(tr.get("realized") or 0) - float(tr.get("fee") or 0)))
+    # pnl_net 由 _stat_close 结单时写入。不再从 realized/fee 反推 —— 旧格式兼容已删。
+    net = float(tr.get("pnl_net") or 0)
     RISK["day_pnl"] = round(RISK["day_pnl"] + net, 4)
     RISK["day_trades"] = int(RISK.get("day_trades", 0)) + 1
     if net < 0:
@@ -367,19 +438,22 @@ def watch_silence():
 
 
 def startup_reconcile():
-    """启动对账闸门：把纸面 state.json 的持仓与币安真实持仓逐条比对。
+    """启动对账闸门：把纸面 state.json 的持仓与币安真实持仓逐条比对 —— **含数量**。
     不一致 → **阻止真实下单**（但继续监控 + 大声告警），需人工处理后再发「重新对账」清除。
-    评估 G3：文件丢了/状态乱了就拒绝开真单，而不是瞎开。"""
+    评估 G3：文件丢了/状态乱了就拒绝开真单，而不是瞎开。
+
+    改走 `src/ledger.py`。
+      旧写法只比**币种集合**（`consistent = (not only_real) and (...)`），
+      所以“纸面以为平了 1/3、交易所其实满仓”这种**数量级漂移永远发现不了**。
+    """
     RECONCILE.update({"checked": True, "ok": None, "diffs": [], "blocked": False, "ts": time.time()})
     if not _BEXEC_OK:
         log("   [对账] 真实下单层未加载 → 跳过")
         return False
     try:
-        real = {}
-        for x in (bexec.positions() or []):
-            amt = float(x.get("positionAmt") or 0)
-            if amt != 0:
-                real[x["symbol"]] = x
+        # 只读真账（with_sl=False：启动时不需要顺便读保护单，省 API 调用）。
+        # ⚠️ 读失败会抛异常 —— 绝不能当成"交易所没仓"。
+        real = ledger.real_ledger(bexec, with_sl=False)
     except Exception as e:
         RECONCILE["ok"] = None
         log("   [对账] ❌ 读交易所持仓失败：%s" % str(e)[:120])
@@ -388,19 +462,27 @@ def startup_reconcile():
             notify("🔴【启动对账失败】读不到币安真实持仓：%s\n"
                    "已**阻止真实下单**（仍在监控记录）。确认网络/权限正常后发「重新对账」。" % str(e)[:160])
         return False
+
     paper = {"%sUSDT" % c.upper() for c in open_pos_ref.keys()}
-    rsyms = set(real)
-    only_paper = sorted(paper - rsyms)
-    only_real = sorted(rsyms - paper)
-    diffs = []
-    for s in only_paper:
-        # 纸面有仓、真实无仓：纸面模式下正常；实盘模式下说明记录与交易所脱节
-        diffs.append("纸面有仓、交易所无仓：%s" % s)
-    for s in only_real:
-        diffs.append("⚠️ 交易所有仓、纸面无记录（孤儿仓/手工仓）：%s 数量 %s"
-                     % (s, real[s].get("positionAmt")))
-        # 用户 2026-09-16 明确要求：交易所有、纸面没有的仓 = **用户手工仓，机器人不得有任何干涉**
-        MANUAL_COINS.add(s[:-4] if s.endswith("USDT") else s)
+    # 纸面折算数量（用于比数量）。⚠️ 只是估算：名义 × 剩余比例 ÷ 开仓价
+    paper_qty = {}
+    for c, tr in open_pos_ref.items():
+        try:
+            paper_qty["%sUSDT" % c.upper()] = real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
+        except Exception:
+            pass
+    rsyms = set(real or {})
+    _res = ledger.reconcile(
+        paper, real, paper_qty=paper_qty, live=bexec.LIVE[0],
+        # 手工仓不参与数量比对：机器人不得干涉，也就没资格评判它的数量
+        ignored={c if str(c).upper().endswith("USDT") else str(c).upper() + "USDT"
+                 for c in MANUAL_COINS})
+    diffs = [d["detail"] for d in _res["diffs"]]
+
+    for d in _res["diffs"]:
+        if d["kind"] == "only_real":
+            # 用户 2026-09-16 明确要求：交易所有、纸面没有的仓 = **用户手工仓，机器人不得有任何干涉**
+            MANUAL_COINS.add(d["coin"])
     # 🆕 2026-09-17：名单只会加不会减 → 按交易所实时持仓把"已经平仓的"移出去（用户实测报障）
     _stale = _manual_prune(rsyms)
     if _stale:
@@ -415,10 +497,10 @@ def startup_reconcile():
                    "机器人不会对它做任何事（不开新仓、不平仓、不改止损、也不拿它的数量去挂保护）。\n"
                    "手工仓平掉后发「解除手工仓 %s」即可解除这条护栏。" % (_c, _c))
     RECONCILE["diffs"] = diffs
-    consistent = (not only_real) and (bexec.LIVE[0] is False or not only_paper)
+    consistent = _res["ok"]
     RECONCILE["ok"] = consistent
-    log("   [对账] 纸面 %d 笔 ｜ 交易所 %d 笔 ｜ 差异 %d 条 ｜ 结论=%s"
-        % (len(paper), len(rsyms), len(diffs), "一致" if consistent else "不一致"))
+    log("   [对账] %s ｜ 结论=%s"
+        % (ledger.summary(paper, real, _res["diffs"]), "一致" if consistent else "不一致"))
     for d in diffs:
         log("      · %s" % d)
     if not consistent and bexec.LIVE[0]:
@@ -595,29 +677,32 @@ def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
     except Exception:
         pass
     try:
-        return bexec.open_full_position(coin.upper() + "USDT", dirc, entry, stop,
+        _plan = bexec.open_full_position(coin.upper() + "USDT", dirc, entry, stop,
                                         list(tps or []), margin=margin or MARGIN)
+        # 🆕 第3步：“半成功”（仓位已建立、但保护单没挂全）必须**大声报出来**，
+        #    不能因为“函数正常返回了”就当成一切良好。
+        _es = (_plan or {}).get("exec") or {}
+        if _es.get("state") == "半成功":
+            _live_alert("开仓保护不全(%s)" % coin, coin,
+                        "；".join(_es.get("missing") or []) or "部分保护单未挂上",
+                        "真实仓位已建立，但保护单没挂全。看门狗会复核止损。")
+        return _plan
     except Exception as e:
         # ⚠️ 实盘下绝不能只说一句"不影响纸面"：可能已经有真实仓位建立了
         if _BEXEC_OK:
             try:
                 if bexec.LIVE[0]:
-                    _live_alert("开仓(%s)" % coin, coin,
-                                e, "真实仓位可能已部分建立或未挂保护，看门狗会复核")
+                    # 异常里带着结构化状态（见 binance_exec._exec_state）→ 能报出“到底缺了什么”
+                    _es = getattr(e, "exec_state", None) or {}
+                    _extra = "真实仓位可能已部分建立或未挂保护，看门狗会复核"
+                    if _es.get("missing"):
+                        _extra = "缺失：%s ｜ %s" % ("；".join(_es["missing"]), _extra)
+                    _live_alert("开仓(%s)" % coin, coin, e, _extra)
                     return None
             except Exception:
                 pass
         log("   ⚠️ 真实下单层计划生成失败（不影响纸面）：%s" % str(e)[:140])
         return None
-
-
-def real_plan_sync_sl(coin, dirc, new_stop, qty=None):
-    """止损移动/重挂（TP1 后移保本损、分批止盈后修正数量）"""
-    if not _BEXEC_OK:
-        return None
-    if bexec.LIVE[0] and manual_block(coin, "改止损"):
-        return None
-    return bexec.sync_sl(coin.upper() + "USDT", dirc, new_stop, qty)
 
 
 def real_plan_close(coin, dirc, qty=None):
@@ -727,10 +812,9 @@ def _stat_close(tr):
     """结单收尾：补结单时间 / 持仓时长 / 净盈亏，然后写飞书多维表格。
     ⚠️ 只在【结单】时调用 —— 持仓中的单不统计（用户要求）。"""
     tr["t_close_ts"] = int(time.time())
-    if not tr.get("t_open_ts"):
-        # 兼容旧仓（用旧代码开的，没有 t_open_ts）：从无年份的 t_open 字符串按当年补全
-        tr["t_open_ts"] = (trade_stats.open_ts(tr) if _STATS_OK else None) or tr["t_close_ts"]
-    tr["hold_sec"] = tr["t_close_ts"] - int(tr["t_open_ts"])
+    # ⚠️ 不再兼容"没有 t_open_ts 的旧仓"（本项目未上线，不存在这种记录，兼容已删）。
+    #    留 `or t_close_ts` 只为**防崩**：真缺字段时持仓时长记 0，不让整单结单断掉。
+    tr["hold_sec"] = tr["t_close_ts"] - int(tr.get("t_open_ts") or tr["t_close_ts"])
     tr["pnl_net"] = round(float(tr.get("realized") or 0) - float(tr.get("fee") or 0), 6)
     tr["margin"] = MARGIN
     tr["lev"] = LEV
@@ -3500,14 +3584,23 @@ _CHART_CACHE = {}
 
 def read_chart_cached(path):
     try:
-        h = hashlib.sha1(open(path, "rb").read()).hexdigest()
+        # ⚠️ 缓存键必须带上读图方式（自查后修正）：否则运行中把 chart_reader 从 geo 改成 llm，
+        #    同一张图还会命中之前 geo 算出来的旧结果。
+        h = CHART_READER[0] + ":" + hashlib.sha1(open(path, "rb").read()).hexdigest()
     except Exception:
         return None
     if h in _CHART_CACHE:
         log("   ♻️ 读图缓存命中（同一张图，0 AI 调用）")
         return _CHART_CACHE[h]
     try:
-        r = read_chart(path)
+        # 读图方式由 runtime_config 的 chart_reader 决定（可用聊天指令改，热加载）
+        if CHART_READER[0] == "llm" and _CHARTLLM_OK:
+            log("   🖼 读图方式：整图直读（大模型，%d 次）" % CHART_LLM_READS[0])
+            r = chart_llm.read(path, agree=CHART_LLM_READS[0], log=log)
+        else:
+            if CHART_READER[0] == "llm" and not _CHARTLLM_OK:
+                log("   ⚠️ chart_reader=llm 但读图模块不可用（%s）→ 回退现有读图" % _CHARTLLM_ERR)
+            r = read_chart(path)
     except Exception as e:
         log("   读图异常: " + str(e)[:80])
         r = None
@@ -3635,7 +3728,7 @@ def range_mid(a, b, coin=None):
     return ceil_to_tick(mid, tick_of(coin) if coin else None), lo, hi
 
 # ---------------- 指令系统（只有你本人、在指定指令群、短消息才执行）----------------
-RUNTIME = BASE + "/runtime_config.json"
+RUNTIME = _P["RUNTIME"]
 CMD_GROUPS = ["开单记录", "机器人开单通知"]   # 指令在这两个群里生效
 PAUSED = [False]              # 暂停：仍抓取记录，但不动作
 STATE_DIRTY = [False]
@@ -3735,16 +3828,22 @@ def load_runtime():
             # 熔断线：总敞口上限的百分比（用户 2026-09-15 要求按金额熔断）
             if cfg.get("loss_limit_pct") is not None:
                 LOSS_LIMIT_PCT[0] = float(cfg["loss_limit_pct"])
+            # 🆕 第4步：读图方式（geo = 现有 / llm = 整图直读）
+            if cfg.get("chart_reader") in ("geo", "llm"):
+                CHART_READER[0] = cfg["chart_reader"]
+            if cfg.get("chart_llm_reads") is not None:
+                CHART_LLM_READS[0] = max(1, int(cfg["chart_llm_reads"]))
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
                 bexec.LEV = LEV
-            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s ｜ 开单需审批=%s ｜ AI优先解析=%s ｜ 失联告警阈值=%.1fh ｜ 暂停=%s"
+            log("已载入运行配置：监控群=%s 保证金=%.0fU 杠杆=%d倍 测试模式=%s ｜ 严格限价群=%s ｜ 真实下单层=%s ｜ 开单需审批=%s ｜ AI优先解析=%s ｜ 失联告警阈值=%.1fh ｜ 暂停=%s ｜ 读图=%s"
                 % ("、".join(GROUPS), MARGIN, LEV, TEST_MODE,
                    "、".join(STRICT_LIMIT_GROUPS) or "无", _be_mode(),
                    "是" if REQUIRE_APPROVAL[0] else "否",
                    "是" if AI_FIRST[0] else "否", SILENCE_ALERT_H,
-                   "是" if PAUSED[0] else "否"))
+                   "是" if PAUSED[0] else "否",
+                   (CHART_READER[0] + ("×%d 次" % CHART_LLM_READS[0] if CHART_READER[0] == "llm" else ""))))
     except Exception as e:
         log("读取运行配置失败: " + str(e)[:80])
 
@@ -3755,19 +3854,20 @@ def save_runtime():
             _old = json.load(open(RUNTIME, encoding="utf-8"))
         except Exception:
             pass
-        out = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE,
-               "max_open": MAX_OPEN, "max_consec_loss": MAX_CONSEC_LOSS,
-               "daily_loss_limit": DAILY_LOSS_LIMIT, "max_total_margin": MAX_TOTAL_MARGIN,
-               "require_approval": REQUIRE_APPROVAL[0], "ai_first_parse": AI_FIRST[0],
-               "loss_limit_pct": LOSS_LIMIT_PCT[0]}
-        # ⚠️ 必须保留 live_trading / strict_limit_groups：否则任何一条指令都会把它们悄悄抹掉
-        if "live_trading" in _old:
-            out["live_trading"] = _old["live_trading"]
-        if "strict_limit_groups" in _old:
-            out["strict_limit_groups"] = _old["strict_limit_groups"]
-        # 同理保留 silence_alert_hours：它不在 out 的默认键里，不显式带回就会被指令抹掉
-        if "silence_alert_hours" in _old:
-            out["silence_alert_hours"] = _old["silence_alert_hours"]
+        # ===== 本函数负责写回的键（程序管理的全部配置）=====
+        _new = {"groups": GROUPS, "margin": MARGIN, "leverage": LEV, "test_mode": TEST_MODE,
+                "max_open": MAX_OPEN, "max_consec_loss": MAX_CONSEC_LOSS,
+                "daily_loss_limit": DAILY_LOSS_LIMIT, "max_total_margin": MAX_TOTAL_MARGIN,
+                "require_approval": REQUIRE_APPROVAL[0], "ai_first_parse": AI_FIRST[0],
+                "loss_limit_pct": LOSS_LIMIT_PCT[0]}
+        # ⚠️ 以**文件原内容**打底，只覆盖上面那几个键。
+        #    旧写法（白名单 + 逐个手动补键）会把“本函数不认识的键”整文件重写抹掉 ——
+        #    实测：`fetch_mode` 会被「修改金额」这类无关指令悄悄删掉（重启后回退到 api，
+        #    主动回滚的选择丢失）。
+        #    所以这里**不再逐个补键**：以后新增任何开关都无需再改本函数。
+        out = dict(_new)
+        for _k, _v in _old.items():
+            out.setdefault(_k, _v)
         json.dump(out, open(RUNTIME, "w"), ensure_ascii=False, indent=1)
         STATE_DIRTY[0] = True
     except Exception as e:
@@ -3825,6 +3925,11 @@ def close_position(coin, pct=100.0, why="手动指令"):
             if tr["remaining"] <= 0.001:
                 real_plan_close(coin, tr["dir"], None)
             else:
+                # 改止损走 bexec.sync_sl（不经过手工仓护栏）：
+                #   手工仓的币在 real_plan_open() 就被 manual_block("开新仓") 拦掉了，
+                #   根本进不了 open_pos —— 所以这条路径碰不到手工仓。
+                #   ⚠️ 不要为了“更安全”在这里加 manual_block：那个名单会误报
+                #      （已平仓的币可能还在名单里），一旦误报就是「该移的止损不移」= 裸奔。
                 bexec.sync_sl(_sym, tr["dir"], tr.get("sl") or tr["entry"],
                               _real_qty_or_estimate(coin, tr))
             _clear_live_alert("手工平仓", coin)
@@ -4075,11 +4180,6 @@ def _handle_ask_reply(t):
     notify("\n".join(_msg))
     log("   🎛 用户回复处理：开=%s 不开=%s 未知=%s" % (opened, closed, unknown))
     return True
-
-
-def _handle_ask(verb, coin_hint=""):
-    """兼容旧的「开 / 不开 [币种]」写法（现在统一走 _handle_ask_reply）"""
-    return _handle_ask_reply(("%s %s" % (verb, coin_hint)).strip())
 
 
 def handle_command(txt):
@@ -4801,6 +4901,55 @@ def main():
     last_id = {}
     open_pos = open_pos_ref          # 指令系统与主循环共用同一个持仓字典
     load_runtime()
+
+    # ===== 🆕 启动前必备项检查：缺了就**大声失败** =====
+    # 为什么必须有：一次真实故障的病根不是“文件还是环境变量”，
+    #   而是**密钥缺失时静默降级成空字符串，程序照跑不报错**。
+    #   配置只从 .env / 环境变量读 → 一旦漏配，必须当场说清楚。
+    #
+    # ⚠️ “实盘开关”必须**直接从 runtime_config.json 读**，不能读 bexec.LIVE：
+    #    后者属于 binance_exec，而它恰恰可能没导入成功 —— 那就永远读不到
+    #    “用户要实盘”这个事实，下面的拒绝启动分支会永远不触发（实测踩到）。
+    try:
+        _live_asked = bool(json.load(open(RUNTIME, encoding="utf-8")).get("live_trading"))
+    except Exception:
+        _live_asked = False
+    _miss = config.missing_required(live=_live_asked, fetch_mode=FETCH_MODE)
+    if _miss:
+        log("=" * 72)
+        log("🔴 启动前检查未通过 —— 缺少以下配置（密钥/凭据只从 .env 或环境变量读）：")
+        for _k, _why in _miss:
+            log("     · %s —— %s" % (_k, _why))
+        log("   修法：把 .env.example 复制成 .env 并填上（见 README 部署章节）。")
+        log("=" * 72)
+        # 注意：FEISHU_WEBHOOK 本身就可能缺（那正是检查项之一）→ 发不出去是正常的，
+        #       日志 + 非零退出码才是主要告警手段（pm2 会反复重启 → 外部巡检能发现）。
+        notify("🔴【启动失败】缺少必备配置，机器人**没有启动**：\n%s" % config.fmt_missing(_miss))
+        sys.exit(2)
+
+    # ===== 🆕 真实下单层不可用：绝不静默降级 =====
+    # 以前 _BEXEC_OK=False 只在「状态」输出里提一句 —— 后果是：**你以为它在交易，
+    # 其实它一单都没发**。分两种情形处理（不做“先跑着看看”）。
+    if not _BEXEC_OK:
+        if _live_asked:
+            log("=" * 72)
+            log("🔴 真实下单层（binance_exec）加载失败，但 runtime_config.json 的"
+                " live_trading 是 true：")
+            log("     %s" % _BEXEC_ERR)
+            log("   继续跑 = 你以为在交易、实际一单不会发。所以**拒绝启动**。")
+            log("   修法：修好 binance_exec；或先把 live_trading 改成 false"
+                "（群里发指令「实盘 关」）。")
+            log("=" * 72)
+            notify("🔴【启动失败】live_trading=true 但真实下单层加载失败，"
+                   "机器人**没有启动**：\n%s" % _BEXEC_ERR)
+            sys.exit(2)
+        log("=" * 72)
+        log("⚠️ 真实下单层（binance_exec）加载失败 → 本次只跑**影子模式**（不会发任何真单）：")
+        log("     %s" % _BEXEC_ERR)
+        log("=" * 72)
+        notify("⚠️【启动告警】真实下单层加载失败，本次只跑影子模式（不会发真单）：\n%s"
+               % _BEXEC_ERR)
+
     try:
         RUNTIME_MTIME[0] = os.path.getmtime(RUNTIME)      # 方案B：热加载基线
     except Exception:
@@ -5744,6 +5893,10 @@ def main():
                 except Exception as e:
                     log("裸仓看门狗异常 " + str(e)[:100])
                 try:
+                    watch_reconcile()      # 周期对账：管“数量对不上”（只告警，不自动改）
+                except Exception as e:
+                    log("周期对账异常 " + str(e)[:100])
+                try:
                     watch_silence()
                 except Exception as e:
                     log("失联看门狗异常 " + str(e)[:100])
@@ -5824,6 +5977,9 @@ def main():
                         filled.append(hit_i)
                         remaining = max(0.0, remaining - part)
                         tr["remaining"] = remaining
+                        # 标记“纸面刚变动” → 周期对账会给真实成交留 RECON_GRACE 秒宽限期，
+                        # 免得刚记账就报“数量不符”（假警报）
+                        tr["_paper_changed"] = time.time()
                         if hit_i == 0 and tr["entry"]:            # TP1 后止损移保本
                             tr["sl"] = tr["entry"]
                             stop = tr["entry"]
@@ -5834,7 +5990,9 @@ def main():
                                % (coin, tr["dir"], hit_i + 1, tp, part * 100, pnl, tr["realized"], remaining * 100,
                                   ("\n止损已移到开仓价 %.8g（保本损）" % stop) if hit_i == 0 else ""))
                         if _BEXEC_OK and tr.get("real_layer") == "实盘":
-                            # 只对实盘仓动真实止损；切模式前开的纸面仓不碰
+                            # 只对实盘仓动真实止损；切模式前开的纸面仓不碰。
+                            # 同 ①：走 bexec.sync_sl 而非手工仓护栏 —— 手工仓进不了 open_pos，
+                            # 而护栏名单会误报（误报后果是“该移的止损不移”= 裸奔）。
                             try:
                                 _rq = _real_qty_or_estimate(coin, tr)
                                 bexec.sync_sl(coin.upper() + "USDT", tr["dir"],
@@ -5871,6 +6029,422 @@ def main():
             time.sleep(POLL_SEC)
 
 if __name__ == "__main__":
+    def _isolate(tag):
+        """把**全套生产路径**重定向到 /tmp，并静默通知 —— 这是本项目自检的硬规定。
+
+        ⚠️ 三样都必须做，少一样就是污染生产：
+          · 路径（RUN/IMGDIR/LOGF/TRADES/STATE/RUNTIME）→ /tmp，否则日志写进生产 `v21/run.log`；
+          · `bexec.AUDITF` → /tmp，否则 `audit()` 写进生产 `v21/real_orders.jsonl`；
+          · `SIGNALBOT_SILENT=1` → 否则可能通过生产的 webhook **真发飞书消息**。
+        """
+        global RUN, IMGDIR, LOGF, TRADES, STATE, RUNTIME
+        import shutil
+        _t = "/tmp/%s_selftest" % tag
+        shutil.rmtree(_t, ignore_errors=True)
+        os.makedirs(_t + "/imgs", exist_ok=True)
+        RUN, IMGDIR, LOGF = _t, _t + "/imgs", _t + "/run.log"
+        TRADES, STATE = _t + "/trades.jsonl", _t + "/state.json"
+        RUNTIME = _t + "/runtime_config.json"
+        os.environ["SIGNALBOT_SILENT"] = "1"      # 一条飞书都不发
+        if _BEXEC_OK:
+            bexec.AUDITF = _t + "/real_orders.jsonl"
+        return _t
+
+    if "--selftest-chartllm" in sys.argv:
+        # ===== 第4步自检：整图直读的**归一化 + 校验 + 双读数**（不联网）=====
+        print("=" * 66)
+        print("整图直读自检（归一化/校验/双读数，不联网）")
+        print("=" * 66)
+        print("隔离目录：%s" % _isolate("chartllm"))
+        _n = [0, 0]
+
+        def _ck(name, got, want):
+            g = (got == want)
+            _n[0] += 1 if g else 0
+            _n[1] += 1
+            print("%s %-46s got=%s want=%s" % ("[ OK ]" if g else "[FAIL]", name, got, want))
+
+        if not _CHARTLLM_OK:
+            print("[FAIL] chart_llm 模块不可用：%s" % _CHARTLLM_ERR)
+            sys.exit(1)
+        N = chart_llm._normalize
+
+        _r = N({"is_trading_chart": True, "direction": "LONG", "entry": 100.0,
+                "stop": 95.0, "targets": [120.0, 110.0]})
+        _ck("做多正常读数 → ok", _r["ok"], True)
+        _ck("做多 → 止损保留", _r["sl"], 95.0)
+        _ck("止盈按离入场由近到远排", _r["tps"], [110.0, 120.0])
+        _ck("  → mode 标为 llm", _r["mode"], "llm")
+
+        _r = N({"direction": "SHORT", "entry": 100.0, "stop": 105.0, "targets": [80.0]})
+        _ck("做空正常读数 → ok", _r["ok"], True)
+
+        _ck("中文方向“做多”能认", N({"direction": "做多", "entry": 10.0, "stop": 9.0})["ok"], True)
+        _ck("中文方向“空”能认", N({"direction": "空", "entry": 10.0, "stop": 11.0})["dir"], "SHORT")
+
+        # 绝不猜：缺项一律不通过
+        _ck("方向缺失 → 不通过", N({"entry": 10.0, "stop": 9.0})["ok"], False)
+        _ck("止损缺失 → 不通过", N({"direction": "LONG", "entry": 10.0,
+                                    "stop": None})["ok"], False)
+        _ck("开仓价缺失 → 不通过", N({"direction": "LONG", "entry": None,
+                                     "stop": 9.0})["ok"], False)
+        _ck("开仓==止损 → 不通过", N({"direction": "LONG", "entry": 10.0,
+                                     "stop": 10.0})["ok"], False)
+        _ck("判定不是信号图 → 不通过",
+            N({"is_trading_chart": False, "direction": "LONG", "entry": 1.0,
+               "stop": 0.9})["ok"], False)
+
+        # 方向-价位自洽（与下游同一口径）
+        _ck("做多但止损高于开仓 → 不通过",
+            N({"direction": "LONG", "entry": 100.0, "stop": 101.0})["ok"], False)
+        _ck("做空但止损低于开仓 → 不通过",
+            N({"direction": "SHORT", "entry": 100.0, "stop": 99.0})["ok"], False)
+
+        # 止盈落错边的丢掉
+        _ck("做多时低于入场的止盈被丢弃",
+            N({"direction": "LONG", "entry": 100.0, "stop": 95.0,
+               "targets": [90.0, 120.0]})["tps"], [120.0])
+        _ck("止盈最多 3 档",
+            len(N({"direction": "LONG", "entry": 100.0, "stop": 95.0,
+                   "targets": [101, 102, 103, 104, 105]})["tps"]), 3)
+
+        # 脏数字清洗（模型爱写 $1,234.5）
+        _ck("脏数字 “$1,234.5” 能洗",
+            N({"direction": "LONG", "entry": "$1,234.5", "stop": "$1,100"})["entry"], 1234.5)
+
+        # 量级自洽：专治“小数点丢失”（历史上真实发生过的 6.513 → 6513）
+        _ck("止损是开仓的 1000 倍 → 拒绝（小数点丢了）",
+            N({"direction": "LONG", "entry": 6.513, "stop": 6513.0})["ok"], False)
+        _ck("止损是开仓的 1/1000 → 拒绝",
+            N({"direction": "SHORT", "entry": 6513.0, "stop": 6.513})["ok"], False)
+        _ck("止损离入场 50%（极端但可能）→ 仍放行",
+            N({"direction": "LONG", "entry": 100.0, "stop": 50.0})["ok"], True)
+
+        # 双读数一致性
+        _a = N({"direction": "LONG", "entry": 100.0, "stop": 95.0, "targets": [110.0]})
+        _b = N({"direction": "LONG", "entry": 100.05, "stop": 95.02, "targets": [110.03]})
+        _c = N({"direction": "SHORT", "entry": 100.0, "stop": 105.0})
+        _d = N({"direction": "LONG", "entry": 101.0, "stop": 95.0})
+        _ck("两次接近 → 一致", chart_llm._agree(_a, _b)[0], True)
+        _ck("两次方向不同 → 不一致", chart_llm._agree(_a, _c)[0], False)
+        _ck("开仓差 1% → 不一致", chart_llm._agree(_a, _d)[0], False)
+        _ck("一次没读出 → 不一致", chart_llm._agree(_a, {"ok": False})[0], False)
+
+        # read() 的控制流（把网络调用打桩，**不联网**）
+        _keep_call, _keep_key = chart_llm._call_once, chart_llm._cfg_key
+        _orig = {"direction": "LONG", "entry": 100.0, "stop": 95.0, "targets": [110.0]}
+        try:
+            chart_llm._cfg_key = lambda: ""
+            _ck("没密钥 → ok=False（不炸）", chart_llm.read("x.png")["ok"], False)
+            chart_llm._cfg_key = lambda: "k"
+            chart_llm._call_once = lambda p, k, timeout=120: dict(_orig)
+            _ck("两次都读对 → ok=True", chart_llm.read("x.png", agree=2)["ok"], True)
+            _seq = [dict(_orig), {"direction": "SHORT", "entry": 100.0, "stop": 105.0}]
+            _q = []
+
+            def _call_seq(p, k, timeout=120):
+                _q.append(1)
+                return _seq[min(len(_q), len(_seq)) - 1]
+            chart_llm._call_once = _call_seq
+            _r2 = chart_llm.read("x.png", agree=2)
+            _ck("两次不一致 → ok=False（绝不猜）", _r2["ok"], False)
+            _ck("  → 说明写清“不一致”", "不一致" in (_r2.get("why") or ""), True)
+            chart_llm._call_once = lambda p, k, timeout=120: (_ for _ in ()).throw(RuntimeError("超时"))
+            _ck("调用抛异常 → ok=False（不炸）", chart_llm.read("x.png")["ok"], False)
+        finally:
+            chart_llm._call_once, chart_llm._cfg_key = _keep_call, _keep_key
+
+        # 开关默认必须是 geo（现有那条已被实盘验证过的路）
+        _ck("读图开关默认 geo", CHART_READER[0], "geo")
+
+        print("-" * 66)
+        print("整图直读自检：%d/%d 通过" % (_n[0], _n[1]))
+        sys.exit(0 if _n[0] == _n[1] else 1)
+
+    if "--selftest-exec" in sys.argv:
+        # ===== 第3步自检：执行状态（“半成功”必须是一等公民）纯函数，不联网 =====
+        print("=" * 66)
+        print("执行状态自检（binance_exec._exec_state，纯函数）")
+        print("=" * 66)
+        print("隔离目录：%s" % _isolate("exec"))
+        _n = [0, 0]
+
+        def _ck(name, got, want):
+            g = (got == want)
+            _n[0] += 1 if g else 0
+            _n[1] += 1
+            print("%s %-46s got=%s want=%s" % ("[ OK ]" if g else "[FAIL]", name, got, want))
+
+        def _mk(ids=(1,), tps=(1, 2), sl=True, fail=(), prot_sl_ok=True, prot_tps_ok=True, watch=False):
+            p = {"order_ids": list(ids), "entry_failed": list(fail),
+                 "tps": [{"price": i} for i in tps], "watch_fill": watch}
+            if sl:
+                p["sl"] = {"triggerPrice": "99"}
+            if ids and not watch:
+                p["protection"] = {
+                    "tps": [({} if prot_tps_ok else {"err": "被拒"}) for _ in tps],
+                    "sl": ({} if prot_sl_ok else {"err": "被拒"}) if sl else None}
+            return p
+
+        _e = bexec._exec_state(_mk())
+        _ck("市价入场、保护挂全 → 全成功", _e["state"], "全成功")
+        _ck("  → 不是 naked", _e["naked"], False)
+
+        _e = bexec._exec_state(_mk(prot_sl_ok=False))
+        _ck("止损没挂上 → 半成功", _e["state"], "半成功")
+        _ck("  → naked=True（有仓没保险，必须喊）", _e["naked"], True)
+        _ck("  → 缺项文案指向止损", any("止损" in m for m in _e["missing"]), True)
+
+        _e = bexec._exec_state(_mk(sl=False))
+        _ck("压根没有止损保护 → naked=True", _e["naked"], True)
+
+        _e = bexec._exec_state(_mk(prot_tps_ok=False))
+        _ck("止盈没挂上、但止损在 → 半成功", _e["state"], "半成功")
+        _ck("  → 不算裸奔", _e["naked"], False)
+
+        _e = bexec._exec_state(_mk(ids=(), fail=[{"err": "余额不足"}]))
+        _ck("入场全失败 → 全失败", _e["state"], "全失败")
+
+        _e = bexec._exec_state(_mk(watch=True))
+        _ck("限价入场等成交 → 等成交", _e["state"], "等成交")
+        _ck("  → 不算裸奔（保护单本就不该现在挂）", _e["naked"], False)
+
+        _e = bexec._exec_state(_mk(), verify={"missing": ["止损 99（条件单）"]})
+        _ck("接口说成功但核对不到止损 → 半成功", _e["state"], "半成功")
+        _ck("  → naked=True", _e["naked"], True)
+        _ck("  → 缺项带“核对发现缺失”",
+            any("核对发现缺失" in m for m in _e["missing"]), True)
+
+        # 影子模式（open_full_position 在非 LIVE 下会直接标成影子模式）
+        # ⚠️ 本机无网络/无 exchangeInfo → 把取价与合约规格打桩（只测状态标记，不测数值）
+        _keep_mp, _keep_spec = bexec.mark_price, bexec.spec
+        bexec.mark_price = lambda s: 100.0
+        bexec.spec = lambda s: {"tick": 0.1, "step": 0.001, "minQty": 0.001, "minNotional": 5.0}
+        try:
+            _p = bexec.open_full_position("BTCUSDT", "LONG", 100.0, 95.0, [110.0], margin=1.0)
+            _ck("影子模式 → 计划标为“影子模式”", (_p.get("exec") or {}).get("state"), "影子模式")
+            _ck("影子模式 → 不可能是 naked", (_p.get("exec") or {}).get("naked"), False)
+            _ck("影子模式 → 无 order_ids", len(_p.get("order_ids") or []), 0)
+        finally:
+            bexec.mark_price, bexec.spec = _keep_mp, _keep_spec
+
+        print("-" * 66)
+        print("执行状态自检：%d/%d 通过" % (_n[0], _n[1]))
+        sys.exit(0 if _n[0] == _n[1] else 1)
+
+    if "--selftest-ledger" in sys.argv:
+        # ===== 第2步自检：真实层账本 + 对账器（**纯函数，不联网、不下单、不碰状态**）=====
+        # 为什么值得存在：这里测的是本项目最要命的那个洞 ——
+        # “纸面以为平了 1/3、交易所其实满仓”能不能被抓到。
+        print("=" * 66)
+        print("真实层账本 / 对账器自检（纯函数 + 接线，不联网）")
+        print("=" * 66)
+        print("隔离目录：%s" % _isolate("ledger"))
+        import io, contextlib
+        _n = [0, 0]
+
+        def _ck(name, got, want):
+            g = (got == want)
+            _n[0] += 1 if g else 0
+            _n[1] += 1
+            print("%s %-44s got=%s want=%s" % ("[ OK ]" if g else "[FAIL]", name, got, want))
+
+        class _Broker:
+            def __init__(self, pos, algo=None, orders=None):
+                self._p, self._a, self._o = pos, algo or {}, orders or {}
+
+            def positions(self):
+                return self._p
+
+            def open_algo_orders(self, sym=None):
+                return self._a.get(sym, [])
+
+            def open_orders(self, sym=None):
+                return self._o.get(sym, [])
+
+        def _pos(sym, amt, side="LONG", entry=100.0):
+            return {"symbol": sym, "positionAmt": str(amt),
+                    "positionSide": side, "entryPrice": str(entry)}
+
+        # ① 读真实账：键用合约名、数量取绝对值、方向看 positionSide
+        rl = ledger.real_ledger(_Broker([_pos("BTCUSDT", 0.5), _pos("ETHUSDT", -2, "SHORT", 50.0)]))
+        _ck("键是合约全名（与纸面写法一致）", sorted(rl), ["BTCUSDT", "ETHUSDT"])
+        _ck("数量取绝对值", rl["ETHUSDT"]["qty"], 2.0)
+        _ck("方向按 positionSide", rl["ETHUSDT"]["side"], "SHORT")
+        _ck("附带币种简称", rl["ETHUSDT"]["coin"], "ETH")
+
+        # ② 脏数据 / 零仓不该进账
+        _ck("数量 0 的仓不计入",
+            len(ledger.real_ledger(_Broker([_pos("BTCUSDT", 0)]))), 0)
+        _ck("缺 symbol 的脏数据被跳过",
+            len(ledger.real_ledger(_Broker([{"positionAmt": "1"}]), with_sl=False)), 0)
+
+        # ③ 保护单识别（含 Algo 条件单）
+        _ck("有止损单 → has_sl=True",
+            ledger.real_ledger(_Broker([_pos("BTCUSDT", 1)],
+                                       algo={"BTCUSDT": [{"type": "STOP_MARKET"}]}),
+                               with_sl=True)["BTCUSDT"]["has_sl"], True)
+        _ck("无止损单 → has_sl=False",
+            ledger.real_ledger(_Broker([_pos("BTCUSDT", 1)]), with_sl=True)["BTCUSDT"]["has_sl"], False)
+        _ck("普通限价单不算止损（只认触发类）",
+            ledger.real_ledger(_Broker([_pos("BTCUSDT", 1)],
+                                       orders={"BTCUSDT": [{"type": "LIMIT"}]}),
+                               with_sl=True)["BTCUSDT"]["stop_orders"], 0)
+
+        # ④ 【关键】读失败必须抛，绝不当成“交易所没仓”
+        class _Bad:
+            def positions(self):
+                raise RuntimeError("网络挂了")
+        try:
+            ledger.real_ledger(_Bad())
+            _ck("读失败必须抛异常（不当成空仓）", "没抛", "抛")
+        except Exception:
+            _ck("读失败必须抛异常（不当成空仓）", True, True)
+
+        # ⑤ 两边一致
+        _r = ledger.reconcile({"BTCUSDT"}, {"BTCUSDT": {"symbol": "BTCUSDT", "coin": "BTC", "qty": 1.0}},
+                              paper_qty={"BTCUSDT": 1.0}, live=True)
+        _ck("数量一致 → ok", _r["ok"], True)
+        _ck("数量一致 → 无差异", len(_r["diffs"]), 0)
+
+        # ⑥ 【最重要】纸面以为平了 1/3、真实满仓 —— 旧代码永远抓不到这个
+        _r = ledger.reconcile({"BTCUSDT"}, {"BTCUSDT": {"symbol": "BTCUSDT", "coin": "BTC", "qty": 1.0}},
+                              paper_qty={"BTCUSDT": 0.667}, live=True)
+        _ck("纸面 2/3 vs 真实满仓 → 抓到", [d["kind"] for d in _r["diffs"]], ["qty_mismatch"])
+        _ck("  → 判为不一致", _r["ok"], False)
+        _ck("  → 实盘下挡住开新仓", _r["blocked"], True)
+
+        # ⑦ 容差边界（纸面数量本来就是估算，允许几点百分点天然误差）
+        def _q(real_q, paper_q=1.0, **kw):
+            return ledger.reconcile({"BTCUSDT"}, {"BTCUSDT": {"symbol": "BTCUSDT", "coin": "BTC", "qty": real_q}},
+                                    paper_qty={"BTCUSDT": paper_q}, live=True, **kw)
+        _ck("差 4% → 容差内，不报", len(_q(1.04)["diffs"]), 0)
+        _ck("差 6% → 容差外，报", [d["kind"] for d in _q(1.06)["diffs"]], ["qty_mismatch"])
+
+        # ⑧ 手工仓不参与数量比对（机器人不得干涉）
+        _ck("手工仓不评判数量", len(_q(5.0, ignored={"BTCUSDT"})["diffs"]), 0)
+
+        # ⑨ only_real / only_paper 语义必须与旧行为逐字一致
+        _r = ledger.reconcile({"BTCUSDT"}, {"ETHUSDT": {"symbol": "ETHUSDT", "coin": "ETH", "qty": 1.0}},
+                              live=True)
+        _ck("only_real 即使影子模式也算不一致",
+            sorted(d["kind"] for d in _r["diffs"]), ["only_paper", "only_real"])
+        _ck("实盘：纸面有仓/交易所无 → 不一致",
+            ledger.reconcile({"BTCUSDT"}, {}, live=True)["ok"], False)
+        _ck("影子：纸面有仓/交易所无 → 不算不一致（旧语义）",
+            ledger.reconcile({"BTCUSDT"}, {}, live=False)["ok"], True)
+        _ck("孤儿仓 detail 文案带 ⚠️（与旧一致）",
+            _r["diffs"][0]["detail"].startswith("⚠️"), True)
+
+        # ⑧ 止损/止盈必须**分开数**（自查后补的：旧口径会把“只有止盈的裸仓”报成 has_sl=True）
+        _rl3 = ledger.real_ledger(_Broker([_pos("BTCUSDT", 1)],
+                                        orders={"BTCUSDT": [{"type": "TAKE_PROFIT"}]}),
+                                 with_sl=True)["BTCUSDT"]
+        _ck("只有止盈单 → has_sl 必须为 False（那是裸仓）", _rl3["has_sl"], False)
+        _ck("  → tp_orders 记到 1", _rl3["tp_orders"], 1)
+        _ck("  → stop_orders 为 0", _rl3["stop_orders"], 0)
+        _ck("  → has_protection=True（旧口径，仅供兼容）", _rl3["has_protection"], True)
+
+        print("-" * 66)
+
+        # ===== 集成部分：startup_reconcile **真的接上账本了吗** =====
+        # 前面测的是 ledger 的纯逻辑；这里测“接线”。
+        # 会临时改写本模块的全局量（bexec / open_pos_ref / MANUAL_COINS / RECONCILE），
+        # 但测完紧接着 sys.exit，不会影响生产。
+        if _BEXEC_OK:
+            class _B2:
+                LIVE = [False]
+
+                def __init__(self, rows, boom=False):
+                    self._rows, self.boom = rows, boom
+
+                def positions(self):
+                    if self.boom:
+                        raise RuntimeError("网络挂了")
+                    return self._rows
+
+                def open_algo_orders(self, sym=None):
+                    return []
+
+                def open_orders(self, sym=None):
+                    return []
+
+            def _live_case(rows, remaining, live=True, manual=(), boom=False, coin="BTC"):
+                global bexec
+                # ⚠️ 必须**把假交易所注入进去** —— 否则 startup_reconcile 会去读真接口，
+                #    在测试台里就变成“读失败”路径，用例会假阳性通过（这是踩过的坑）。
+                bexec = _B2(rows, boom=boom)
+                bexec.LIVE[0] = live
+                MANUAL_COINS.clear(); MANUAL_COINS.update(manual)
+                open_pos_ref.clear()
+                if remaining is not None:
+                    open_pos_ref[coin] = {"entry": 100.0, "remaining": remaining, "dir": "LONG"}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _r = startup_reconcile()
+                return _r, dict(RECONCILE), set(MANUAL_COINS)
+
+            def _prow(sym, amt, side="LONG", entry=100.0):
+                return {"symbol": sym, "positionAmt": str(amt),
+                        "positionSide": side, "entryPrice": str(entry)}
+
+            _keep_brexec = bexec
+            _rows = [_prow("BTCUSDT", 9.0)]          # NOTIONAL=900 / entry=100 → 9 手
+            # ① 数量一致
+            _r, _rc, _mn = _live_case(_rows, 1.0)
+            _ck("集成① 数量一致 → 一致", _r, True)
+            _ck("集成① 不阻止下单", _rc["blocked"], False)
+            # ② 【最核心】纸面以为平了 1/3、交易所满仓 —— 旧代码永远抓不到这个
+            _r, _rc, _mn = _live_case(_rows, 2.0 / 3)
+            _ck("集成② 纸面 2/3 vs 真实满仓 → 抓到", _r, False)
+            _ck("集成② 已阻止真单", _rc["blocked"], True)
+            _ck("集成② 差异文案含「数量不符」",
+                any("数量不符" in d for d in _rc["diffs"]), True)
+            # ③ 孤儿仓 → 登记手工仓 + 阻止
+            _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0)], None)
+            _ck("集成③ 孤儿仓登记为手工仓", _mn, {"ETH"})
+            _ck("集成③ 已阻止真单", _rc["blocked"], True)
+            # ④ 手工仓不评判数量
+            _r, _rc, _mn = _live_case([_prow("BTCUSDT", 99.0)], 1.0, manual={"BTC"})
+            _ck("集成④ 手工仓数量不管 → 一致", _r, True)
+            # ⑤ 读交易所失败 → 绝不能当成“没仓”
+            _r, _rc, _mn = _live_case([], 1.0, boom=True)
+            _ck("集成⑤ 读失败 → 判为未知（ok=None）", _rc["ok"], None)
+            _ck("集成⑤ 读失败 → 已阻止真单", _rc["blocked"], True)
+            # ⑥ 周期对账：数量漂移要告警，且**不能**被当成“裸仓”去重挂止损
+            bexec = _B2([_prow("BTCUSDT", 9.0)])
+            bexec.LIVE[0] = True
+            MANUAL_COINS.clear()
+            NAKED_WATCH.clear()
+            _LIVE_ALERTS.clear()
+            open_pos_ref.clear()
+            open_pos_ref["BTC"] = {"entry": 100.0, "remaining": 2.0 / 3, "dir": "LONG",
+                                  "real_layer": "实盘"}
+            with contextlib.redirect_stdout(io.StringIO()):
+                watch_reconcile()
+            _ck("集成⑥ 周期对账拓到数量不符",
+                any("周期对账·数量不符|BTC" == k for k in _LIVE_ALERTS), True)
+            _ck("集成⑥ 不把它误登记成裸仓（不去重挂止损）", "BTC" in NAKED_WATCH, False)
+            # ⑦ 纸面刚变动过 → 宽限期内不告警（防止刚记完账就误报）
+            _LIVE_ALERTS.clear(); NAKED_WATCH.clear()
+            open_pos_ref["BTC"]["_paper_changed"] = time.time()
+            with contextlib.redirect_stdout(io.StringIO()):
+                watch_reconcile()
+            _ck("集成⑦ 纸面刚变动 → 宽限期内不告警", len(_LIVE_ALERTS), 0)
+            # ⑧ 影子模式不对账（纸面的仓本来就不该在交易所上）
+            _LIVE_ALERTS.clear()
+            bexec.LIVE[0] = False
+            with contextlib.redirect_stdout(io.StringIO()):
+                watch_reconcile()
+            _ck("集成⑧ 影子模式不做周期对账", len(_LIVE_ALERTS), 0)
+
+            # 复原（虽然马上退出，还是复原一下）
+            open_pos_ref.clear(); NAKED_WATCH.clear(); _LIVE_ALERTS.clear()
+            bexec = _keep_brexec
+
+        print("-" * 66)
+        print("账本/对账自检：%d/%d 通过" % (_n[0], _n[1]))
+        sys.exit(0 if _n[0] == _n[1] else 1)
+
     if "--selftest-parse" in sys.argv:
         # 本地正则解析自检（不联网、不动状态）。第一条就是用户 16:17 的测试消息。
         cases = [
@@ -5979,7 +6553,7 @@ if __name__ == "__main__":
         STATE = _T + "/state.json"
         LOGF = _T + "/run.log"
         IMGDIR = _T + "/imgs"
-        NOTIFY_CFG = _T + "/notify.json"          # 不存在 → notify() 不会推飞书
+        os.environ["SIGNALBOT_SILENT"] = "1"      # 一条飞书都不发
         shutil.rmtree(_T, ignore_errors=True)
         os.makedirs(_T + "/imgs", exist_ok=True)
         print("=" * 70)
@@ -5991,7 +6565,7 @@ if __name__ == "__main__":
         print("  TRADES          = %s" % TRADES)
         print("  STATE           = %s" % STATE)
         print("  LOGF            = %s" % LOGF)
-        print("  NOTIFY_CFG      = %s（不存在 → 不发飞书）" % NOTIFY_CFG)
+        print("  NOTIFY      = 已静默（SIGNALBOT_SILENT=1，一条都不发）")
         _fail = []
 
         # ---------- ② 单元：异常分类（用的是 2026-09-15 那场 93 分钟事故的真实报错串）----------
@@ -6126,13 +6700,13 @@ if __name__ == "__main__":
         STATE = _T + "/state.json"
         LOGF = _T + "/run.log"
         IMGDIR = _T + "/imgs"
-        NOTIFY_CFG = _T + "/notify.json"
+        os.environ["SIGNALBOT_SILENT"] = "1"      # 一条飞书都不发
         os.makedirs(IMGDIR, exist_ok=True)
         print("=" * 70)
         print("第3项自检：审批闸门 / B4 组合 / B11 健壮性（隔离在 /tmp，不碰生产）")
         print("=" * 70)
         print("路径重定向证明：")
-        for _k in ("RUNTIME", "TRADES", "STATE", "LOGF", "NOTIFY_CFG"):
+        for _k in ("RUNTIME", "TRADES", "STATE", "LOGF"):
             print("  %-11s = %s" % (_k, eval(_k)))
         _fail = []
 
@@ -6438,7 +7012,7 @@ if __name__ == "__main__":
         STATE = _T + "/state.json"
         LOGF = _T + "/run.log"
         IMGDIR = _T + "/imgs"
-        NOTIFY_CFG = _T + "/notify.json"      # 不存在 → 不发飞书
+        os.environ["SIGNALBOT_SILENT"] = "1"      # 一条飞书都不发
         RUN = _T + "/run"                     # 读图中间产物也不许落到生产 v21/
         os.makedirs(IMGDIR, exist_ok=True)
         os.makedirs(RUN, exist_ok=True)
@@ -6455,7 +7029,7 @@ if __name__ == "__main__":
         print("B16 自检：图片消息不能再丢（门槛 / 暂存 / 回填关联 / 单独推送）")
         print("=" * 72)
         print("路径重定向证明（全部在 /tmp，生产零写入）：")
-        for _k in ("RUNTIME", "TRADES", "STATE", "LOGF", "IMGDIR", "NOTIFY_CFG", "RUN"):
+        for _k in ("RUNTIME", "TRADES", "STATE", "LOGF", "IMGDIR", "RUN"):
             print("  %-11s = %s" % (_k, eval(_k)))
         _fail = []
 
@@ -7002,6 +7576,10 @@ if __name__ == "__main__":
                  all(len(c) <= 36 and c.isalnum() for c in _cids), True)
             _calls = {"n": 0, "cids": []}
 
+            # ⚠️ 下面这些 `_fake_req` / `_reject` / `_rl` / `_amb_then_*` / `_always_amb` 是
+            #    自检**桩函数** —— 它们不被直接调用，而是通过 `_bx._req = <桩>` 赋值替换掉
+            #    真实出口（下一行的写法）。所以「AST 调用次数 = 0」是**假阳性**，不是死代码。
+            #    同理 `_call_seq`（`chart_llm._call_once = _call_seq`）与 `_cap`。
             def _fake_req(method, path, params=None, signed=True, test=False, timeout=20):
                 _calls["n"] += 1
                 if path.endswith("/order") and params and "newClientOrderId" in params:

@@ -1,9 +1,10 @@
-import os, re, json, time, base64, datetime
+import os, json, time, base64, datetime
 os.environ.setdefault("DISPLAY", ":99")
 from playwright.sync_api import sync_playwright
 
-PROFILE = "/home/ubuntu/signal-bot/fs_bot"
-OUTDIR = "/home/ubuntu/signal-bot/v16"
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
+PROFILE = BASE + "/fs_bot"
+OUTDIR = BASE + "/v16"
 IMGDIR = OUTDIR + "/ua_imgs"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 CUTOFF = int(datetime.datetime(2026, 8, 30, 0, 0, tzinfo=CST).timestamp())

@@ -24,7 +24,11 @@ import sys
 import time
 import json
 
-sys.path.insert(0, "/home/ubuntu/signal-bot")
+# 项目根目录：环境变量优先（见 src/config.py）。
+# ⚠️ 生产机上 .py 平铺在根目录，git 仓库里在 src/ —— 两个位置都加，两种布局都能跑。
+_SB_BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
+sys.path.insert(0, os.path.join(_SB_BASE, "src"))
+sys.path.insert(0, _SB_BASE)
 import binance_exec as bx          # noqa: E402
 
 
@@ -168,7 +172,7 @@ def main():
     except Exception:
         pass
     bx.audit("live_smoke_test", {"symbol": symbol, "notional": notional}, out)
-    print("\n完成。完整审计记录：/home/ubuntu/signal-bot/v21/real_orders.jsonl")
+    print("\n完成。完整审计记录：%s" % os.path.join(_SB_BASE, "v21", "real_orders.jsonl"))
     return 0
 
 

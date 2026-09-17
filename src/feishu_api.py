@@ -19,14 +19,20 @@
     fetch_new(chat_id, since_ms, img_dir)       # 拉新消息，返回与网页版同结构的行
     msg_text_of(item)                           # 从任意消息（文本/卡片/post/图片）抽文字
 """
-import os, json, time, hashlib, mimetypes, datetime
+import os, json, time, hashlib
 from urllib.parse import quote as urlencode
 import requests
 
 API = "https://open.feishu.cn/open-apis"
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+# .env 由 config 统一加载（见 config.py 文件头）
+import config
+
 TOKEN_PATH = os.environ.get("FEISHU_TOKEN_PATH") or os.path.join(_HERE, "feishu_user_token.json")
-CFG_PATH = os.environ.get("BOT_CONFIG_PATH") or os.path.join(_HERE, "config.json")
+# ⚠️ 原来这里还有一行 `CFG_PATH = ... config.find_cfg()` —— 已删：
+#    配置改成**只从环境变量（含 .env）读**后，config.json 已整个退役，
+#    这行既没人用、又在 `find_cfg()` 被删后变成会崩的死代码。
 REFRESH_MARGIN = 600          # 剩余有效期 < 10 分钟就提前刷新
 # 重新授权用：控制台「安全设置 → 重定向 URL」里登记过的地址（不需要真的能打开）
 REDIRECT_URI = "https://localhost:8765/callback"
@@ -66,11 +72,8 @@ def set_logger(fn):
 
 
 def _cfg():
-    try:
-        c = json.load(open(CFG_PATH, encoding="utf-8"))
-    except Exception:
-        return {}
-    return c.get("feishu_app") or {}
+    """飞书自建应用凭据 —— 从环境变量（含 `.env`）读：`FEISHU_APP_ID` / `FEISHU_APP_SECRET`。"""
+    return config.app_creds()
 
 
 def token_info():
@@ -349,7 +352,7 @@ def fetch_new(chat_id, since_ms, img_dir, want_images=True, max_msgs=60, skip_id
 
     ⚠️ 实测（2026-09-17，生产真数据，别凭印象推翻）：
       · 机器人自己的通知（自定义机器人 webhook 发的）→ {"sender_type": "app",
-          "id": "cli_c08abc1da138d00f", "id_type": "app_id"}
+          "id": "cli_c08abc...（脱敏）", "id_type": "app_id"}
       · 用户本人发的消息                              → {"sender_type": "user",
           "id": "ou_ef47…", "id_type": "open_id"}
       · **KOL 群里的博主信号同样是 "app"**（黄金mansoor / UA-nurseneil2 的卡片全是 app），

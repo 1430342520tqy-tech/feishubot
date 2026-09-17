@@ -1,9 +1,15 @@
 # 密钥与本地配置（绝不提交）
-config/config.json
-config/notify.json
+# ⚠️ 2026-09-17 配置规则：手写的配置**只走 .env**（见 .env.example / src/config.py）。
+#    config.json / notify.json 已不再被代码读，但**仍然要挡住** ——
+#    旧部署上可能还留着带真密钥的文件，不能因为“现在不读了”就放进公开仓库。
+.env
+config.json
+notify.json
+runtime_config.json
+feishu_user_token.json
+**/feishu_user_token.json
 *.key
 *.pem
-.env
 
 # 抓取到的数据（含聊天记录、图片，体积大）
 data/
@@ -23,6 +29,9 @@ venv/
 fs_profile/
 fs_bot/
 fs_scrape/
+
+# 代码索引工具的本地缓存（不进库）
+.codegraph/
 
 # 编辑器/系统
 .vscode/

@@ -41,10 +41,13 @@ import urllib.request
 import urllib.error
 import threading
 
-BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
-CFG = os.path.join(BASE, "config.json")
-RUNTIME = os.path.join(BASE, "runtime_config.json")
-AUDITF = os.path.join(BASE, "v21", "real_orders.jsonl")
+# 配置的唯一来源：路径 / 密钥 / .env 加载全在 config.py（见其文件头）
+# 配置的唯一来源：路径 / 密钥 / .env 加载全在 config.py（见其文件头）
+import config
+_P = config.paths()
+BASE = _P["BASE"]
+RUNTIME = _P["RUNTIME"]
+AUDITF = _P["AUDITF"]
 FAPI = "https://fapi.binance.com"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -58,17 +61,10 @@ _DUAL = [None]          # 账户是否双向持仓（None=未探测）
 
 
 # ============================ 底层 HTTP ============================
-def _load_cfg():
-    try:
-        return json.load(open(CFG, encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-_C = _load_cfg()
-_B = _C.get("binance") or {}
-KEY = (_B.get("api_key") or "").strip()
-SEC = (_B.get("api_secret") or "").strip()
+# 密钥一次性读齐：**只从环境变量（含 .env）**，变量名定义在 config.py 里
+_S = config.secrets()
+KEY = _S["binance_api_key"]
+SEC = _S["binance_api_secret"]
 
 
 class BinanceError(Exception):
@@ -102,7 +98,8 @@ def _req(method, path, params=None, signed=True, test=False, timeout=20):
     headers = {"X-MBX-APIKEY": KEY}
     if signed:
         if not KEY or not SEC:
-            raise BinanceError("config.json 缺少 binance.api_key / api_secret")
+            raise BinanceError("缺少 BINANCE_API_KEY / BINANCE_API_SECRET"
+                              "（密钥只从 .env 或环境变量读，见 .env.example）")
         p["timestamp"] = int(time.time() * 1000)
         p.setdefault("recvWindow", 5000)
         qs = urllib.parse.urlencode(p)
@@ -374,14 +371,6 @@ def sync_sl(symbol, dir_, new_stop, qty):
     return new
 
 
-def move_sl(symbol, dir_, new_stop, qty=None):
-    """移动止损（TP1 后移保本损）。完整实现见 sync_sl。"""
-    if qty is None:
-        pos = position_of(symbol, _ps(dir_))
-        qty = abs(float(pos.get("positionAmt") or 0)) if pos else 0
-    return sync_sl(symbol, dir_, new_stop, qty)
-
-
 def close_position_market(symbol, dir_, qty=None):
     """市价平仓：qty=None 表示全平（**自己读持仓数量后用显式 quantity**）。
 
@@ -449,6 +438,58 @@ def split_tp_qty(symbol, total_qty, tiers):
             parts.append(base)
             acc += base
     return parts
+
+
+def _exec_state(plan, verify=None):
+    """把“这一步到底成没成、成了多少”算成一个**有名字的结果**。
+
+    让“半成功”成为一等公民。
+    旧写法只有两种表达：正常返回（看起来全好）或抛异常（看起来全崩）。
+    但真实世界里最常见的是**中间态** —— “市价仓已建立、止损没挂上”。
+    “返回正常”会把裸奔说成成功；“抛异常”又丢掉了“仓已经开了”这个事实。
+
+    返回 `{state, entry_ok, entry_failed, missing, naked, note}`，其中：
+      `state ∈ {"全成功", "半成功", "全失败", "等成交", "影子模式"}`
+      `naked=True` 表示 **有真实仓位但没有止损保护** —— 这是最必须被喊出来的状态。
+    """
+    ids = plan.get("order_ids") or []
+    failed = plan.get("entry_failed") or []
+    prot = plan.get("protection") or {}
+    missing = []
+    # 止损
+    if plan.get("sl"):
+        sl = prot.get("sl")
+        if sl is None:
+            missing.append("止损未挂上")
+        elif isinstance(sl, dict) and sl.get("err"):
+            missing.append("止损未挂上：%s" % str(sl["err"])[:60])
+    # 止盈：逐档对（数量和档数一致才叫挂全）
+    _tps = prot.get("tps") or []
+    for i in range(len(plan.get("tps") or [])):
+        t = _tps[i] if i < len(_tps) else None
+        if t is None:
+            missing.append("止盈第%d档未挂上" % (i + 1))
+        elif isinstance(t, dict) and t.get("err"):
+            missing.append("止盈第%d档未挂上：%s" % (i + 1, str(t["err"])[:60]))
+    # 挂完的**独立核对**（bracket_verify）：防“接口说成功、其实没挂上”
+    for m in ((verify or {}).get("missing") or []):
+        if not any(m in x for x in missing):
+            missing.append("核对发现缺失：%s" % m)
+    if plan.get("watch_fill"):
+        st = "等成交"                       # 限价入场：还没成交，保护单本就不该挂
+    elif not ids:
+        st = "全失败"
+    elif failed or missing:
+        st = "半成功"
+    else:
+        st = "全成功"
+    _naked = bool(ids) and st != "等成交" and (
+        (not plan.get("sl")) or any(m.startswith("止损") for m in missing)
+        or any(m.startswith("核对发现缺失：止损") for m in missing))
+    plan["exec"] = {"state": st, "entry_ok": len(ids), "entry_failed": len(failed),
+                    "missing": missing, "naked": _naked,
+                    "note": ("有真实仓位但没有止损保护" if _naked else "")}
+    return plan["exec"]
 
 
 def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=LEV):
@@ -539,13 +580,19 @@ def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=L
         if _fail:
             audit("entry_abort", {"symbol": symbol, "ok": _oids, "failed": _fail},
                   "有入场腿失败 → 不挂止盈止损，交由上层告警 + 裸仓看门狗接管")
-            raise BinanceError(
+            _es = _exec_state(plan)
+            audit("exec_state", {"symbol": symbol}, _es)
+            _e = BinanceError(
                 "入场腿 %d 条失败（成功 %d 条）：%s —— 已中止挂保护，交由告警+看门狗处理"
                 % (len(_fail), len(_oids), _fail[0].get("err")))
+            # 把结构化状态挂在异常上 → 上层能报出“到底缺了什么”，而不只是一串文字
+            _e.plan, _e.exec_state = plan, _es
+            raise _e
         if _has_limit:
             # ⚠️ 限价入场必须【先等成交】再挂止盈止损：
             #    没持仓时挂止损/止盈会被币安拒（或语义错误），所以交给成交监听接管。
             plan["watch_fill"] = True
+            plan["exec"] = _exec_state(plan)      # state="等成交"（保护单本就不该现在挂）
             audit("await_fill", {"symbol": symbol, "order_ids": _oids,
                                  "note": "等成交后再挂止盈/止损"})
             return plan
@@ -563,9 +610,27 @@ def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=L
                 _prot["sl"] = {"err": str(e)[:160]}
         plan["protection"] = _prot
         audit("protection_result", {"symbol": symbol}, _prot)
-        if plan.get("sl") and isinstance(_prot["sl"], dict) and _prot["sl"].get("err"):
-            # 止损没挂上 = 裸奔 → 必须让上层告警（不能静默）
-            raise BinanceError("市价仓已建立，但【止损挂单失败】：%s" % _prot["sl"]["err"])
+        # 🆕 第3步：挂完**回头核对**。B7 的 bracket_verify 原本只在限价入场后的
+        #    after_entry_filled 里调过，**市价入场这条路漏了** —— 补上。
+        try:
+            plan["verify"] = bracket_verify(
+                symbol, dir_,
+                stop=(float(plan["sl"]["triggerPrice"]) if plan.get("sl") else None),
+                tps=[{"price": float(t["price"])} for t in plan["tps"]])
+        except Exception as _ve:
+            plan["verify"] = {"missing": ["挂单核对异常：%s" % str(_ve)[:60]]}
+        _es = _exec_state(plan, verify=plan.get("verify"))
+        audit("exec_state", {"symbol": symbol}, _es)
+        if _es["naked"]:
+            # 止损没挂上（或核对不到）= 裸奔 → 必须让上层告警（不能静默）
+            _e = BinanceError("市价仓已建立，但【止损未挂上/未核对到】：%s"
+                              % "；".join(_es["missing"]))
+            _e.plan, _e.exec_state = plan, _es
+            raise _e
+        # 其余缺项（如某档止盈没挂上）= 半成功：不抛异常，交给上层按状态告警
+        return plan
+    plan["exec"] = {"state": "影子模式", "entry_ok": 0, "entry_failed": 0,
+                    "missing": [], "naked": False, "note": "未向交易所发任何单"}
     return plan
 
 

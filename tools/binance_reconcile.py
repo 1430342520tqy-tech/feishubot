@@ -24,10 +24,34 @@ import urllib.request
 import urllib.error
 
 BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
-CFG = os.path.join(BASE, "config.json")
 STATE = os.path.join(BASE, "v21", "state.json")
 TRADES = os.path.join(BASE, "v21", "trades_dryrun.jsonl")
-NOTIFY = os.path.join(BASE, "notify.json")
+
+
+def _cfg_api():
+    """币安密钥 —— 从环境变量（含 .env）读：`BINANCE_API_KEY` / `BINANCE_API_SECRET`。"""
+    try:
+        for _p in (os.path.join(BASE, "src"), BASE):
+            if _p not in sys.path:
+                sys.path.insert(0, _p)
+        import config
+        _s = config.secrets()
+        return _s["binance_api_key"], _s["binance_api_secret"]
+    except Exception:
+        return ((os.environ.get("BINANCE_API_KEY") or "").strip(),
+                (os.environ.get("BINANCE_API_SECRET") or "").strip())
+
+
+def _webhook():
+    """推送地址 —— 从环境变量（含 .env）读 `FEISHU_WEBHOOK`。"""
+    try:
+        for _p in (os.path.join(BASE, "src"), BASE):
+            if _p not in sys.path:
+                sys.path.insert(0, _p)
+        import config
+        return (config.secrets() or {}).get("feishu_webhook") or ""
+    except Exception:
+        return (os.environ.get("FEISHU_WEBHOOK") or "").strip()
 FAPI = "https://fapi.binance.com"
 SAPI = "https://api.binance.com"
 CST = datetime.timezone(datetime.timedelta(hours=8))
@@ -44,10 +68,7 @@ def load_json(path, default=None):
         return default if default is not None else {}
 
 
-cfg = load_json(CFG)
-B = cfg.get("binance") or {}
-KEY = (B.get("api_key") or "").strip()
-SEC = (B.get("api_secret") or "").strip()
+KEY, SEC = _cfg_api()
 
 OUT = []
 
@@ -81,10 +102,9 @@ def call(path, params=None, base=FAPI):
 
 
 def push(text):
-    n = load_json(NOTIFY)
-    url = n.get("webhook") or n.get("url") or ""
+    url = _webhook()
     if not url:
-        return "notify.json 里没有 webhook"
+        return "没拿到 webhook（.env 里没配 FEISHU_WEBHOOK）"
     body = json.dumps({"msg_type": "text", "content": {"text": text}}).encode()
     try:
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
@@ -113,7 +133,7 @@ except Exception:
 # ---------------- 2. 真实账户 ----------------
 if not KEY or not SEC:
     p("=" * 66)
-    p("❌ config.json 里没有 binance.api_key / api_secret，无法对账")
+    p("❌ 没有币安密钥（.env 里的 BINANCE_API_KEY / BINANCE_API_SECRET），无法对账")
     p("=" * 66)
     print("（本次只读对账未执行）")
     sys.exit(2)

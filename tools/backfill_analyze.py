@@ -3,7 +3,7 @@
 """
 空窗回补分析（只读）—— 2026-09-16 浏览器→API 切换留下的那段空窗里，到底漏了什么。
 
-背景（实测，见 docs/待办与未解决问题-2026-09-15.md 第 0.16.18 节）：
+背景（实测）：
   API 模式首次启动时游标只从"10 分钟前"开始、不回补更早历史，而浏览器模式的最后进度更早：
       机器人开单通知 09-16 16:00 ｜ 暴富龙 09-15 19:19 ｜ UA-nurseneil2 09-16 16:00 ｜ 黄金mansoor 09-16 13:52
   所以这些时间点到 09-17 00:00:36（API 起始游标）之间的消息**没有被处理**。
@@ -27,14 +27,17 @@
 import os
 import sys
 import json
-import time
 import datetime
 
-BASE = "/home/ubuntu/signal-bot"
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
 RUN = BASE + "/v21"
 OUT = "/tmp/backfill"
 CST = datetime.timezone(datetime.timedelta(hours=8))
-sys.path.insert(0, BASE)
+# 项目根目录 + src/ 都加进搜索路径：
+# 生产机上 .py 平铺在根目录，git 仓库里在 src/ —— 两种布局都要能 import。
+for _p in (os.path.join(BASE, "src"), BASE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # 文档里记录的真实空窗区间（浏览器模式最后进度 → API 起始游标）
 WINDOWS = {
@@ -78,17 +81,17 @@ def main():
     import dryrun_bot2 as bot          # 只借它的纯函数：strip_sender_prefix / fast_parse / read_chart
 
     os.makedirs(OUT, exist_ok=True)
-    # ⚠️ 必须把模块级路径**全部**改到 /tmp 再用它：
-    #    · read_chart 会往 RUN 写"读图中间产物"（imgmerge 自检里专门为此重定向过 RUN）
+    # ⚠️ 必须把模块级路径**全部**改到 /tmp 再用它，并静默通知：
+    #    · read_chart 会往 RUN 写"读图中间产物"
     #    · log() 会往 LOGF 追加（否则本脚本的分析过程会污染生产 run.log）
-    #    · notify() 读 NOTIFY_CFG —— 指到不存在的路径 → 无论如何都发不出飞书
+    #    · notify() 只读 .env 里的 FEISHU_WEBHOOK → 用 SIGNALBOT_SILENT 一条都不发
+    os.environ["SIGNALBOT_SILENT"] = "1"
     bot.RUN = OUT + "/run"
     bot.IMGDIR = OUT + "/imgs"
     bot.LOGF = OUT + "/run.log"
     bot.TRADES = OUT + "/trades.jsonl"
     bot.STATE = OUT + "/state.json"
     bot.RUNTIME = OUT + "/runtime_config.json"
-    bot.NOTIFY_CFG = OUT + "/notify.json"
     os.makedirs(bot.IMGDIR, exist_ok=True)
     os.makedirs(bot.RUN, exist_ok=True)
     before = _fingerprint()

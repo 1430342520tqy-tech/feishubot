@@ -5,13 +5,17 @@
 只读：不写任何生产文件、不发飞书、不下单。
 用法：venv/bin/python tools/verify_api_mode.py
 """
-import os, re, sys, json, time, subprocess, datetime
+import os, re, sys, json, subprocess, datetime
 
-BASE = "/home/ubuntu/signal-bot"
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
 RUN = BASE + "/v21"
 LOG = RUN + "/run.log"
 STATE = RUN + "/state.json"
-sys.path.insert(0, BASE)
+# 项目根目录 + src/ 都加进搜索路径：
+# 生产机上 .py 平铺在根目录，git 仓库里在 src/ —— 两种布局都要能 import。
+for _p in (os.path.join(BASE, "src"), BASE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 ok_all, fail = True, []
 

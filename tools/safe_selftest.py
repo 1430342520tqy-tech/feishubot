@@ -4,7 +4,8 @@
 安全自检器（sandbox runner）—— 在 /tmp 里跑 dryrun_bot2.py 的自检，并【实测证明】没碰生产。
 
 为什么需要它：
-  · 自检分支自身会把 RUNTIME/TRADES/STATE/LOGF/IMGDIR/NOTIFY_CFG/RUN 重定向到 /tmp；
+  · 自检分支自身会把 RUNTIME/TRADES/STATE/LOGF/IMGDIR/RUN 重定向到 /tmp；
+    并设 `SIGNALBOT_SILENT=1`（保证一条飞书都不发）；
   · 但"代码说它隔离"不等于"真的隔离"。这个运行器在跑之前/之后对生产关键文件做指纹，
     有任何一处变了就判 FAIL 并返回非 0 —— 用测量说话，而不是用声明说话。
   · 顺带记录 Chromium 进程数：自检绝不允许拉起浏览器（API 模式不需要浏览器）。
@@ -22,19 +23,33 @@ import json
 import hashlib
 import subprocess
 
-BASE = os.environ.get("SBX_BASE", "/home/ubuntu/signal-bot")
+# 路径唯一来源：以 SIGNAL_BOT_BASE 为准（与 src/config.py、src/binance_exec.py 统一）。
+# ⚠️ 旧名 SBX_BASE 的兼容已删（本项目未上线；且全仓搜过：从未有任何地方设过 SBX_BASE）。
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
 RUN = BASE + "/v21"
-BOT = BASE + "/dryrun_bot2.py"
 WORK = "/tmp/sbx_selftest"
+
+
+def _locate(*names):
+    """定位文件，兼容两种布局：生产机上是平铺在根目录，git 仓库里是 src/ 布局。
+    ⚠️ 这个差异是实测发现的：本文件与 tools/eval_charts.py 都假设文件在根目录，
+       而仓库里它们在 src/ —— 所以全新 clone 直接跑会 FAIL。"""
+    for n in names:
+        p = os.path.join(BASE, n)
+        if os.path.exists(p):
+            return p
+    return os.path.join(BASE, names[0])
+
+
+BOT = _locate("dryrun_bot2.py", "src/dryrun_bot2.py")
 
 DEFAULT_SUITE = ["--selftest-imgmerge", "--selftest-feishu"]
 
 # 【硬比对】机器人自己不会改的文件：自检若动了它们 = 污染生产，直接 FAIL
 HARD = [
     BOT,
-    BASE + "/feishu_api.py",
+    _locate("feishu_api.py", "src/feishu_api.py"),
     BASE + "/runtime_config.json",
-    BASE + "/notify.json",
 ]
 
 # 【软观察】机器人自己一直在写的文件（心跳/游标/已读记录）：只记录，不据此判 FAIL。
@@ -79,14 +94,6 @@ def _open_positions():
     try:
         d = json.load(open(RUN + "/state.json", encoding="utf-8")) or {}
         return len(d.get("open") or {})
-    except Exception as e:
-        return "ERR:%s" % type(e).__name__
-
-
-def _seen_count():
-    try:
-        d = json.load(open(RUN + "/state.json", encoding="utf-8")) or {}
-        return len(d.get("seen") or [])
     except Exception as e:
         return "ERR:%s" % type(e).__name__
 
@@ -180,6 +187,8 @@ def main():
 
     env = dict(os.environ)
     env.pop("DISPLAY", None)          # 不给浏览器留任何机会
+    # 静默开关：保证**任何**分支都不会往外发飞书（自检分支自己带 --selftest- 也会被 notifier 拦住）
+    env["SIGNALBOT_SILENT"] = "1"
     codes = {}
     for fl in flags:
         cmd = [sys.executable, BOT, fl]

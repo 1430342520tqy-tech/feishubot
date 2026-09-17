@@ -7,7 +7,7 @@
   · 用户授权的是**用户身份**令牌，范围里**没有** `im:message.send_as_user`，机器人不能以你的身份发言；
   · 机器人自带的 `notify()` 发出去的消息带【跟单机器人】等前缀，会被自己的 SELF_MARKS 过滤掉
     （这是**故意设计**，防止自环），所以走 notify() 测不出"能不能解析外部信号"。
-  · 因此直接用 notify.json 里的自定义机器人 webhook 发一条**普通文本**，它看起来就是一条普通群消息，
+  · 因此用 `.env` 里的自定义机器人 webhook 发一条**普通文本**，它看起来就是一条普通群消息，
     走的是和真实博主信号完全相同的处理路径。
 
 安全约定：
@@ -28,8 +28,7 @@ import sys
 import json
 import requests
 
-BASE = "/home/ubuntu/signal-bot"
-NOTIFY_CFG = BASE + "/notify.json"
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
 
 DEFAULT_TEXT = "【联调测试】UNI 做多 CMP 6.719 止损 6.39 止盈 7.180 / 8.216 / 9.302"
 
@@ -52,15 +51,11 @@ def main():
             with open(args[i + 1], encoding="utf-8") as f:
                 text = f.read().strip()
 
-    try:
-        cfg = json.load(open(NOTIFY_CFG, encoding="utf-8"))
-    except Exception as e:
-        print("读不到 %s：%s" % (NOTIFY_CFG, e))
-        return 2
-    hook = cfg.get("feishu_webhook")
-    print("notify.json 里有 feishu_webhook：%s" % ("是（地址不打印）" if hook else "否"))
+    hook = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
     if not hook:
+        print("没拿到 webhook（.env 里没配 FEISHU_WEBHOOK）")
         return 2
+    print("webhook：%s" % "已配置（地址不打印）")
 
     print("将要发送的文本（%d 字）：\n  %s" % (len(text), text))
     # 自查：文本里绝不能含机器人自己的通知前缀，否则会被自环防护忽略，测不出东西

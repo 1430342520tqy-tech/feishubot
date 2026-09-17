@@ -12,7 +12,6 @@ import json, os, sys, urllib.request
 BASE = os.path.dirname(os.path.abspath(__file__))
 V21 = os.path.join(BASE, "v21")
 TRADES = os.path.join(V21, "trades_dryrun.jsonl")
-NOTIFY_CFG = os.path.join(BASE, "notify.json")
 NOTIONAL = 900.0     # 300U 保证金 x 3倍
 
 
@@ -166,11 +165,10 @@ def render_plain(rows):
 
 
 def push(text):
-    try:
-        cfg = json.load(open(NOTIFY_CFG, encoding="utf-8"))
-        url = cfg["feishu_webhook"]
-    except Exception as e:
-        print("读 webhook 失败: " + str(e)[:80])
+    # webhook 从环境变量（含 .env）读：FEISHU_WEBHOOK
+    url = (os.environ.get("FEISHU_WEBHOOK") or "").strip()
+    if not url:
+        print("没拿到 webhook（.env 里没配 FEISHU_WEBHOOK），跳过推送")
         return
     body = json.dumps({"msg_type": "text", "content": {"text": text}}).encode()
     req = urllib.request.Request(url, data=body,

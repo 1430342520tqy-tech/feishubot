@@ -13,12 +13,12 @@
 放在机器人**同一个进程里调用**（结单时直接调），不新起进程、不常驻 →
 对这台 2C4G 的额外内存开销≈0，不影响开单。
 
-配置（服务器 config.json）：
-  "bitable": { "app_token": "<多维表格 URL 里 /base/ 后面那串>",
-               "table_id":  "<URL 里 table= 后面那串 tblXXXX>" }
+配置（**只看 .env / 环境变量**，见 src/config.py 头部）：
+  `BITABLE_APP_TOKEN` = 多维表格 URL 里 /base/ 后面那串
+  `BITABLE_TABLE_ID`  = URL 里 table= 后面那串 tblXXXX
+  `FEISHU_APP_ID` / `FEISHU_APP_SECRET` = 自建应用凭据（换 tenant_access_token 用）
 未配置时只写日志、不报错，机器人照常运行。
 """
-import os
 import json
 import time
 import datetime
@@ -26,8 +26,10 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
-BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
-CFG = os.path.join(BASE, "config.json")
+# .env 由 config 统一加载（见 config.py 文件头）
+import config
+
+BASE = config.base()
 FEISHU = "https://open.feishu.cn/open-apis"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -37,11 +39,11 @@ _TOKEN = {"v": None, "exp": 0.0}
 
 
 def _cfg():
-    try:
-        c = json.load(open(CFG, encoding="utf-8"))
-        return c.get("bitable") or {}, c
-    except Exception:
-        return {}, {}
+    """多维表格配置 —— 从环境变量（含 .env）读：`BITABLE_APP_TOKEN` / `BITABLE_TABLE_ID`。
+
+    返回 `(btable, {})`：第二个元素是历史遗留的占位，无用途。
+    """
+    return config.bitable(), {}
 
 
 # 字段定义：名称 -> (Bitable 类型, property)  —— 顺序即表里的从左到右顺序
@@ -145,9 +147,9 @@ def _token():
     """tenant_access_token，缓存到过期前 5 分钟"""
     if _TOKEN["v"] and time.time() < _TOKEN["exp"] - 300:
         return _TOKEN["v"]
-    _, c = _cfg()
-    app = c.get("feishu_app") or {}
-    aid, sec = (app.get("app_id") or "").strip(), (app.get("app_secret") or "").strip()
+    # 飞书凭据：变量名与来源只在 config 里定义一次（只读 .env / 环境变量）
+    _a = config.app_creds()
+    aid, sec = _a["app_id"], _a["app_secret"]
     if not aid or not sec:
         return None
     body = json.dumps({"app_id": aid, "app_secret": sec}).encode()
@@ -168,7 +170,7 @@ def _token():
 def _api(method, path, payload=None, token=None, timeout=20):
     tk = token or _token()
     if not tk:
-        return None, "没有可用的 tenant_access_token（config.json 缺 feishu_app 或换取失败）"
+        return None, "没有可用的 tenant_access_token（缺 FEISHU_APP_ID / FEISHU_APP_SECRET，或换取失败）"
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(FEISHU + path, data=data, method=method,
                                 headers={"Authorization": "Bearer " + tk,
@@ -202,39 +204,15 @@ def _hold_text(sec):
     return "%d分钟" % m
 
 
-def _exit_kind(why):
-    """归类结单方式。⚠️ 顺序有讲究：先判『手动/指令』再判止盈/保本/止损 ——
-    否则『手动平仓(全部平仓指令，TP1后移保本)』会因为含『保本』二字被误归成保本止损。"""
-    w = str(why or "")
-    if "手动" in w or "指令" in w:
-        return "手动平仓"
-    if "止盈" in w:
-        return "止盈"
-    if "保本" in w:
-        return "保本止损"
-    if "止损" in w:
-        return "止损"
-    return w or "-"
-
-
 def open_ts(tr):
-    """取开仓时刻（Unix 秒）。
-    新记录有 t_open_ts；旧记录只有 "09-12 22:23:52" 这种**无年份**字符串 → 按当年补全。"""
-    v = tr.get("t_open_ts")
-    if v:
-        try:
-            return int(v)
-        except Exception:
-            pass
-    s = tr.get("t_open")
-    if s:
-        try:
-            return int(datetime.datetime.strptime(
-                "%d-%s" % (datetime.datetime.now(CST).year, s),
-                "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST).timestamp())
-        except Exception:
-            pass
-    return None
+    """取开仓时刻（Unix 秒）。开单时必写 `t_open_ts`（见 `dryrun_bot2.finalize_pending`）。
+
+    ⚠️ 不再兼容"只有无年份 `t_open` 字符串"的旧记录 —— 本项目未上线，不存在这种数据。
+    """
+    try:
+        return int(tr.get("t_open_ts"))
+    except (TypeError, ValueError):
+        return None
 
 
 def build_row(tr, margin=None):

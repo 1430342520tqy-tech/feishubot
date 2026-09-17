@@ -3,7 +3,7 @@ from PIL import Image
 os.environ.setdefault("DISPLAY", ":99")
 from playwright.sync_api import sync_playwright
 
-BASE = "/home/ubuntu/signal-bot"
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
 OUT = BASE + "/v19"
 IMGDIR = OUT + "/ua_imgs"
 os.makedirs(IMGDIR, exist_ok=True)

@@ -5,12 +5,13 @@
 """
 import os, re, json, collections
 
-LOG = "/home/ubuntu/signal-bot/v21/run.log"
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
+LOG = BASE + "/v21/run.log"
 OUT = "/tmp/golden_msgs.json"
 # ⚠️ 日志已被 logrotate 轮转过：历史在 run.log.1 / 更早的 bak 里，必须一起读，
 #    否则标准答案集只剩轮转之后那几条（第一次跑就踩到了）。
-LOG_FILES = ["/home/ubuntu/signal-bot/v21/run.log"]
-_d = "/home/ubuntu/signal-bot/v21"
+LOG_FILES = [BASE + "/v21/run.log"]
+_d = BASE + "/v21"
 for _f in sorted(os.listdir(_d)):
     if _f.startswith("run.log.") and _f not in ("run.log",):
         LOG_FILES.append(os.path.join(_d, _f))

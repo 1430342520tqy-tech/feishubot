@@ -17,7 +17,11 @@ import sys
 import time
 import datetime
 
-sys.path.insert(0, "/home/ubuntu/signal-bot")
+# 项目根目录：环境变量优先（见 src/config.py）。
+# ⚠️ 生产机上 .py 平铺在根目录，git 仓库里在 src/ —— 两个位置都加，两种布局都能跑。
+_SB_BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
+sys.path.insert(0, os.path.join(_SB_BASE, "src"))
+sys.path.insert(0, _SB_BASE)
 import feishu_api as fa          # noqa: E402
 
 CST = datetime.timezone(datetime.timedelta(hours=8))

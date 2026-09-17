@@ -10,6 +10,8 @@
 """
 import os, re, json, sys, importlib.util
 
+_SB_BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
+
 MSGS_F = "/tmp/golden_msgs.json"
 SELF_ANY = ("【跟单机器人】", "【信号·", "【博主指令】", "【止盈成交", "【已结单", "【已开单",
             "【指令】", "【待确认】", "【机器人状态】", "【挂单情况】", "【你的持仓】",
@@ -120,7 +122,7 @@ def cmp_parse(exp, got):
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "/home/ubuntu/signal-bot/dryrun_bot2.py"
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_SB_BASE, "src", "dryrun_bot2.py")
     spec = importlib.util.spec_from_file_location("boteval", path)
     bot = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bot)

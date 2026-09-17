@@ -24,11 +24,26 @@
 """
 import os, re, sys, json, time, datetime
 
-BASE = "/home/ubuntu/signal-bot"
+BASE = os.environ.get("SIGNAL_BOT_BASE", "/home/ubuntu/signal-bot")
 RUN = BASE + "/v21"
 DEFAULT_LOGF = RUN + "/run.log"
 DEFAULT_CURSOR = RUN + "/watch_state.json"    # 本脚本自己的游标，不动机器人任何文件
-NOTIFY_CFG = BASE + "/notify.json"
+
+
+def webhook():
+    """取飞书 webhook —— 从环境变量（含 `.env`）读 `FEISHU_WEBHOOK`。
+
+    本工具是**外部巡检**（systemd timer 跑，不依赖机器人进程），是监控链路的一环，
+    所以只要能拿到地址就去发；拿不到就打印一句说清楚，不静默失败。
+    """
+    try:
+        for _p in (os.path.join(BASE, "src"), BASE):
+            if _p not in sys.path:
+                sys.path.insert(0, _p)
+        import config
+        return (config.secrets() or {}).get("feishu_webhook") or ""
+    except Exception:
+        return (os.environ.get("FEISHU_WEBHOOK") or "").strip()
 
 
 def _arg(flag, default):
@@ -114,12 +129,15 @@ def push_feishu(text, dry=False):
         print("[dry-run] 本应推送飞书：\n" + text)
         return
     try:
-        hook = json.load(open(NOTIFY_CFG, encoding="utf-8")).get("feishu_webhook")
+        hook = webhook()
+        if not hook:
+            print("[warn] 没拿到 webhook（.env 里没配 FEISHU_WEBHOOK），跳过推送")
+            return
     except Exception as e:
-        print("[warn] 读 notify.json 失败：%s" % e)
+        print("[warn] 取 webhook 失败：%s" % e)
         return
     if not hook:
-        print("[warn] notify.json 里没有 feishu_webhook，跳过推送")
+        print("[warn] 没拿到 webhook（.env 里没配 FEISHU_WEBHOOK）")
         return
     try:
         import requests
