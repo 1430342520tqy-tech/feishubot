@@ -1520,6 +1520,28 @@ def read_chart(path):
     _axis = fit_axis_scale([(t.get("line_y") or t["y"], t["value"])
                             for t in tags if t["cov"] >= TP_MIN_COV])
     _zones = find_zones(px, w, h)
+    # 🆕 2026-09-17：色块**清单 + 每条边的价格**（不看清"角色"也要能报出来）。
+    #   用户报障现场（20:04 黄金那张）：图上有 4 个色块、且左右错开**不共享边** →
+    #   我的"两框相邻"假设不成立 → 退回旧路径 → 只吐一句"无红色止损标签"，
+    #   用户原话："就算是读第二张图，那也不应该什么信息都没读出来啊，
+    #   至少也能看出灰色框框区间蓝色框框区间，以及对应的价格啊"。
+    #   所以这里**无论角色判不判得出来，都把色块区间和对应的价格列出来**。
+    _zones_priced = []
+    for _z in _zones[:6]:
+        try:
+            _p0 = axis_price(_axis, _z["y0"]) if _axis else None
+            _p1 = axis_price(_axis, _z["y1"]) if _axis else None
+            _l0 = nearest_label_value(tags, _p0, 0.02) if _p0 else None
+            _l1 = nearest_label_value(tags, _p1, 0.02) if _p1 else None
+            _zones_priced.append({"rgb": list(_z["rgb"]), "y0": _z["y0"], "y1": _z["y1"],
+                                  "p_top": _l0 or _p0, "p_bot": _l1 or _p1})
+        except Exception:
+            pass
+    if _zones_priced:
+        geo["zone_edges"] = _zones_priced
+        log("   🧱 图上色块清单（不看颜色）：%s"
+            % "; ".join("%s y=%d..%d → %s…%s" % (z["rgb"], z["y0"], z["y1"],
+                                                  z["p_top"], z["p_bot"]) for z in _zones_priced))
     _zr = read_zones(tags, _zones, _axis) if len(_zones) >= 2 else None
     if _zr and _zr.get("ok"):
         log("   🧩 色块读图: %s | 开仓 %s 两区交界 y=%d | 止损 %s 止损区 y=%s | 止盈 %s | "
@@ -1657,7 +1679,7 @@ def read_chart(path):
         log("   ⚠️ 几何读图异常（不影响旧逻辑）：%s" % str(_e)[:100])
     reds = [t for t in tags if t["color"] == "red"]
     if not reds:
-        return {"ok": False, "why": "无红色止损标签（标签区域 %d 个，两次读数一致可用 %d 个）"
+        return {"ok": False, "why": "没找到止损线或仓位色块（图上可读标签 %d 个，两次读数一致可用 %d 个）"
                                     % (len(merged), len(tags)), "tags": tags, "verify": verify,
                 "geo": geo, "mode": "legacy"}
     sl = min(reds, key=lambda t: t["value"])["value"]
@@ -2361,6 +2383,24 @@ def _img_is_repeat(chart, coin=None):
     这样"读偏一项、其余对得上"也能识别出来；真正的新信号不会有两项都撞上。
     """
     if not (chart and chart.get("ok") and chart.get("entry")):
+        # 🆕 2026-09-17：读不出"角色"时，用**色块每条边的价格**当特征。
+        #   用户报障现场（20:04 黄金那张赚钱状态图）：旧逻辑要求 chart.ok 才能比对，
+        #   于是这张"同一笔的进展图"没被判为重复 → 又推送了一次。现在用色块边价照样能认出。
+        _lv0 = []
+        for _z in ((chart or {}).get("geo") or {}).get("zone_edges") or []:
+            for _k in ("p_top", "p_bot"):
+                _v = _z.get(_k)
+                if isinstance(_v, (int, float)) and _v > 0:
+                    _lv0.append(_v)
+        _lv0 = sorted(set(_lv0))
+        if len(_lv0) < 2:
+            return False
+        for r in _img_sig_dump():
+            _rv0 = [r.get("entry"), r.get("sl")] + list(r.get("tps") or [])
+            _rv0 = [v for v in _rv0 if isinstance(v, (int, float)) and v > 0]
+            _hit0 = sum(1 for a in _lv0 if any(_near(a, b, 0.005) for b in _rv0))
+            if _hit0 >= 2:
+                return True
         return False
     _lv = [chart.get("entry"), chart.get("sl")] + list(chart.get("tps") or [])
     _lv = [v for v in _lv if isinstance(v, (int, float)) and v > 0]
@@ -2458,8 +2498,16 @@ def _push_img_only(group, rec, now=None):
             L.append("⚠️ 图上「哪个框是止损、哪个是止盈」的判断置信度=%s"
                      "（颜色提示与大小关系不完全一致）→ 请你确认" % _zc)
     else:
-        L.append("这张图已抓到并保存，但没能读出可用的点位（来源：chart）：%s"
+        L.append("这张图已抓到并保存，但**没能确定哪块是止损空间、哪块是止盈空间**（来源：chart）：%s"
                  % (ch.get("why") or "未知原因"))
+        # 🆕 2026-09-17 用户报障：读不出"角色"也必须把**看到的色块区间和价格**列出来
+        #   （原话："至少也能看出灰色框框区间蓝色框框区间，以及对应的价格啊"）
+        _ze = (ch.get("geo") or {}).get("zone_edges") or []
+        if _ze:
+            L.append("图上看到的色块区间（不看颜色，按位置从上到下）：")
+            for _z in _ze[:5]:
+                L.append("  · %s ～ %s" % (fmt_price(_z.get("p_top")), fmt_price(_z.get("p_bot"))))
+            L.append("（机器人不敢替你定哪块是止损、哪块是止盈 → 请你确认一眼；本条不会下单）")
     # 🆕 2026-09-17：这一段原来是**写死的**（读到了也照样印"未读到的：开仓/入场价"）——
     #   用户当天报障"开仓价识别为空"就是被这句话误导的。现在按**实读**写。
     _miss = []
@@ -7056,6 +7104,57 @@ if __name__ == "__main__":
             except Exception as _e:
                 _chk("bracket_verify 可运行", "异常 %s" % str(_e)[:60], "可运行")
             _bx.time.sleep = _sleep0
+            # ⑦ 平仓**绝不能再发 closePosition=true**（2026-09-17 实盘小单联调当场抓到 -4136）
+            _seen_pay = {}
+            _bx.LIVE[0] = True
+            _bx.position_of = lambda *_a, **_k: {"positionAmt": "0.14"}
+
+            def _cap(method, path, params=None, signed=True, test=False, timeout=20):
+                _seen_pay.update(params or {})
+                return {"orderId": 1}
+            _bx._req = _cap
+            try:
+                _bx.close_position_market("SOLUSDT", "LONG")
+                _chk("平仓用显式数量、不发 closePosition=true（实盘实测 -4136 拒单）",
+                     ("closePosition" in _seen_pay, "quantity" in _seen_pay), (False, True))
+            except Exception as _e:
+                _chk("平仓用显式数量、不发 closePosition=true", "异常 %s" % str(_e)[:60], "成功")
+            _bx.LIVE[0] = False
+
+        # ---------- ⑧p 多色块图（2026-09-17 20:04 用户报障现场）----------
+        print("\n[8p] 多色块图：角色定不了也要报出区间与价格；同一笔的进展图必须拦住")
+        _p204 = _prod_imgdir + "/f156159ea9_6aec0g.jpg"
+        if os.path.exists(_p204):
+            _r204 = read_chart(_p204) or {}
+            _ze = (_r204.get("geo") or {}).get("zone_edges") or []
+            _chk("20:04 那张多色块图 → 报出色块清单（≥2 块）", len(_ze) >= 2, True)
+            _chk("每块都带上下边价格（不是空的）",
+                 all((z.get("p_top") or z.get("p_bot")) for z in _ze[:2]), True)
+            _chk("失败原因不再提「红色」（颜色已不是判据）",
+                 "红色" not in (_r204.get("why") or ""), True)
+        else:
+            print("     （20:04 那张图不在，跳过）")
+        # 读不出角色时，用"色块边价"照样能认出"同一笔的进展图"
+        IMG_SIG_SEEN.clear()
+        _img_sig_remember({"ok": True, "entry": 4258.0, "sl": 4239.0, "tps": [4380.0]}, "XAU")
+        _fake_fail = {"ok": False, "why": "没找到止损线", "geo": {"zone_edges": [
+            {"p_top": 4380.0, "p_bot": 4258.0}, {"p_top": 4258.0, "p_bot": 4239.0}]}}
+        _chk("读不出角色、但色块边价与已见过的一致 → 判为同一笔（不推送）",
+             _img_is_repeat(_fake_fail), True)
+        _chk("色块边价都对不上 → 不误判",
+             _img_is_repeat({"ok": False, "geo": {"zone_edges": [
+                 {"p_top": 5000.0, "p_bot": 4900.0}, {"p_top": 4800.0, "p_bot": 4700.0}]}}), False)
+        IMG_SIG_SEEN.clear()
+        # 读不出角色时的推送文案：必须把"看到的色块区间"列出来
+        _SENT.clear()
+        _rec = {"group": "黄金mansoor", "when": "09-17 20:04:32", "imgs": ["x.jpg"],
+                "chart": _fake_fail, "meta": {}}
+        _push_img_only("黄金mansoor", _rec)
+        _chk("推送里列出了色块区间与价格（用户要求「至少也能看出灰色/蓝色框区间和价格」）",
+             any(("色块区间" in s) and (("4258" in s) or ("4380" in s)) for s in _SENT), True)
+        _chk("推送里也说清了不会下单", any("不会下单" in s for s in _SENT), True)
+        _chk("推送里不再出现「红色止损」这种旧说法", any("红色" in s for s in _SENT), False)
+        _SENT.clear()
 
         # ⑧ 高危开关：否定词不许被当成"开"（实盘/测试模式原来用 `"开" in cmd` 判定）
         _chk("「实盘模式 不要开 确认」同时含 开+确认（所以必须靠否定词挡住）",

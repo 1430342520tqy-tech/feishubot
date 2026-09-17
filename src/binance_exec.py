@@ -383,13 +383,26 @@ def move_sl(symbol, dir_, new_stop, qty=None):
 
 
 def close_position_market(symbol, dir_, qty=None):
-    """市价平仓：qty=None 表示全平（closePosition）；否则平指定数量（减仓）"""
-    p = {"symbol": symbol, "side": _side_for(dir_, closing=True), "type": "MARKET",
-         "positionSide": _ps(dir_)}
+    """市价平仓：qty=None 表示全平（**自己读持仓数量后用显式 quantity**）。
+
+    🔴 2026-09-17 真实小单联调当场抓到的 bug（必须记住）：
+      原来 qty=None 时发的是 `closePosition=true`，币安现在直接拒单：
+        HTTP 400 {'code': -4136, 'msg': 'Target strategy invalid for orderType MARKET,closePosition true'}
+      后果很严重：**平不掉仓**。当场留下 0.14 SOL 的多头持仓，而且那一刻止损/止盈已经
+      被"撤单收尾"撤掉了 → 成了一个**没有任何保护的裸仓**（我立刻用手工显式数量的方式平掉了）。
+      现在：一律用**显式 quantity**（先读持仓数量）——这也和止损接口用显式 quantity 的理由一致。
+    """
     if qty is None:
-        p["closePosition"] = "true"
-    else:
-        p["quantity"] = fmt_qty(symbol, qty)
+        try:
+            _pos = position_of(symbol, dir_) or {}
+            qty = abs(float(_pos.get("positionAmt") or 0))
+        except Exception as e:
+            raise BinanceError("平仓前读不到持仓数量（不敢用 closePosition=true，币安会报 -4136）：%s"
+                               % str(e)[:120])
+        if not qty:
+            raise BinanceError("平仓失败：交易所当前没有 %s 的 %s 持仓（数量 0）" % (symbol, dir_))
+    p = {"symbol": symbol, "side": _side_for(dir_, closing=True), "type": "MARKET",
+         "quantity": fmt_qty(symbol, qty), "positionSide": _ps(dir_)}
     audit("close_market", p, mode="LIVE" if LIVE[0] else "shadow")
     if not LIVE[0]:
         return {"shadow": True, "would_send": p}
