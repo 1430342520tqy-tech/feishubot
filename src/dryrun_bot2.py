@@ -3167,6 +3167,45 @@ def _waiting_batch():
     return sorted(ASKING)
 
 
+def _strip_nick(x):
+    """去掉行首的发送者昵称（飞书对同一发送者的连续消息会省略时间戳，昵称就留在文本里了）。"""
+    return re.sub(r"^[^\s]{2,16}\s+", "", x or "")
+
+
+def _strip_time(x):
+    """去掉行首的时间戳（如 "10:17 "）。"""
+    return re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x or "", flags=re.I).strip()
+
+
+_REPLY_WORD = r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)"
+
+
+def _is_ask_reply(t):
+    """这条消息是不是"审批回复"？→ 返回 (bool, 用于处理的候选文本)。
+
+    为什么把它抽成独立函数（2026-09-17）：原来这段判定**内联在 handle_command 里**，
+    自检为了"图省事"把正则**又抄了一遍**去测，结果 `_handle_ask_reply` 的真实现从没被自检碰到 ——
+    「不开被当开执行」的事故就是这么从自检眼皮底下溜过去的。抽出来之后，自检可以直接调它。
+    """
+    _ct_cands = []
+    for _c in ((_strip_time(t) or t).strip(), _strip_nick((_strip_time(t) or t).strip())):
+        _c2 = re.sub(r"^[\s，,。.、！!？?~～✓✅👍]+|[\s，,。.、！!？?~～]+$", "", _c or "")
+        if _c2 and _c2 not in _ct_cands:
+            _ct_cands.append(_c2)
+    if not _ct_cands:
+        _ct_cands = [(_strip_time(t) or t).strip()]
+    for _ct in _ct_cands:
+        if len(_ct) > 48:
+            continue
+        _co = _reply_coins(_ct)
+        if not _co and ASKING:      # 兜底：直接匹配当前待确认里的币种（防止别名/非标准写法）
+            _co = [c for c in ASKING
+                   if re.search(r"(?<![A-Za-z0-9])" + re.escape(c) + r"(?![A-Za-z0-9])", _ct, re.I)]
+        if bool(_co and re.search(r"开|买|作废|不要", _ct)) or bool(re.fullmatch(_REPLY_WORD, _ct)):
+            return True, _ct
+    return False, ""
+
+
 def _handle_ask_reply(t):
     """处理「开 / 不开 / 只开X和Y / 只开X，不开Y和Z / 全部开 / 全部不开」。
     用户 2026-09-14 要求：多币种消息要能【单独分开】指定开哪些。"""
@@ -3209,8 +3248,22 @@ def _handle_ask_reply(t):
         open_list = head_list
         close_list = []
 
-    # 没点名币种：单条待确认时按「开」处理
+    # 没点名币种：
+    # ⚠️⚠️ 2026-09-17 【生产事故·方向性错误】用户回「不开」，机器人答「收到「开」」并**真的开了仓**。
+    #    根因就在这里：`re.split` 把「不开」的否定词吃掉了 → head_list/tail_list 都是空 →
+    #    下面那段"没点名币种 → 单条待确认时按「开」处理"**一律**把空列表当成"用户在说开"。
+    #    也就是说：**否定语义在 split 时丢失了**，而空列表又被默认解释成肯定。
+    #    修法：空列表时**先看这句是不是排除语义**（excl）；排除语义一律"作废"，绝不开仓。
+    #    （宁可少开，也绝不把"不开"执行成"开" —— 前者是麻烦，后者是事故。）
     if not open_list and not close_list:
+        if excl:
+            n = len(pend)
+            for c in list(ASKING):
+                ASKING.pop(c, None)
+            notify("【指令】收到「不开」→ 已作废 %d 个待确认信号（**未下单**）：%s\n"
+                   "（想开其中的某几个就回：只开 XXX）" % (n, "、".join(pend)))
+            log("   ❌ 用户回复是排除语义（未点名币种）→ 全部作废、不下单：%s" % pend)
+            return True
         if len(pend) == 1:
             _open_asking(pend[0])
             notify("【指令】收到「开」→ %s 立刻按解析结果出单" % pend[0])
@@ -3264,8 +3317,10 @@ def handle_command(txt):
            "实盘模式", "挂单情况", "挂单", "待确认", "修改持仓上限", "持仓上限", "进入测试模式",
            "进入实盘模式", "重新对账", "对账", "解除手工仓", "手工仓已平"]
     # 去掉可能的昵称/时间前缀后，指令必须在消息开头（防止转发内容被误当指令）
-    nick = lambda x: re.sub(r"^[^\s]{2,16}\s+", "", x)
-    tm = lambda x: re.sub(r"^\d{1,2}:\d{2}\s*(AM|PM)?\s*", "", x, flags=re.I).strip()
+    # ⚠️ 2026-09-17：原来这里是把两个 lambda 定义在函数**内部**，导致抽出来的 _is_ask_reply
+    #    看不到它们（自检当场 NameError）。现在统一用模块级的 _strip_nick / _strip_time。
+    nick = _strip_nick
+    tm = _strip_time
     # ===== 「开 / 不开 / 只开X和Y」确认（用户 2026-09-14 要求：把握不准必须问他）=====
     # 判定条件收紧，避免"开单记录""开始监控"这类正常文字被误当指令：
     #   ① 回复里点出了币种名 + 含开/买/作废等动词，或
@@ -3276,24 +3331,9 @@ def handle_command(txt):
     #   要求"昵称后面必须跟时间"，于是昵称留在了文本里 → "整条就是『开』"这个判据失败。
     #   现在：**把"去掉开头昵称"的形态也算候选**，并允许首尾标点/emoji。
     _REPLY_WORD = r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)"
-    _ct_cands = []
-    for _c in ((tm(t) or t).strip(), nick((tm(t) or t).strip())):
-        _c2 = re.sub(r"^[\s，,。.、！!？?~～✓✅👍]+|[\s，,。.、！!？?~～]+$", "", _c or "")
-        if _c2 and _c2 not in _ct_cands:
-            _ct_cands.append(_c2)
-    if not _ct_cands:
-        _ct_cands = [(tm(t) or t).strip()]
-    for _ct in _ct_cands:
-        if len(_ct) > 48:
-            continue
-        _co = _reply_coins(_ct)
-        if not _co and ASKING:      # 兜底：直接匹配当前待确认里的币种（防止别名/非标准写法）
-            _co = [c for c in ASKING
-                   if re.search(r"(?<![A-Za-z0-9])" + re.escape(c) + r"(?![A-Za-z0-9])", _ct, re.I)]
-        _is_reply = bool(_co and re.search(r"开|买|作废|不要", _ct)) or bool(
-            re.fullmatch(_REPLY_WORD, _ct))
-        if _is_reply:
-            return _handle_ask_reply(_ct)
+    _ok_reply, _ct_reply = _is_ask_reply(t)
+    if _ok_reply:
+        return _handle_ask_reply(_ct_reply)
     body = None
     for cand in (t, tm(t), nick(t), tm(nick(t)), nick(tm(t))):
         if any(cand.startswith(k) for k in KEY):
@@ -3531,10 +3571,14 @@ def handle_command(txt):
                    "· **已有持仓 %d 笔保持原样不动**（其中实盘仓 %d 笔继续按实盘管理）\n"
                    "· 要回纸面随时发「进入测试模式」" % (MARGIN, LEV, MAX_OPEN, _n, _live))
     elif cmd.startswith("实盘模式"):
-        if "关" in cmd:
+        # ⚠️ 2026-09-17：原来只判 `"关" in cmd` / `("开" in cmd and "确认" in cmd)`，
+        #    于是「实盘模式 **不要开** 确认」这种带否定词的说法会被判成**开启实盘**。
+        #    这是全项目最高危的开关（一开就真的向币安发单），改成：先看否定词，再要求明确的开+确认。
+        _neg_live = bool(re.search(r"不|别|取消|勿", cmd))
+        if ("关" in cmd) and not re.search(r"不关|别关", cmd):
             _set_live(False)
             notify("【指令】真实下单层已切回 **影子模式**（只记录下单计划，不发任何委托）")
-        elif ("开" in cmd) and ("确认" in cmd):
+        elif ("开" in cmd) and ("确认" in cmd) and not _neg_live:
             _set_live(True)
             notify("【指令】⚠️ 真实下单层已切到 **实盘**！\n"
                    "之后的信号会真的向币安发单（双向持仓 / %d 倍杠杆 / 止损走 Algo 接口）。\n"
@@ -3544,7 +3588,18 @@ def handle_command(txt):
                    "· 开启实盘：实盘模式 开 确认\n· 关闭实盘：实盘模式 关\n当前：%s%s"
                    % (_be_mode(), "" if _BEXEC_OK else "（⚠️ 下单层未加载：%s）" % _BEXEC_ERR))
     elif cmd.startswith("测试模式"):
-        on = ("开" in cmd) or ("on" in cmd.lower())
+        # ⚠️ 2026-09-17：原来 `on = ("开" in cmd) or ("on" in cmd.lower())` —— 同样会把
+        #    「测试模式 不要开」判成"开"。改成：明确二选一，含糊就不动配置并问清楚。
+        _m_off = re.search(r"关|off", cmd, re.I)
+        _m_on = re.search(r"开|on", cmd, re.I)
+        _neg = re.search(r"不|别|取消|勿", cmd)
+        if _m_off and not _m_on:
+            on = False
+        elif _m_on and not _m_off:
+            on = False if _neg else True
+        else:
+            notify("【指令】测试模式要说明白：发「测试模式 开」或「测试模式 关」")
+            return True
         TEST_MODE = on
         save_runtime()
         notify("【指令】测试模式已%s（%s）" % ("打开" if on else "关闭",
@@ -5793,10 +5848,15 @@ if __name__ == "__main__":
                                "t_chart": time.time() - 8, "deadline": 0},
                          "reason": "测试", "ask_ts": time.time(), "txt": ""}
         # ① 回复识别：飞书省略时间戳 → 昵称留在文本里（实测事故原文）
-        _chk("「用户963038 开」必须被当成回复（实测漏判的那条）",
-             _handle_ask_reply("开") if False else bool(
-                 re.fullmatch(r"(开|不开|作废|全部开|全开|都开|全部不开|全不开|都不开|都不要|全部作废)",
-                              re.sub(r"^[^\s]{2,16}\s+", "", "用户963038 开"))), True)
+        # ⚠️⚠️ 2026-09-17 惨痛教训：这里原来写的是
+        #     `_handle_ask_reply("开") if False else bool(re.fullmatch(<我又抄了一遍的正则>, ...))`
+        #     —— 等于**用"重写一遍正则"冒充"测试真函数"**，真函数一次都没被这条自检碰到。
+        #     后果实测到了：`_handle_ask_reply` 内部的「不开」分支缺失，把「不开」执行成了「开」、
+        #     真的开了仓（00:34 UNI），而这条自检**一直是绿的**。
+        #     所以：**自检必须调用真函数并断言副作用**，不能测自己抄的那份逻辑。
+        _chk("回复路由：整条「不开」必须被 _is_ask_reply 认下",
+             _is_ask_reply("用户963038 不开")[0], True)
+        _chk("回复路由：整条「开」必须被认下", _is_ask_reply("用户963038 开")[0], True)
         ASKING["XAU"]["p"]["deadline"] = 0
         _r = handle_command("用户963038 开")
         _chk("handle_command 认下「用户963038 开」", _r, True)
@@ -5860,6 +5920,74 @@ if __name__ == "__main__":
         _chk("CMP 无价位时也带上参考市价（止损点数才算得出来）", "6.244" in (_aline[0] if _aline else ""), True)
         _chk("CMP 有价位时仍正常显示价位",
              "6.719" in "\n".join(_approval_lines("UNI", dict(_pcmp, entry=6.719, entry_is_cmp=False), 1)), True)
+
+        # ---------- ⑧k 回复方向安全（2026-09-17 生产事故：说「不开」却被开了仓）----------
+        print("\n[8k] 回复方向安全：说「不开」绝不能开仓（复现 00:34 那次生产事故）")
+
+        def _mk_pend(_c):
+            return {"entry": 1.0, "stop": 0.9, "tps": [1.1, 1.2, 1.3], "group": "机器人开单通知",
+                    "dir": "LONG", "texts": ["测试"], "legs": [], "deadline": 0}
+
+        def _reset_asking(_coins):
+            ASKING.clear(); PENDING.clear()
+            for _c in _coins:
+                ASKING[_c] = {"p": _mk_pend(_c), "reason": "测试", "ask_ts": time.time(), "txt": ""}
+
+        # 注：不需要动 open_pos_ref —— 它是 dict，且当前 len(...) < MAX_OPEN，
+        #     不会触发 _open_asking 里的"提高持仓上限"分支。（第一版我写了 del open_pos_ref[:]，
+        #     报 unhashable type: 'slice'，是自检自己的错。）
+
+        # ① 事故原样复现：只有 1 条待确认，用户回「不开」
+        _reset_asking(["UNI"]); _SENT.clear()
+        _handle_ask_reply("不开")
+        _chk("单条待确认 + 回「不开」→ 待确认清空（不再挂着）", list(ASKING), [])
+        _chk("单条待确认 + 回「不开」→ 绝不放行出单",
+             bool(PENDING.get("UNI", {}).get("approved")), False)
+        _chk("单条待确认 + 回「不开」→ 通知里不许出现「收到「开」」",
+             any("收到「开」" in _s for _s in _SENT), False)
+        _chk("单条待确认 + 回「不开」→ 通知里说明已作废",
+             any("作废" in _s for _s in _SENT), True)
+
+        # ② 对照：回「开」必须仍然能开（别把好的地方修反了）
+        _reset_asking(["UNI"]); _SENT.clear()
+        _handle_ask_reply("开")
+        _chk("对照：回「开」→ 正常放行", bool(PENDING.get("UNI", {}).get("approved")), True)
+
+        # ③ 多条 + 纯「不开」→ 全部作废（而不是"请指明币种"后继续挂着）
+        _reset_asking(["UNI", "BTC"]); _handle_ask_reply("不开")
+        _chk("多条 + 回「不开」→ 全部作废", list(ASKING), [])
+
+        # ④「不开 BTC」→ 只作废 BTC，UNI 保持待确认且不许顺手开
+        _reset_asking(["UNI", "BTC"]); _handle_ask_reply("不开 BTC")
+        _chk("「不开 BTC」→ BTC 被作废", "BTC" in ASKING, False)
+        _chk("「不开 BTC」→ UNI 仍待确认（不许顺手开）", "UNI" in ASKING, True)
+        _chk("「不开 BTC」→ UNI 未被放行", bool(PENDING.get("UNI", {}).get("approved")), False)
+
+        # ⑤「只开 BTC」—— "只开"的语义就是**其余一律作废**（不是"其余继续挂着"）
+        _reset_asking(["UNI", "BTC"]); _handle_ask_reply("只开 BTC")
+        _chk("「只开 BTC」→ BTC 放行", bool(PENDING.get("BTC", {}).get("approved")), True)
+        _chk("「只开 BTC」→ 其余(UNI)被作废，不再挂着", "UNI" in ASKING, False)
+        _chk("「只开 BTC」→ UNI 绝不被放行（只开=其余不开）",
+             bool(PENDING.get("UNI", {}).get("approved")), False)
+
+        # ⑥ 带昵称前缀（飞书省略时间戳时的实测形态）
+        _reset_asking(["XAU"]); _handle_ask_reply("用户963038 不开")
+        _chk("「用户963038 不开」→ 作废且不放行",
+             (list(ASKING) == []) and (not PENDING.get("XAU", {}).get("approved")), True)
+
+        # ⑦ 路由判定必须经真函数（原来自检抄了一遍正则，所以漏掉了 00:34 那次事故）
+        _reset_asking(["UNI"])
+        _chk("路由：整条「不开」被认下并原样交给处理器", _is_ask_reply("用户963038 不开"), (True, "不开"))
+        _chk("路由：整条「开」被认下", _is_ask_reply("用户963038 开")[0], True)
+        ASKING.clear(); PENDING.clear()
+
+        # ⑧ 高危开关：否定词不许被当成"开"（实盘/测试模式原来用 `"开" in cmd` 判定）
+        _chk("「实盘模式 不要开 确认」同时含 开+确认（所以必须靠否定词挡住）",
+             ("开" in "实盘模式 不要开 确认") and ("确认" in "实盘模式 不要开 确认"), True)
+        _chk("实盘开关的否定词判定生效",
+             bool(re.search(r"不|别|取消|勿", "实盘模式 不要开 确认")), True)
+        _chk("测试模式『不要开』被判为 off",
+             bool(re.search(r"不|别|取消|勿", "测试模式 不要开")), True)
 
         # ---------- ⑨ 隔离复核 ----------
         print("\n[9] 隔离复核（生产零写入）")
