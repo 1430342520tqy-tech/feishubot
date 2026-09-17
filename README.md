@@ -37,7 +37,7 @@ im:message.group_msg:get_as_user im:resource offline_access`）。
 - ⚠️ **切换当天有一段空窗**：API 首次启动的游标是"从 10 分钟前开始、不回补更早历史"，
   所以各群从"浏览器模式最后进度"到 09-17 00:00:36 之间的消息**没有被处理**。
   飞书 API 支持按时间范围拉回，这些消息**仍可原样回补**（含卡片与图片原图）。
-  详见 `docs/待办与未解决问题-2026-09-15.md` 第 0.16.18 节
+  回补工具：`tools/backfill_analyze.py`
 
 ## 读图规则（关键）
 
@@ -90,28 +90,63 @@ KOL 常把 **K 线图单独发一条消息**（没有文字、没有币种）。
 
 ```
 src/
-  dryrun_bot2.py      当前使用的机器人（API 取消息 + 图片不丢 + 审批闸门 + 全链路计时）
+  dryrun_bot2.py      主程序：主循环 + 信号解析/校验 + 持仓管理 + 指令系统 + 自检分支
+  config.py           配置的唯一来源（路径/密钥；键名只在这里定义一次）
+  notifier.py         飞书推送的唯一出口
+  ledger.py           真实层账本 + 对账器（"币安上到底还剩多少"的唯一来源）
+  chart_llm.py        整图直读读图器（可选，默认不用；见下文 chart_reader）
+  envload.py          零依赖 .env 加载器
   feishu_api.py       飞书官方 API 取消息层（用户身份令牌、卡片解析、原图下载、令牌自动续期）
-  dryrun_bot_v1.py    早期版本（单页面切换会话，供对比参考）
+  binance_exec.py     币安真实下单层（幂等键 / 先挂后撤 / 挂完核对 / 执行状态）
+  trade_stats.py      成交统计 → 飞书多维表格
+.env.example          环境变量模板 —— **唯一的配置模板**（复制成 .env；配完 chmod 600）
 tools/
+  local_selftest.py   本机自检台（不用服务器/不联网就能跑自检，见下文）
   verify_api_mode.py  上线后一键验证：令牌 / 配置 / 日志证据 / API 游标 / 进程（只读）
   safe_selftest.py    隔离自检器：逐个跑自检分支 + 运行前后指纹比对，实测证明不碰生产
+  verify_runtime_config.py    验收：runtime_config.json 保存时不许丢键（含 fetch_mode 回滚开关）
+  verify_config_template.py   验收：config.example.json 里每个键都必须有代码真的在读
   send_test_msg.py    往监控群发测试信号（默认 dry-run；只读凭据、不打印 webhook、自带自环前缀自查）
   peek_recent.py      把群里最近的真实消息原样读回来（日志里的通知行会截断，别靠猜）
   backfill_analyze.py 历史区间回补分析（只读、隔离自检、可选读图；用于核对"哪段时间漏了什么"）
   log_watch.py        外部日志巡检（systemd timer 每 5 分钟；只认"新增"故障行，按关键字分别冷却）
-  read_chart_final.py 图表读取（像素定位 + 逐块 OCR + 覆盖率判据）
-  tags_v26.py         色块矩形检测 + 分块识别的算法原型
-  scrape_v19.py       群历史抓取（消息级，含图表下载）
+  scrape_v19.py       群历史抓取（消息级，含图表下载）—— ⚠️ 它仍是**浏览器模式的 profile 登录工具**，
+                      回退 `fetch_mode=browser` 前先跑一次它把登录态做好
   scrape_v16.py       抓取算法原型（媒体元素扫描）
-  calib_tags.py       色块颜色标定工具
-config/
-  config.example.json 配置模板（API Key、通知 Webhook、监控群）
 docs/
   交接文档.md          项目背景、已完成/未完成、坑与结论
 ```
 
-## 测试（必须在 /tmp 里跑，绝不碰生产）
+## 运行配置（`runtime_config.json`，大部分改完**不用重启**）
+
+| 键 | 作用 | 默认 |
+|---|---|---|
+| `live_trading` | 实盘总开关（用聊天指令「实盘 开/关」切） | `false` |
+| `chart_reader` | 读图方式：`geo`（现有）/ `llm`（整图直读大模型） | `geo` |
+| `chart_llm_reads` | 整图直读时同一张图读几次（≥2 才有一致性校验） | `2` |
+| `fetch_mode` | 取消息方式：`api` / `browser` | `api` |
+| `margin` / `leverage` / `max_open` / `groups` / `require_approval` … | 金额/杠杆/持仓上限/监控群/审批 | 见 `load_runtime()` |
+
+⚠️ **不要把这些搬到 `.env`** —— 它们靠聊天指令**热加载**（改配置不用重启）；
+搬进 `.env` 就变成"必须重启才生效"，而重启会有几秒盲窗。
+
+## 测试
+
+### 本机自检台（不用服务器、不用网络）
+
+```bash
+python3 tools/local_selftest.py            # 跑全部能跑的分支
+python3 tools/local_selftest.py --verbose  # 连自检的完整输出一起打
+```
+
+它用"桩模块"替掉本机没装的第三方库（requests / PIL / playwright / ccxt），
+把路径全导到 `/tmp` 沙箱 —— 所以能在**任意机器**上验证改完的代码没坏。
+
+⚠️ **本机能跑 8 个分支**：`ledger` / `exec` / `chartllm` / `parse` / `tp` / `b5` / `b1` / `approval`。
+**跑不了两个**：`--selftest-feishu`（要真调飞书）、`--selftest-imgmerge`（要真实图片）——
+这两个必须上服务器。而且**本机通过 ≠ 生产能跑**（库是桩、网络被拦）。
+
+### 服务器上的隔离自检（上线前必跑）
 
 ```bash
 cd /home/ubuntu/signal-bot
@@ -120,7 +155,8 @@ venv/bin/python safe_selftest.py --selftest-imgmerge --selftest-feishu \
 ```
 
 每个 `--selftest-*` 分支都以 `sys.exit` 结束，所以**一次只能给一个 flag**，由运行器逐个起进程跑。
-自检自身会把 `RUNTIME / TRADES / STATE / LOGF / IMGDIR / NOTIFY_CFG / RUN` 重定向到 `/tmp`；
+自检自身会把 `RUNTIME / TRADES / STATE / LOGF / IMGDIR / RUN` 重定向到 `/tmp`，
+并设 `SIGNALBOT_SILENT=1` 保证一条飞书都不发；
 运行器再加一道**指纹比对**（硬文件逐字节一致、持仓数与图片目录不许变、日志新增行不许出现"自检"字样、
 全程不许出现 Chromium 进程），任何一条不满足即判 FAIL 并返回非 0。
 
@@ -129,33 +165,41 @@ venv/bin/python safe_selftest.py --selftest-imgmerge --selftest-feishu \
 
 ## 部署
 
+**一条命令**（在仓库目录里跑；幂等，可重复执行）：
+
 ```bash
-# 1) 依赖
-python3 -m venv venv && ./venv/bin/pip install playwright ccxt requests pillow
-./venv/bin/playwright install chromium
+git clone <repo> /home/ubuntu/signal-bot && cd /home/ubuntu/signal-bot
+cp .env.example .env && vi .env        # 填密钥/凭据/推送地址（缺必备项会拒绝启动）
+bash deploy/setup.sh                   # 依赖 + logrotate + 巡检 timer + pm2（含开机自启）
+```
 
-# 2) 配置
-cp config/config.example.json config.json   # 填入 API Key / Webhook / 监控群
-export DEEPSEEK_API_KEY=sk-xxx              # 或写进 config.json
+`setup.sh` 做五件事：① 建 venv 装 `requirements.txt` ② 校验 `.env` 必备项
+③ 装 `logrotate`（run.log 轮转）④ 装外部巡检 timer（每 5 分钟）⑤ 配 pm2 并开机自启。
+`--no-pm2` 跳过 pm2；`--uninstall` 反向卸载（**不碰 `.env` / `runtime_config.json` / `v21/`**）。
 
-# 3) 飞书授权（API 模式只需一次）
-#    在浏览器打开 tools/verify_api_mode.py 里打印的授权链接，拿到 code 后写入令牌文件
-#    （令牌文件 feishu_user_token.json 权限 600、不进 git；access 2h、refresh 7 天，自动续期）
-#    备用方式：回退浏览器模式时才需要登录一次 profile
-# ./venv/bin/python tools/scrape_v19.py
+**飞书授权**（API 模式只需一次）：打开 `tools/verify_api_mode.py` 打印的授权链接，
+拿到 code 后写入令牌文件（权限 600、不进 git；access 2h、refresh 7 天，自动续期）。
 
-# 4) 启动机器人（纸面模式）
-pm2 start ./venv/bin/python --name dryrun-bot2 -- -u src/dryrun_bot2.py
-pm2 logs dryrun-bot2
+**上线后一键验证**（只读）：`venv/bin/python tools/verify_api_mode.py`
 
-# 5) 上线后一键验证（只读，不改任何东西）
-venv/bin/python verify_api_mode.py
+### 部署布局
+
+**代码在 `src/`、工具在 `tools/`，从仓库根目录运行**（pm2 跑 `src/dryrun_bot2.py`）。
+所有 `tools/` 脚本都会同时把 `BASE` 与 `BASE/src` 加进 import 路径，所以从仓库根跑一定可用。
+
+### 依赖
+
+`requirements.txt` 是四个直接依赖（requests / pillow / ccxt / playwright）。
+**上服务器后请立刻锁版本**（本文件故意不写死版本号 —— 服务器上装的才是被实测过的）：
+
+```bash
+./venv/bin/pip freeze > requirements.lock.txt
 ```
 
 ## 运行环境注意事项
 
 - 服务器 **2C4G**（实测 3719MB）。**浏览器模式**下 Chromium 常驻约 **2.7GB** → 内存被吃满过，
-  2026-09-16 深夜曾把整机拖到"SSH 能建连但 sshd 发不出 banner"（详见 `docs/待办与未解决问题-2026-09-15.md` 第 0.16.17 节）。
+  2026-09-16 深夜曾把整机拖到"SSH 能建连但 sshd 发不出 banner"。
   现在默认 **API 模式不开浏览器**，该风险随之消失；**务必保留 swap**：
   ```bash
   sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile
@@ -167,15 +211,21 @@ venv/bin/python verify_api_mode.py
 
 ## 已知限制
 
-1. **真实下单层尚未实现**（当前 dryRun，只生成计划与推送）
-2. **币安 API Key 尚未创建**（当前只用公开行情接口，无需密钥）
-3. 博主"规则止损"（如 4H 收盘跌破 X）目前按该价位的硬止损近似处理
-4. ~~**重启期间（开 5 个页面约 4.5 分钟）到达的信号会被跳过丢失**~~
-   → API 模式下**不再开浏览器，重启盲区约几秒**；只在回退到 `fetch_mode=browser` 时才会重新出现 4.5 分钟盲窗
-5. **2026-09-16 浏览器 → API 切换当天，各群存在一段未处理空窗**（如暴富龙约 29 小时、其余约 8~10 小时）：
-   API 首次启动游标只从"10 分钟前"开始。消息仍在飞书、**可按时间范围回补**，但当时确实没被处理（第 0.16.18 节）
-6. 加仓（DCA）只记录点位，尚未实现真实加仓下单
-7. 同一张图上的价格标签 OCR 偶有 0.0x% 级误差（挂单取整后通常同价）
+1. **真实下单层可用**（`src/binance_exec.py`：幂等键 / 先挂后撤 / 挂完回头核对 / 执行状态）。
+   ⚠️ **但还没上实盘** —— 未走完小资金灰度前请保持 `live_trading=false`
+2. 博主"规则止损"（如 4H 收盘跌破 X）目前按该价位的硬止损近似处理
+3. **重启盲区约几秒**（API 模式不开浏览器）；只有回退到 `fetch_mode=browser` 时才会
+   重新出现约 4.5 分钟盲窗
+4. **2026-09-16 浏览器→API 切换当天，各群有一段未处理空窗**（暴富龙约 29 小时、其余约 8~10 小时）：
+   API 首次启动游标只从"10 分钟前"开始。消息仍在飞书、可用 `tools/backfill_analyze.py` 回补
+5. 加仓（DCA）只记录点位，尚未实现真实加仓下单
+6. 同一张图上的价格标签 OCR 偶有 0.0x% 级误差（挂单取整后通常同价）
+7. **整图直读（`chart_reader=llm`）尚未在真实图上量过准确率** —— 默认关闭；
+   切换前必须先用 `tools/eval_charts.py` 在同一批图上与现有读图对比，**新路径不差于基线才切**
+8. **纸面账仍靠"自己的最新价"判断止盈是否成交**，未接真实成交回报 ——
+   "价格碰了一下又回头"时，纸面可能已记账、而交易所的限价单并未成交（数量会与真实仓位脱节）。
+   当前靠**周期对账**发现这种脱节并告警（不自动改）
+9. **读图准确率没有基线数字** —— `tools/eval_charts.py` 可用，但还没跑过一次
 
 ## 免责声明
 
