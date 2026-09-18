@@ -442,7 +442,103 @@ def _risk_on_close(tr):
     return _hits
 
 
-# ===== 失联看门狗（2026-09-15，评估 M7）=====
+# ============ 🆕 2026-09-18 用户新定的两条风控（**只报警，绝不自动动手**）============
+# 用户原话：
+#   「开单按照博主的止损价格来，但是怕机器人读错止损价格…假设一个单子最多亏了保证金的 30%
+#     及以上（只算浮亏）则推送报警，机器人不能不进行任何手动操作，我来手工。」
+#   「熔断也把浮亏算进去，依旧推送报警。」
+# ⚠️ 两条的共同边界：**机器人只推送，不做任何自动操作**（不平仓、不改止损、不加仓）。
+FLOAT_ALERT_PCT = [0.30]      # 逐笔浮亏达到"该笔保证金"的这个比例 → 报警
+FLOAT_ALERT_EVERY = 600       # 同一笔最多每 10 分钟报一次（防刷屏）
+_FLOAT_ALERTED = {}           # coin -> 上次报警时间
+_RISK_FLOAT_ALERTED = [0.0]   # 熔断（含浮亏口径）重复提醒的节流
+
+
+def _pos_pnl(coin, t):
+    """单笔当前浮动盈亏（正=浮盈）；读不到价返回 None。"""
+    try:
+        px = price_of(coin)
+        e = float(t.get("entry") or 0)
+        if not px or not e:
+            return None
+        d = 1.0 if str(t.get("dir") or "LONG").upper() == "LONG" else -1.0
+        k = float(t.get("remaining", 1.0))
+        notional = float(t.get("notional") or (MARGIN * LEV)) * k
+        return (float(px) - e) / e * notional * d
+    except Exception:
+        return None
+
+
+def floating_pnl(open_pos):
+    """所有持仓的浮动盈亏合计 + 参与计算的笔数。"""
+    tot, n = 0.0, 0
+    for c, t in (open_pos or {}).items():
+        v = _pos_pnl(c, t)
+        if v is None:
+            continue
+        tot += v
+        n += 1
+    return round(tot, 4), n
+
+
+def check_float_alert(open_pos):
+    """逐笔浮亏 ≥ 该笔保证金的 30% → **只报警**（机器人不做任何操作）。"""
+    for c, t in (open_pos or {}).items():
+        v = _pos_pnl(c, t)
+        if v is None or v >= 0:
+            continue
+        try:
+            mg = float(t.get("margin") or MARGIN) * float(t.get("remaining", 1.0))
+        except Exception:
+            mg = 0.0
+        if mg <= 0 or abs(v) < mg * float(FLOAT_ALERT_PCT[0]) - 1e-9:
+            continue
+        if time.time() - float(_FLOAT_ALERTED.get(c, 0)) < FLOAT_ALERT_EVERY:
+            continue
+        _FLOAT_ALERTED[c] = time.time()
+        notify("🔴【浮亏告警】%s %s 浮亏 %.2fU（= 该笔保证金 %.2fU 的 %.0f%%，阈值 %.0f%%）\n"
+               "现价 %.8g ｜ 入场 %.8g ｜ 止损 %s\n"
+               "**机器人不做任何自动操作**（不平仓、不改止损、不加仓）→ 请你手工处理。"
+               % (c, "做多" if str(t.get("dir") or "LONG").upper() == "LONG" else "做空",
+                  v, mg, abs(v) / mg * 100.0, float(FLOAT_ALERT_PCT[0]) * 100.0,
+                  float(price_of(c) or 0), float(t.get("entry") or 0), t.get("stop")))
+        log("   🔴 浮亏告警：%s 浮亏 %.2fU / 保证金 %.2fU（只报警，不动手）" % (c, v, mg))
+    return None
+
+
+def risk_check_with_float(open_pos):
+    """熔断判定**把浮亏算进去**（当日已实现 + 当前浮亏）；依旧只报警 + 只拦新开仓。
+
+    ⚠️ 比较都带 1e-9 容差：实测踩到浮点精度 —— `1.8` 算出来的亏损是 `-1.4999999999999998`，
+    严格比较会判成"没到阈值"，而用户要的是**"达到即算"**（≥ 阈值就报警）。
+    """
+    _risk_roll_day()
+    fl, _n = floating_pnl(open_pos)
+    comb = round(float(RISK.get("day_pnl") or 0) + fl, 4)
+    _cap = _exposure_cap()
+    _hits = []
+    if DAILY_LOSS_LIMIT > 0 and comb <= -abs(DAILY_LOSS_LIMIT) + 1e-9:
+        _hits.append("当日已实现+浮亏 %.2fU（上限 %.0fU）" % (comb, DAILY_LOSS_LIMIT))
+    if LOSS_LIMIT_PCT[0] > 0 and _cap > 0:
+        _line = -abs(_cap * float(LOSS_LIMIT_PCT[0]))
+        if comb <= _line + 1e-9:
+            _hits.append("当日已实现+浮亏 %.2fU（= 已实现 %.2f + 浮亏 %.2f）｜ 熔断线 = 敞口上限 %.0fU 的 %.0f%% = %.0fU"
+                         % (comb, float(RISK.get("day_pnl") or 0), fl, _cap,
+                            float(LOSS_LIMIT_PCT[0]) * 100, abs(_line)))
+    if _hits:
+        if not PAUSED[0]:
+            PAUSED[0] = True
+            STATE_DIRTY[0] = True
+            notify("🛑【风控熔断·已暂停开新仓（含浮亏口径）】\n%s\n"
+                   "· 机器人【仍在监控和记录】，但不会再开新仓\n"
+                   "· 已持仓的止盈止损【继续正常管理】，**绝不自动平仓**\n"
+                   "· 你确认要继续后，发指令「继续」即可恢复" % "\n".join("· " + h for h in _hits))
+            log("   🛑 风控熔断（含浮亏）：%s" % "；".join(_hits))
+        elif time.time() - float(_RISK_FLOAT_ALERTED[0]) > 1800:
+            _RISK_FLOAT_ALERTED[0] = time.time()
+            notify("🔴【风控熔断·仍在触发】%s\n（已暂停开新仓；浮亏已计入；不会自动平仓）"
+                   % "；".join(_hits))
+    return _hits
 # 信号源是网页爬虫：飞书一次改版、登录态失效、页面异常，都可能让机器人"看起来在跑但什么都收不到"。
 # 之前没有任何机制告诉你"今天怎么没通知"。现在超过阈值没抓到任何新消息就主动告警。
 LAST_MSG_TS = [0.0]
@@ -1426,7 +1522,9 @@ def _self_marks():
             # 🆕 2026-09-18：配置收敛到 .env 时新增的启动告警（[8g] 自检在 dev 分支上当场抓到：
             #    这两个前缀没登记 → 机器人会把自己的启动告警当成博主信号重新解析，
             #    而这正是历史上出过 4 次的自环坑）。
-            "【启动告警】", "【启动失败】"]
+            "【启动告警】", "【启动失败】",
+            # 🆕 2026-09-18 用户新定的浮亏告警（[8g] 自检当场抓到我漏登记这一个）
+            "【浮亏告警】"]
 
 
 SELF_MARKS = _self_marks()
@@ -6006,6 +6104,15 @@ def main():
                     watch_reconcile()      # 周期对账：管“数量对不上”（只告警，不自动改）
                 except Exception as e:
                     log("周期对账异常 " + str(e)[:100])
+                # 🆕 2026-09-18 用户新定的两条风控（只报警，不自动动手）
+                try:
+                    check_float_alert(open_pos)        # 逐笔浮亏 ≥ 保证金 30% → 报警
+                except Exception as e:
+                    log("浮亏检查异常 " + str(e)[:100])
+                try:
+                    risk_check_with_float(open_pos)    # 熔断把浮亏也算进去（只报警+只拦新开仓）
+                except Exception as e:
+                    log("熔断(含浮亏)检查异常 " + str(e)[:100])
                 try:
                     watch_silence()
                 except Exception as e:
@@ -7659,6 +7766,46 @@ if __name__ == "__main__":
         _chk("名单只剩真实有仓的", sorted(MANUAL_COINS), ["BTC"])
         _chk("真实有仓的绝不被误删", "BTC" in MANUAL_COINS, True)
         MANUAL_COINS.clear()
+
+        # ⑤ 2026-09-18 用户新定的两条风控：**只报警，绝不自动动手**
+        print("\n[8m-⑤] 逐笔浮亏告警（≥保证金30%）与熔断含浮亏 —— 只报警、不自动操作")
+        _po0 = globals().get("price_of")
+        _seen_pos = {"entry": 2.0, "dir": "LONG", "remaining": 1.0, "margin": 5.0,
+                     "notional": 15.0, "stop": 1.8}
+        try:
+            globals()["price_of"] = lambda _c: 1.95      # 亏 2.5% → 15U×2.5% = 0.375U < 1.5U 阈值
+            _chk("浮亏未到 30% → 不报警", check_float_alert({"T1": dict(_seen_pos)}) is None
+                 and not any("浮亏告警" in s for s in _SENT), True)
+            _SENT.clear()
+            globals()["price_of"] = lambda _c: 1.80       # 亏 10% → 1.5U = 保证金 5U 的 30% → 报警
+            _chk("浮亏到 30% → 报警", bool(check_float_alert({"T2": dict(_seen_pos)}) is None
+                                          and any("浮亏告警" in s for s in _SENT)), True)
+            _chk("报警里写明「机器人不做任何自动操作」",
+                 any("不做任何自动操作" in s for s in _SENT), True)
+            _SENT.clear()
+            globals()["price_of"] = lambda _c: 2.10      # 价格高于入场 = 浮盈
+            _SENT.clear()
+            check_float_alert({"T3": dict(_seen_pos)})
+            _chk("浮盈 → 绝不报警", not any("浮亏告警" in s for s in _SENT), True)
+            _SENT.clear()
+            _fl, _n = floating_pnl({"T4": dict(_seen_pos)})
+            _chk("浮动盈亏合计可算（方向/剩余比例都算进去）", isinstance(_fl, float) and _n == 1, True)
+            # 熔断：把浮亏算进去（这里直接构造"已实现亏到熔断线"的场景）
+            _keep_paused, _keep_day, _keep_dayname = PAUSED[0], RISK.get("day_pnl"), RISK.get("day")
+            PAUSED[0] = False
+            RISK["day"] = _today()          # ⚠️ 必须先设当天，否则 _risk_roll_day() 会把 day_pnl 清零
+            RISK["day_pnl"] = -abs(_exposure_cap() * float(LOSS_LIMIT_PCT[0]))
+            globals()["price_of"] = lambda _c: 1.80      # 同时带上浮亏
+            _hits = risk_check_with_float({"T5": dict(_seen_pos)})
+            _chk("熔断（含浮亏口径）能触发", bool(_hits), True)
+            _chk("熔断通知写明「绝不自动平仓」", any("绝不自动平仓" in s for s in _SENT), True)
+            _chk("熔断只暂停开新仓（PAUSED=True）", PAUSED[0], True)
+            _SENT.clear()
+            RISK["day_pnl"] = _keep_day
+            RISK["day"] = _keep_dayname
+            PAUSED[0] = _keep_paused
+        finally:
+            globals()["price_of"] = _po0
 
         # ---------- ⑧n 用户 2026-09-17 定的规则：门口表扩容 / 拆段不丢价位行 / % 不当价格 / 别名收窄 ----------
         print("\n[8n] 门口关键词扩容、多币种拆段、百分比不当价格、别名表收窄")
