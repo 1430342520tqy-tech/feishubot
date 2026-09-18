@@ -605,15 +605,15 @@ def startup_reconcile():
     if not _BEXEC_OK:
         log("   [对账] 真实下单层未加载 → 跳过")
         return False
-    # ===== 🆕 2026-09-18 二轮 F1：快照"本次运行开始时**从 state.json 恢复**的手工仓名单" =====
-    # 病根（一轮改出来的，最危险的一处）：一轮是**先**把 only_real 的币登记进 MANUAL_COINS
-    #   （见下面 "用户 2026-09-16 明确要求"那段），**再**用"是否已在 MANUAL_COINS 里"去拆分
-    #   「手工仓」与「未解决」—— 登记在前，所以拆分那一刻"已在 MANUAL_COINS"**恒为真**，
-    #   于是**所有 only_real 都被排除**：`state.json` 整个丢失（交易所有仓、纸面全空）也会
-    #   blocked=False 并照开真单，ledger 设计的"文件丢了/状态乱了就拒绝开真单（防双倍敞口）"
-    #   这道闸门对 only_real 被永久废掉了。
-    # 修法：判定只认"本次运行开始**之前**就已经登记过的手工仓"（= 下面这份快照）。
-    #   本次新发现的孤儿仓照样登记（护栏行为不变），但**同时计入闸门**并要求用户确认。
+    # ===== 🆕 2026-09-18 三轮（用户决定）：孤儿仓**一律不拦**，快照只用来识别"本次新发现" =====
+    # 口径变更（用户 2026-09-18 明确选择「任何孤儿仓都不要拦，我自己盯」）：
+    #   「交易所有仓、纸面无记录」（only_real = 手工仓/孤儿仓）**永远不参与实盘开仓闸门** ——
+    #   不管是本次新发现的、还是已经在 state.json 的 manual 里的。
+    #   ⇒ 这**推翻**了二轮 F1 里"本次新发现的孤儿仓计入 `_unresolved` → 实盘 blocked=True"的做法；
+    #     二轮当初那样改，是为了防"state.json 丢了 → 机器人对自己的仓位失忆 → 照开真单（双倍敞口）"。
+    #     用户看过这个风险后仍选择"不拦、我自己盯"，所以改成：**不拦 + 一条不拦人的告警**（见下面 _new_orphans）。
+    # 这份快照（= 本次运行开始时**从 state.json 恢复**出来的那份名单）**仍然要留**，
+    #   但用途**只剩一个**：判断哪些孤儿仓是"本次**新发现**"的（只有这些才发告警，免得每次重启刷屏）。
     # ⚠️ 恢复顺序已验证：state.json 的 manual / ambig / ambig_ack 在 main() 里由
     #    `_restore_lists()` 于本函数之前恢复（startup_reconcile 在 main 里紧跟其后调用），
     #    所以这里的 MANUAL_COINS 就是"上次运行结束时的那份名单"。
@@ -671,8 +671,9 @@ def startup_reconcile():
             except Exception:
                 pass
 
-    # 🆕 2026-09-18 二轮 F1：本次**新发现**的孤儿仓（交易所有仓、纸面完全没有记录）要单独记下 ——
-    #   它们既要登记成手工仓（用户 09-16 要求的护栏），又必须计入闸门（防"文件丢了就照开真单"）。
+    # 🆕 2026-09-18 三轮：本次**新发现**的孤儿仓（交易所有仓、纸面完全没有记录）单独记下来 ——
+    #   只为发那条"请你人工核对一次"的告警（`_manual_known` 快照的唯一用途）。
+    #   ⚠️ 它们**不再**计入闸门（用户 2026-09-18 决定：任何孤儿仓都不拦）。
     _new_orphans = []
     for d in _res["diffs"]:
         if d["kind"] == "only_real":
@@ -700,17 +701,22 @@ def startup_reconcile():
                    "机器人不会对它做任何事（不开新仓、不平仓、不改止损、也不拿它的数量去挂保护）。\n"
                    "手工仓平掉后发「解除手工仓 %s」即可解除这条护栏。" % (_c, _c))
     if _new_orphans:
-        # 🆕 2026-09-18 二轮 F1：主动把"这是本次新发现的"讲清楚，免得用户懵
-        #   （旧行为只说"检测到你的手工仓"，用户看不出这是刚发现的、也不知道它正卡着实盘闸门）。
-        notify("🛑【手工仓护栏】**本次新发现 %d 个交易所有仓、纸面无记录的币**：%s\n"
-               "已按老规则登记为你的手工仓（机器人绝不动它们的真实仓位）。\n"
-               "但它们的**归属还没确认**，所以**实盘下单闸门是关着的**"
-               "（防「纸面账记错了却照开真单」造成的双倍敞口）。\n"
-               "· 如果这确实是你的手工仓 → 回「%s 是我的手工仓」（或直接发「重新对账」）即可解除闸门；\n"
-               "· 如果这是机器人自己开的仓（例如 state.json 丢了）→ 回「%s 是机器人的仓」，"
-               "并请在币安核对一次数量。"
-               % (len(_new_orphans), "、".join(_new_orphans),
-                  _new_orphans[0], _new_orphans[0]))
+        # 🆕 2026-09-18 三轮（用户决定）：这条告警**只喊人、不拦单** ——
+        #   「不拦」≠「不提示」：用户选择"孤儿仓我自己盯"，但他**必须先知道这次新出现了什么**，
+        #   尤其要能分辨两种情况：① 这些仓是他自己开的（正常手工仓，机器人不管就对了）；
+        #   ② **不是他开的**（例如 state.json 被删/损坏 → 机器人对自己的仓位失忆了）
+        #      —— 那种情况下机器人纸面是空的，会按新信号**重复开仓**，必须人工立刻核对。
+        #   ⚠️ 只有"本次新发现"才发（`_manual_known` 快照判定）→ 重启不刷屏。
+        notify("⚠️【手工仓护栏】**本次新发现 %d 个「交易所有仓、纸面上没记录」的币**：%s\n"
+               "机器人已把它们登记为你的手工仓：**不开新仓、不平仓、不改止损、"
+               "也不拿交易所的数量去挂保护**。\n"
+               "⚠️ **机器人不会因为这些币拦你的开仓**"
+               "（按你 2026-09-18 的决定：这些仓你自己盯）。\n"
+               "❗ 但请你核对一次：如果这些仓**不是你开的**"
+               "（例如 state.json 被删/损坏，机器人对自己的仓位失忆了），请**立刻人工核对** —— "
+               "那种情况下机器人会以为纸面是空的，**可能重复开仓**。\n"
+               "（这些手工仓平掉后发「解除手工仓 %s」即可解除这条护栏）"
+               % (len(_new_orphans), "、".join(_new_orphans), _new_orphans[0]))
     if AMBIG_COINS:
         STATE_DIRTY[0] = True
         log("   [归属待确认] %d 个币归属待你确认（回话之前不对它们发任何真单）：%s"
@@ -734,23 +740,26 @@ def startup_reconcile():
                "机器人不会自动改账 —— 请你自己核对一次（尤其是止损数量）。"
                % (str(_d.get("detail") or _d)[:200]))
 
-    # ===== 闸门判定：用"未解决"的差异决定闸门（手工仓不算不一致）=====
+    # ===== 闸门判定：用"未解决"的差异决定闸门（手工仓/孤儿仓一律不算不一致）=====
     # ⚠️ 既有缺陷①：`ledger.reconcile` 对**已登记的手工仓**照样生成 only_real 差异，
     #    于是 consistent 永远是 False → 实盘下 RECONCILE["blocked"]=True →
     #    **用户只要持有任何手工仓，实盘就永远开不出新仓**。
     #    所以：把差异分成三类（清单本身还要用，diff 明细照样保留）。
-    # ⚠️ 既有缺陷②（二轮 F1，最危险）：一轮的修法把"已登记"判成了"登记之后"，于是**所有**
-    #    only_real 都被排除 → 闸门对 only_real 永久失效。现在只认 `_manual_known`
-    #    （= 本次运行开始时从 state.json 恢复出来的那份名单）。
+    # ⚠️ 二轮 F1 曾经改成"只豁免 `_manual_known` 里那份、本次新发现的孤儿仓照拦"，**三轮按用户
+    #    2026-09-18 的决定改回来了**：用户明确要「任何孤儿仓都不要拦，我自己盯」——
+    #    所以现在**所有** `only_real`（含本次新发现的）都不计入 `_unresolved`、都不置 `blocked`；
+    #    代价（双倍敞口风险）由下面那条"新发现孤儿仓"的告警 + 用户自己盯来承担。
+    # ⇒ `_unresolved` 里现在只剩：① 未答复的 `qty_mismatch`（归属待确认 = AMBIG）
+    #    ② 其它未解决差异（例如**实盘下**的 `only_paper`「纸面有仓、交易所无仓」）。
     _unresolved = []
     _manual_diffs = []
     _acked_syms = {str(d.get("symbol") or "").upper() for d in _acked_mismatch}
     for d in _res["diffs"]:
-        _c = str(d.get("coin") or "").upper()
         if str(d.get("symbol") or "").upper() in _acked_syms:
             continue                        # 归属已答复过的数量差：只告警，不计入闸门（F4）
-        if d["kind"] == "only_real" and _c in _manual_known:
-            _manual_diffs.append(d)         # 已登记的手工仓：机器人不得干涉，也就没资格算它"不一致"
+        if d["kind"] == "only_real":
+            # 孤儿仓/手工仓：机器人不得干涉，也就没资格算它"不一致"；用户决定一律不拦（三轮）
+            _manual_diffs.append(d)
             continue
         _unresolved.append(d)
     # 归属待确认的币一律算"未解决"（哪怕这次对账没再报数量差，只要还没答复就继续算）
@@ -774,8 +783,9 @@ def startup_reconcile():
     RECONCILE["blocked"] = bool(_blocking)
     log("   [对账] %s ｜ 结论=%s%s ｜ 闸门=%s"
         % (ledger.summary(paper, real, _res["diffs"]),
-           "无差异" if not diffs else ("差异只属于已登记的手工仓" if not _unresolved else "有未解决差异"),
-           "（其中 %d 条=你的手工仓，不计入闸门）" % len(_manual_diffs) if _manual_diffs else "",
+           "无差异" if not diffs else
+           ("差异只属于手工仓/孤儿仓（一律不拦，三轮）" if not _unresolved else "有未解决差异"),
+           "（其中 %d 条=手工仓/孤儿仓，不计入闸门）" % len(_manual_diffs) if _manual_diffs else "",
            "已阻止真单" if RECONCILE["blocked"] else "未阻止"))
     for d in diffs:
         log("      · %s" % d)
@@ -784,11 +794,11 @@ def startup_reconcile():
                "机器人【仍在监控和记录】，但**不会向币安发任何真单**，避免双倍敞口或孤儿仓。\n"
                "请人工核对后发指令「重新对账」清除这个闸门。%s"
                % ("\n".join("· " + str(d.get("detail") or d) for d in _unresolved[:8]),
-                  ("\n（另有 %d 条差异是你的手工仓，已排除、**不计入这个闸门**）" % len(_manual_diffs))
+                  ("\n（另有 %d 条差异是手工仓/孤儿仓，已排除、**不计入这个闸门**）" % len(_manual_diffs))
                   if _manual_diffs else ""))
     elif diffs:
         log("   [对账] 差异已记录、未计入闸门（%s）"
-            % ("全是已登记的手工仓" if not _unresolved else "当前影子模式，不影响"))
+            % ("全是手工仓/孤儿仓" if not _unresolved else "当前影子模式，不影响"))
     return RECONCILE["ok"]
 
 
@@ -7221,17 +7231,17 @@ if __name__ == "__main__":
             _ck("集成② 已阻止真单", _rc["blocked"], True)
             _ck("集成② 差异文案含「数量不符」",
                 any("数量不符" in d for d in _rc["diffs"]), True)
-            # ③ 【二轮 F1 把这条**恢复**成安全性质】新孤儿仓（state 里没有它的手工仓记录）→ 实盘必须 blocked
-            #    ⚠️ 一轮把断言改成了 blocked=False，理由写的是"手工仓不该卡死闸门"—— 目标没错，
-            #    但一轮的实现是"**先登记**进 MANUAL_COINS，**再**按'是否在 MANUAL_COINS 里'拆分差异"，
-            #    于是拆分那一刻"已在 MANUAL_COINS"**恒为真** → **所有** only_real 全被排除：
-            #    state.json 整个丢失（交易所有 3 仓、纸面全空）也是 blocked=False 并照开真单，
-            #    ledger 设计的"文件丢了/状态乱了就拒绝开真单（防双倍敞口）"这道闸门对 only_real
-            #    被永久废掉。二轮改成只认 `_manual_known`（= 本次运行开始时从 state.json 恢复的那份）。
+            # ③ 【三轮·用户 2026-09-18 决定】新孤儿仓（state 里没有它的手工仓记录）→ **一律不拦**
+            #    ⚠️ 二轮 F1 把这条断言改成"必须 blocked=True"（防"state.json 丢了就照开真单"）；
+            #    用户看过那个风险后明确选择「任何孤儿仓都不要拦，我自己盯」→ 本轮**按用户决定改回 False**。
+            #    代价由 ③c 的那条"本次新发现 N 个孤儿仓、请人工核对、可能重复开仓"告警来兜。
+            #    ⚠️ 登记为手工仓（护栏）+ 差异明细保留这两件事**不变**。
             _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0)], None)
             _ck("集成③ 新孤儿仓照样登记为手工仓（护栏不变）", _mn, {"ETH"})
-            _ck("集成③ 新孤儿仓 → 实盘必须置 blocked（二轮恢复）", _rc["blocked"], True)
-            _ck("集成③   → 计入「未解决差异」（供指令/日志列出）", len(_rc["pending"]) >= 1, True)
+            _ck("集成③ 新孤儿仓 → 实盘 blocked=False（三轮：孤儿仓一律不拦）", _rc["blocked"], False)
+            _ck("集成③   → 不计入「未解决差异」（闸门里没有孤儿仓）", _rc["pending"], [])
+            _ck("集成③   → 归入 manual_diffs（明细照样保留，只是不拦）",
+                len(_rc["manual_diffs"]), 1)
             _ck("集成③ 差异明细照样保留（供日志/指令查询）",
                 any("孤儿仓/手工仓" in d for d in _rc["diffs"]), True)
             # ③b 【目标①不许回退】已登记（state.json 里就有）的手工仓 → 实盘不卡死闸门
@@ -7240,17 +7250,45 @@ if __name__ == "__main__":
             _ck("集成③b 已登记手工仓 → 不计入未解决差异", _rc["pending"], [])
             _ck("集成③b   → 但 ok=False（有差异就如实报，见 F5）", _r, False)
             _ck("集成③b   → 差异归入 manual_diffs", len(_rc["manual_diffs"]), 1)
-            # ③c 【二轮 F1 最核心】state.json 整个丢失：交易所有 3 仓、纸面全空、manual 名单为空
-            _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0), _prow("BTCUSDT", 1.0), _prow("SOLUSDT", 2.0)],
-                                      None)
+            # ③c 【三轮·用户 2026-09-18 决定】state.json 整个丢失：交易所有 3 仓、纸面全空、manual 名单为空
+            #    → 按新口径**不拦**（用户自己盯）；但这条路径下**必须发出那条"新发现 N 个孤儿仓"的告警** ——
+            #      它就是这个决定下**唯一的安全网**（提醒用户核对，防"机器人失忆 → 重复开仓"）。
+            _cap_orph = []
+            _keep_notify_orph = globals()["notify"]
+            globals()["notify"] = lambda _t: _cap_orph.append(str(_t))
+            try:
+                _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0), _prow("BTCUSDT", 1.0), _prow("SOLUSDT", 2.0)],
+                                          None)
+            finally:
+                globals()["notify"] = _keep_notify_orph
             _ck("集成③c state.json 丢失（3 仓/纸面全空/名单空）→ 三个币全登记为手工仓",
                 _mn, {"ETH", "BTC", "SOL"})
-            _ck("集成③c   → 实盘必须 blocked=True（防双倍敞口，二轮恢复）", _rc["blocked"], True)
-            _ck("集成③c   → 未解决差异就是这 3 条", len(_rc["pending"]), 3)
+            _ck("集成③c   → 实盘 blocked=False（三轮：孤儿仓一律不拦，按用户决定）",
+                _rc["blocked"], False)
+            _ck("集成③c   → 不计入未解决差异（pending 空）", _rc["pending"], [])
+            _orph_msg = next((s for s in _cap_orph if ("本次新发现" in s) and ("手工仓护栏" in s)), "")
+            _ck("集成③c   → **必须发出「本次新发现 3 个孤儿仓」告警**（唯一安全网），且只发一条",
+                ("本次新发现 3 个" in _orph_msg)
+                and all(c in _orph_msg for c in ("BTC", "ETH", "SOL"))
+                and sum(1 for s in _cap_orph if "本次新发现" in s) == 1, True)
+            _ck("集成③c   → 告警写明是「交易所有仓、纸面上没记录」的币",
+                "交易所有仓、纸面上没记录" in _orph_msg, True)
+            _ck("集成③c   → 告警写明机器人不动这些仓（不开新仓/不平仓/不改止损/不拿交易所数量挂保护）",
+                all(k in _orph_msg for k in ("不开新仓", "不平仓", "不改止损", "挂保护")), True)
+            _ck("集成③c   → 告警写明「机器人不会因为这些币拦你的开仓」（要点3）",
+                "不会因为这些币拦你的开仓" in _orph_msg, True)
+            _ck("集成③c   → 告警写明「可能重复开仓」+ 请立刻人工核对（要点4）",
+                ("重复开仓" in _orph_msg) and ("人工核对" in _orph_msg), True)
             # ③d 【二轮 F5】影子模式有孤儿 → 不拦真单，但 ok 必须=False（不许显示"一致"骗用户）
             _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0)], None, live=False)
             _ck("集成③d 影子模式有孤儿 → 不拦真单（沿用旧语义）", _rc["blocked"], False)
             _ck("集成③d   → ok 必须=False（有差异就如实报；一轮在这里显示过「一致」）", _r, False)
+            # ③e 【三轮：闸门里"剩下的那些"必须还在】孤儿仓(only_real)被排除之后，
+            #    **实盘下**的 only_paper（纸面有仓、交易所无仓）**照旧要拦** —— 不能连它一起放过。
+            _r, _rc, _mn = _live_case([], 1.0, coin="BTC")
+            _ck("集成③e 实盘下 only_paper → ok=False（有差异就如实报）", _r, False)
+            _ck("集成③e 实盘下 only_paper → 仍然 blocked=True（闸门没被改空）", _rc["blocked"], True)
+            _ck("集成③e   → 计入未解决差异", len(_rc["pending"]), 1)
             # ④ 手工仓不评判数量
             _r, _rc, _mn = _live_case([_prow("BTCUSDT", 99.0)], 1.0, manual={"BTC"})
             _ck("集成④ 手工仓数量不管 → 一致", _r, True)
@@ -7434,16 +7472,18 @@ if __name__ == "__main__":
                 _ck("⑧m-⑥④ 闲聊里的同款字样**不算**指令（防误伤）",
                      _quiet(handle_command, "我还有个 BTC 的手工仓你帮我看看"), False)
 
-                # ⑤ 闸门：**已登记**的手工仓不卡死闸门；**本次新发现**的孤儿仓必须置 blocked（二轮 F1）
-                #    ⚠️ 一轮这里的断言是"手工仓（交易所有/纸面没有）不再卡死实盘闸门 → blocked=False"。
-                #    目标（已登记的手工仓不该永久卡死）没错，但一轮的实现是"登记在前、判定在后"，
-                #    于是**所有** only_real 都被排除 → 连 state.json 整个丢失也 blocked=False。
-                #    二轮：只有 `_manual_known`（本次运行开始时从 state.json 恢复出来的那份）才豁免。
+                # ⑤ 闸门（三轮·用户 2026-09-18 决定）：**任何**孤儿仓都不拦（本次新发现的也算）——
+                #    「交易所有仓、纸面无记录」永远不进闸门；本次新发现的**只发一条不拦人的告警**。
+                #    ⚠️ 二轮在这里断言"本次新发现的孤儿仓必须 blocked=True"，本轮按用户决定改回 False。
+                _cap.clear()
                 _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0)], None)
-                _ck("⑧m-⑥⑤ 本次新发现的孤儿仓 → 实盘置 blocked（二轮恢复）", _rc["blocked"], True)
+                _ck("⑧m-⑥⑤ 本次新发现的孤儿仓 → 实盘**不拦**（三轮：孤儿仓一律不拦）", _rc["blocked"], False)
                 _ck("⑧m-⑥⑤   → 但仍然登记为手工仓（护栏照旧保护）", _mn, {"ETH"})
+                _ck("⑧m-⑥⑤   → 不计入「未解决差异」（闸门里没有孤儿仓）", _rc["pending"], [])
                 _ck("⑧m-⑥⑤   → 差异明细照样保留（供日志/指令查询）",
                      any("孤儿仓/手工仓" in d for d in _rc["diffs"]), True)
+                _ck("⑧m-⑥⑤   → 但**发告警**提醒你自己核对（不拦 ≠ 不提示）",
+                     any(("本次新发现" in s) and ("可能重复开仓" in s) for s in _cap), True)
                 _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0)], None, manual={"ETH"})
                 _ck("⑧m-⑥⑤ 已登记的手工仓 → 不卡死实盘闸门（目标①不回退）", _rc["blocked"], False)
                 _r, _rc, _mn = _live_case([_prow("BTCUSDT", 9.0)], 1.0, manual={"BTC"})
