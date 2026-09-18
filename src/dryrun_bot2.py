@@ -285,6 +285,14 @@ def watch_naked():
     for coin, tr in list(open_pos_ref.items()):
         if tr.get("real_layer") != "实盘" or tr.get("pending_fill"):
             continue
+        # 🆕 2026-09-18 归属待确认：**不补挂止损** —— 这币可能是用户的手工仓，
+        #   补挂就是拿机器人的数量去动真实仓位（用户要求：回话之前一律不发真单）。
+        #   ⚠️ 这里只加 AMBIG、**不加**手工仓判据：手工仓进不了 open_pos（real_plan_open 已拦），
+        #      而名单会误报，误报的后果是"该补的止损不补"= 裸奔（见 close_position 里的同类说明）。
+        #      归属待确认不一样 —— 它**本来就是纸面有记录的币**，所以会进到 open_pos 里来。
+        if ambig_guard(coin, "自动补挂止损"):
+            _ambig_hold_note(coin, "自动补挂止损")
+            continue
         sl = tr.get("sl")
         if not sl:
             continue
@@ -604,15 +612,35 @@ def startup_reconcile():
                  for c in MANUAL_COINS})
     diffs = [d["detail"] for d in _res["diffs"]]
 
+    # ===== 🆕 2026-09-18「归属待确认」：数量不符 = 这币到底是谁的？（见 AMBIG_COINS 头部）=====
+    # ⚠️ 顺序很重要：**先登记，再做闸门判定**，否则会用自己的判定结果把自己卡住。
+    _ambig_show = {}          # coin -> (纸面数量, 交易所数量)，只用于问话文案
+    for d in _res["diffs"]:
+        if d["kind"] == "qty_mismatch":
+            _c = str(d.get("coin") or "").upper()
+            if not _c:
+                continue
+            AMBIG_COINS.add(_c)
+            try:
+                _ambig_show[_c] = (float(paper_qty.get(d["symbol"])),
+                                   float((real.get(d["symbol"]) or {}).get("qty")))
+            except Exception:
+                pass
+
     for d in _res["diffs"]:
         if d["kind"] == "only_real":
             # 用户 2026-09-16 明确要求：交易所有、纸面没有的仓 = **用户手工仓，机器人不得有任何干涉**
             MANUAL_COINS.add(d["coin"])
+            # 纸面已经没有这个币了 → 「同币两边都有但数量差很大」这个疑问不复存在，
+            # 按上面的老规则判定为手工仓即可（手工仓护栏拦得比归属待确认更死，不会漏保护）。
+            AMBIG_COINS.discard(str(d.get("coin") or "").upper())
     # 🆕 2026-09-17：名单只会加不会减 → 按交易所实时持仓把"已经平仓的"移出去（用户实测报障）
     _stale = _manual_prune(rsyms)
     if _stale:
         notify("ℹ️【手工仓护栏】已把**已经平仓**的币从名单移除：%s\n"
                "（按交易所实时持仓核对；这些币以后有新信号会照常走审批）" % "、".join(_stale))
+    # 🆕 2026-09-18：归属待确认名单同样按交易所实时持仓核对（读不到就不删，见 _ambig_prune）
+    _ambig_prune(rsyms)
     if MANUAL_COINS:
         log("   [手工仓] 已登记 %d 个币为你的手工仓（机器人不会对它们发任何真单）：%s"
             % (len(MANUAL_COINS), "、".join(sorted(MANUAL_COINS))))
@@ -621,18 +649,58 @@ def startup_reconcile():
             notify("ℹ️【手工仓护栏】检测到交易所有你的手工仓：**%s**\n"
                    "机器人不会对它做任何事（不开新仓、不平仓、不改止损、也不拿它的数量去挂保护）。\n"
                    "手工仓平掉后发「解除手工仓 %s」即可解除这条护栏。" % (_c, _c))
-    RECONCILE["diffs"] = diffs
-    consistent = _res["ok"]
+    if AMBIG_COINS:
+        STATE_DIRTY[0] = True
+        log("   [归属待确认] %d 个币归属待你确认（回话之前不对它们发任何真单）：%s"
+            % (len(AMBIG_COINS), "、".join(sorted(AMBIG_COINS))))
+        for _c in sorted(AMBIG_COINS):
+            _pq, _rq = _ambig_show.get(_c, (None, None))
+            if _pq is None or _rq is None:
+                _num = "机器人纸面记的数量与交易所差很多"
+            else:
+                _num = "交易所有 %.8g 张、机器人纸面只记了 %.8g 张" % (_rq, _pq)
+            notify("❓【归属待确认】**%s**：%s。这币到底是谁的？\n"
+                   "· 是你的手工仓 → 回「%s 是我的手工仓」\n"
+                   "· 是机器人自己开的 → 回「%s 是机器人的仓」\n"
+                   "在你回话之前，机器人**不会对 %s 发任何真单**"
+                   "（不开新仓、不平仓/减仓、不改止损），也不会拿交易所的持仓数量去挂保护。"
+                   % (_c, _num, _c, _c, _c))
+
+    # ===== 闸门判定：用"未解决"的差异决定 consistent（手工仓不算不一致）=====
+    # ⚠️ 这是本次要修的既有缺陷：`ledger.reconcile` 对**已登记的手工仓**照样生成 only_real 差异，
+    #    于是 consistent 永远是 False → 实盘下 RECONCILE["blocked"]=True →
+    #    **用户只要持有任何手工仓，实盘就永远开不出新仓**。
+    #    所以：在完成手工仓登记**之后**，把差异分成两类（清单本身还要用，diff 明细照样保留）。
+    _unresolved = []
+    _manual_n = 0
+    for d in _res["diffs"]:
+        if d["kind"] == "only_real" and str(d.get("coin") or "").upper() in MANUAL_COINS:
+            _manual_n += 1          # 用户手工仓：机器人不得干涉，也就没资格算它"不一致"
+            continue
+        _unresolved.append(d)
+    # 归属待确认的币一律算"未解决"（哪怕这次对账没再报数量差，只要还没答复就继续算）
+    for _c in sorted(AMBIG_COINS):
+        if not any(str(d.get("coin") or "").upper() == _c for d in _unresolved):
+            _unresolved.append({"kind": "ambig", "symbol": _c + "USDT", "coin": _c,
+                                "detail": "❓ [归属待确认] %s：等你回话（回话之前机器人不发真单）" % _c})
+    RECONCILE["diffs"] = diffs          # 保留全部明细（供日志与「重新对账」指令查询）
+    # 影子模式沿用旧语义：纸面的仓本来就不该出现在交易所，所以只有实盘才把差异算"不一致"
+    _blocking = _unresolved if bexec.LIVE[0] else []
+    consistent = not _blocking
     RECONCILE["ok"] = consistent
-    log("   [对账] %s ｜ 结论=%s"
-        % (ledger.summary(paper, real, _res["diffs"]), "一致" if consistent else "不一致"))
+    log("   [对账] %s ｜ 结论=%s%s"
+        % (ledger.summary(paper, real, _res["diffs"]), "一致" if consistent else "不一致",
+           "（其中 %d 条=你的手工仓，不计入闸门）" % _manual_n if _manual_n else ""))
     for d in diffs:
         log("      · %s" % d)
     if not consistent and bexec.LIVE[0]:
         RECONCILE["blocked"] = True
         notify("🔴【启动对账不一致·已阻止真实下单】\n%s\n\n"
                "机器人【仍在监控和记录】，但**不会向币安发任何真单**，避免双倍敞口或孤儿仓。\n"
-               "请人工核对后发指令「重新对账」清除这个闸门。" % "\n".join("· " + d for d in diffs[:8]))
+               "请人工核对后发指令「重新对账」清除这个闸门。%s"
+               % ("\n".join("· " + str(d.get("detail") or d) for d in _unresolved[:8]),
+                  ("\n（另有 %d 条差异是你的手工仓，已排除、**不计入这个闸门**）" % _manual_n)
+                  if _manual_n else ""))
     elif diffs:
         log("   [对账] 差异仅记录（当前影子模式，不影响）")
     return consistent
@@ -785,12 +853,107 @@ def _manual_prune(real_syms):
     return _stale
 
 
+# ===== 🆕 2026-09-18「归属待确认」闸门（用户当天明确要求）=====
+# 背景事故：用户的**手工仓** LABUSDT（交易所 11700 张）与机器人**纸面账**里同币的一条记录
+#   （292 张，来自博主信号、mode=shadow）同时存在。
+#   上面的手工仓护栏判据是「交易所有仓 且 纸面无记录」——**同币既在纸面账、又是用户手工仓**这种情况
+#   它认不出来：对账只会报一条 `qty_mismatch`，影子模式无害；
+#   但**一开实盘，机器人会把它当成自己的仓**，去挂真实止损 + 三层止盈 → 直接动到用户的手工仓。
+# 所以用户要求：这种情况机器人要**自己拦住** ——
+#   · 开机对账发现「同一个币交易所有仓 + 纸面也有记录但数量差很大」→ 该币进 AMBIG_COINS（归属待确认）；
+#   · 机器人**主动问用户**「这币是你的手工仓吗？」；
+#   · **在用户回话确认之前，不对该币发任何真单**（不开新仓、不平仓/减仓、不改止损），
+#     也不拿交易所的持仓数量去挂保护。
+# 拦截强度与手工仓护栏**完全一致** —— 所有 `manual_*` 的调用点都必须同时覆盖 AMBIG
+#   （漏一个点就等于没拦，所以真实动作统一走下面的 no_touch_guard / no_touch_block）。
+AMBIG_COINS = set()
+
+
+def ambig_guard(coin, action="真实下单"):
+    """该币是否**归属待确认** → 返回拦截原因（有的话）。"""
+    c = (coin or "").upper()
+    if c and c in AMBIG_COINS:
+        return ("%s **归属还没确认**（交易所有这个币的仓、机器人纸面也记着它，但数量差很大），"
+                "在你回话之前机器人不对它发任何真单，所以拒绝执行「%s」" % (c, action))
+    return None
+
+
+def ambig_block(coin, action):
+    """拦下来并告警（只告警、不下单）。"""
+    why = ambig_guard(coin, action)
+    if not why:
+        return False
+    _c = (coin or "").upper()
+    log("   🛑 [归属待确认] %s" % why)
+    notify("❓【归属待确认】%s 的「%s」**被拒绝**：这币在交易所有仓、机器人纸面也记着它，"
+           "但数量差很大，归属还没确认。\n"
+           "在你回话之前，机器人**不会对它发任何真单**（不开新仓、不平仓/减仓、不改止损），"
+           "也不会拿交易所的持仓数量去挂保护。\n"
+           "回「%s 是我的手工仓」或「%s 是机器人的仓」。" % (_c, action, _c, _c))
+    return True
+
+
+def no_touch_guard(coin, action="真实下单"):
+    """**该币的真实仓位不许机器人碰** → 返回原因（手工仓 / 归属待确认，任一命中即可）。
+
+    ⚠️ 这是真实动作的**唯一判定入口**：手工仓与归属待确认两套判据必须同时生效，
+       免得以后新增判据时漏掉某个调用点（漏一个点 = 没拦）。"""
+    return manual_guard(coin, action) or ambig_guard(coin, action)
+
+
+def no_touch_block(coin, action):
+    """统一的硬拦：命中就当场告警并拒绝（只告警、绝不下单）。返回 True = 已拦住。"""
+    if manual_block(coin, action):
+        return True
+    return ambig_block(coin, action)
+
+
+def _ambig_hold_note(coin, action):
+    """归属待确认期间「机器人没动手」的通报（同一币只报一次，免得每轮刷屏）。
+
+    用在**非用户主动触发**的轮询路径上（看门狗补挂止损、TP 后同步止损…）：
+    那些地方原来靠"手工仓进不了 open_pos"来保证不碰用户仓位，
+    但归属待确认的币**恰恰是纸面有记录的币** —— 它会进 open_pos，所以必须单独挡住。"""
+    c = (coin or "").upper()
+    key = "归属待确认|%s" % c
+    if key in _LIVE_ALERTS:
+        return
+    _LIVE_ALERTS.add(key)
+    notify("❓【归属待确认】%s 的「%s」**没有执行**：这币在交易所有仓、机器人纸面也记着它，"
+           "但数量差很大，归属没确认之前机器人不对它发任何真单。\n"
+           "回「%s 是我的手工仓」或「%s 是机器人的仓」。" % (c, action, c, c))
+
+
+def _ambig_dump():
+    return sorted(AMBIG_COINS)
+
+
+def _ambig_prune(real_syms):
+    """按**交易所实时持仓**核对归属待确认名单，把交易所已经没有的币移出去。返回被移除的币（已排序）。
+
+    与 `_manual_prune` 同一条安全约束：**只在「读交易所持仓成功」时才会被调用**
+    （读失败时 startup_reconcile 早已 return，不会走到这里）——读不到就绝不删名单。
+    交易所已经没有这个币 → 「纸面与交易所数量差」这件事本身不存在了，问题自动消失。
+    """
+    _have = {str(s)[:-4] if str(s).endswith("USDT") else str(s) for s in (real_syms or [])}
+    _stale = sorted(c for c in list(AMBIG_COINS) if c not in _have)
+    for _c in _stale:
+        AMBIG_COINS.discard(_c)
+    if _stale:
+        log("   [归属待确认] 交易所已经不再有这些币 → 移出待确认名单：%s（名单现在=%s）"
+            % ("、".join(_stale), "、".join(sorted(AMBIG_COINS)) or "空"))
+        STATE_DIRTY[0] = True
+        notify("ℹ️【归属待确认】交易所已经没有这些币了 → 已移出待确认名单：%s\n"
+               "（它们以后有新信号会照常走审批，机器人不再拦）" % "、".join(_stale))
+    return _stale
+
+
 def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
     """开仓 → 交给真实下单层生成完整计划（市价/限价腿 + 各档止盈 + Algo 止损）"""
     if not _BEXEC_OK:
         return None
-    # ===== 手工仓护栏：用户的仓，绝不动（优先级高于一切）=====
-    if bexec.LIVE[0] and manual_block(coin, "开新仓"):
+    # ===== 手工仓 / 归属待确认：用户的仓（或还没确认是谁的仓），绝不动（优先级高于一切）=====
+    if bexec.LIVE[0] and no_touch_block(coin, "开新仓"):
         return None
     # ===== 启动对账闸门：不一致时禁止开新真仓（评估 G3）=====
     try:
@@ -834,7 +997,7 @@ def real_plan_close(coin, dirc, qty=None):
     """平仓/减仓 → 真实层对应动作"""
     if not _BEXEC_OK:
         return None
-    if bexec.LIVE[0] and manual_block(coin, "平仓/减仓"):
+    if bexec.LIVE[0] and no_touch_block(coin, "平仓/减仓"):
         return None
     sym = coin.upper() + "USDT"
     try:
@@ -849,11 +1012,11 @@ def real_plan_close(coin, dirc, qty=None):
 def _real_qty_or_estimate(coin, tr):
     """止损数量：**优先查交易所真实持仓**，查不到才退回纸面估算。
     评估 M4：实盘下若用纸面公式估数量，可能偏大（被拒）或偏小（只保护一部分仓位）。
-    ⚠️ 手工仓护栏：该币若有用户手工仓，**绝不允许**把交易所数量（含手工仓）拿来挂止损 ——
-       否则机器人的止损会覆盖到用户手工仓的数量，那就是"干涉"。"""
+    ⚠️ 手工仓护栏 / 归属待确认：该币若命中，**绝不允许**把交易所数量（含用户手工仓的数量）
+       拿来挂止损 —— 否则机器人的止损会覆盖到用户手工仓的数量，那就是"干涉"。"""
     sym = coin.upper() + "USDT"
-    if manual_guard(coin):
-        log("   🛑 [手工仓护栏] %s 有你的手工仓 → 止损数量只用纸面估算，绝不用交易所数量" % coin)
+    if no_touch_guard(coin):
+        log("   🛑 [手工仓/归属待确认] %s 的真实仓位机器人不碰 → 止损数量只用纸面估算，绝不用交易所数量" % coin)
         return real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
     if _BEXEC_OK:
         try:
@@ -1524,7 +1687,9 @@ def _self_marks():
             #    而这正是历史上出过 4 次的自环坑）。
             "【启动告警】", "【启动失败】",
             # 🆕 2026-09-18 用户新定的浮亏告警（[8g] 自检当场抓到我漏登记这一个）
-            "【浮亏告警】"]
+            "【浮亏告警】",
+            # 🆕 2026-09-18 用户新定的「归属待确认」闸门（同币交易所有仓 + 纸面数量差很大 → 先问用户）
+            "【归属待确认】"]
 
 
 SELF_MARKS = _self_marks()
@@ -3993,7 +4158,15 @@ HELP_TEXT = """【机器人指令】在「开单记录」或「机器人开单�
 — 手工仓护栏（你在币安自己开的仓）—
 · 对账时若发现「交易所有仓、纸面无记录」→ 机器人把该币登记为**你的手工仓**并告警，
   之后**绝不对它发任何真单**（不开新仓、不平仓、不改止损、也不拿它的数量去挂保护）
-· 解除手工仓 LSK —— 手工仓平掉后解除护栏（也可写：手工仓已平 LSK）"""
+· 解除手工仓 LSK —— 手工仓平掉后解除护栏（也可写：手工仓已平 LSK）
+
+— 归属待确认（🆕 2026-09-18：同一个币交易所有仓、机器人纸面也记着，但数量差很大）—
+· 机器人开机对账时遇到这种情况**不会自己猜**，而是**主动问你**「这币到底是谁的？」
+· ⚠️ 在机器人收到你的回话之前，**不会对该币发任何真单**（不开新仓、不平仓/减仓、不改止损），
+  也不会拿交易所的持仓数量去挂保护 —— 免得把你在币安的手工仓当成机器人自己的仓来管
+· LAB 是我的手工仓 —— 认下是你的手工仓（此后按上面的手工仓护栏保护）
+· LAB 是机器人的仓 —— 认下是机器人自己的仓（闸门解除；纸面数量机器人**不会自动改**，请自己核对）
+· 实盘模式下如果还没回答，这个币会**一直算在启动对账闸门里**（不会开新真单）"""
 
 
 def load_runtime():
@@ -4124,7 +4297,12 @@ def close_position(coin, pct=100.0, why="手动指令"):
     STATE_DIRTY[0] = True
     with open(TRADES, "a", encoding="utf-8") as f:
         f.write(json.dumps(tr, ensure_ascii=False) + "\n")
-    if _BEXEC_OK and tr.get("real_layer") == "实盘":
+    if _BEXEC_OK and tr.get("real_layer") == "实盘" and ambig_guard(coin, "手工平/减仓的真实动作"):
+        # 🆕 2026-09-18 归属待确认：**一个真实动作都不发**。
+        #   这里不能只靠 real_plan_close（它已经被拦住）——上面的 cancel_all 会把这个币
+        #   **所有**挂单撤掉，包括用户手工仓的止损单；撤掉 = 用户的手工仓变裸仓。
+        _ambig_hold_note(coin, "手工平/减仓的真实动作（撤单/改止损）")
+    elif _BEXEC_OK and tr.get("real_layer") == "实盘":
         # 只对实盘仓动真实挂单（用户 2026-09-15：切换模式时已有持仓不动）
         try:
             _sym = coin.upper() + "USDT"
@@ -4390,6 +4568,66 @@ def _handle_ask_reply(t):
     return True
 
 
+def _is_ambig_reply(s):
+    """识别用户对「归属待确认」的问话回答（用户 2026-09-18 定的口径）。
+
+    返回 `(coin, "manual")` / `(coin, "robot")`，认不出来返回 None。
+
+    认这些写法：
+      · `LAB 是我的手工仓` / `手工仓 LAB`      → manual
+      · `LAB 是机器人的仓` / `LAB 不是手工仓`   → robot
+
+    ⚠️ 只认**整条消息就是这句话**（去掉昵称/时间前缀、首尾标点后）——
+       免得把聊天里的"我也有个 BTC 手工仓"当成指令；同时要求能解析出币种。
+    """
+    t = re.sub(r"\s+", " ", (s or "")).strip().strip("。.!！?？,，:：;；、~ ")
+    if not t or len(t) > 40:
+        return None
+    _c = r"([A-Za-z0-9]{2,12})"
+    for _p in (r"^%s ?(?:是|＝|=) ?(?:我的|我)? ?手工仓$" % _c,
+               r"^手工仓 ?%s$" % _c):
+        m = re.match(_p, t)
+        if m:
+            c, _ = resolve_coin(m.group(1))
+            if c:
+                return (c.upper(), "manual")
+    for _p in (r"^%s ?(?:是|＝|=) ?(?:机器人|程序|bot) ?的? ?仓位?$" % _c,
+               r"^%s ?不是 ?(?:我的)? ?手工仓$" % _c):
+        m = re.match(_p, t)
+        if m:
+            c, _ = resolve_coin(m.group(1))
+            if c:
+                return (c.upper(), "robot")
+    return None
+
+
+def _handle_ambig_reply(coin, who):
+    """处理用户对「归属待确认」的回答（用户 2026-09-18 要求）。"""
+    c = (coin or "").upper()
+    if not c:
+        return False
+    # 「机器人没动手」的通报去重要跟着解掉，万一以后又变成待确认还得能再报一次
+    _LIVE_ALERTS.discard("归属待确认|%s" % c)
+    if who == "manual":
+        MANUAL_COINS.add(c)
+        AMBIG_COINS.discard(c)
+        STATE_DIRTY[0] = True
+        log("   ✅ [归属确认] %s = 你的手工仓（机器人从此不碰它）" % c)
+        notify("【指令】已记下：**%s 是你的手工仓**。\n"
+               "机器人从现在起不会对它发任何真单（不开新仓、不平仓/减仓、不改止损，"
+               "也不拿交易所的数量去挂保护）。\n"
+               "如果机器人纸面还记着这个币，那条纸面记录照旧只走纸面，不影响你的真实持仓。\n"
+               "手工仓平掉后发「解除手工仓 %s」即可解除这条护栏。" % (c, c))
+    else:
+        AMBIG_COINS.discard(c)
+        STATE_DIRTY[0] = True
+        log("   ✅ [归属确认] %s = 机器人的仓（闸门解除，但纸面与交易所数量仍不一致）" % c)
+        notify("【指令】已记下：**%s 是机器人的仓**。归属待确认闸门已解除，机器人会照常按纸面逻辑管它。\n"
+               "⚠️ 但机器人纸面记的数量与交易所上这个币的数量**仍然不一致**，"
+               "机器人只记录、**不会自动改账** —— 请你自己核对一次（尤其是止损数量）。" % c)
+    return True
+
+
 def handle_command(txt):
     """返回 True 表示这条消息是指令（已处理，不再走信号流程）"""
     global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE
@@ -4405,6 +4643,12 @@ def handle_command(txt):
     #    看不到它们（自检当场 NameError）。现在统一用模块级的 _strip_nick / _strip_time。
     nick = _strip_nick
     tm = _strip_time
+    # ===== 🆕 2026-09-18「这币是谁的？」回答（用户要求：机器人问完，用户回话才放行）=====
+    # ⚠️ 放在「开/不开」判定之前：它是更具体的整句匹配，不会被 _is_ask_reply 抢走。
+    for cand in (t, tm(t), nick(t), tm(nick(t)), nick(tm(t))):
+        _amb = _is_ambig_reply(cand)
+        if _amb:
+            return _handle_ambig_reply(_amb[0], _amb[1])
     # ===== 「开 / 不开 / 只开X和Y」确认（用户 2026-09-14 要求：把握不准必须问他）=====
     # 判定条件收紧，避免"开单记录""开始监控"这类正常文字被误当指令：
     #   ① 回复里点出了币种名 + 含开/买/作废等动词，或
@@ -5215,6 +5459,11 @@ def main():
             for _c in (sv.get("manual") or []):
                 if _c:
                     MANUAL_COINS.add(str(_c).upper())
+            # ===== 🆕 2026-09-18 归属待确认恢复（同币交易所有仓 + 纸面数量差很大）=====
+            # 没答复就重启，问话不能丢 —— 恢复后仍然**不发任何真单**（拦截靠 AMBIG_COINS 本身）
+            for _c in (sv.get("ambig") or []):
+                if _c:
+                    AMBIG_COINS.add(str(_c).upper())
             # 🆕 2026-09-17：图上信号的"点位记忆"（识别"同一笔的进展通报"用）
             for _r in (sv.get("img_sig_seen") or []):
                 if isinstance(_r, dict) and _r.get("entry"):
@@ -5224,6 +5473,9 @@ def main():
             if MANUAL_COINS:
                 log("已恢复手工仓护栏：%s（机器人不会对它们发任何真单）"
                     % "、".join(sorted(MANUAL_COINS)))
+            if AMBIG_COINS:
+                log("已恢复归属待确认名单：%s（得到你的回话之前，机器人不会对它们发任何真单）"
+                    % "、".join(sorted(AMBIG_COINS)))
         except Exception:
             pass
     # ===== 启动对账闸门（评估 G3）：放在开页之前，避免带着不一致状态开始跑 =====
@@ -5345,6 +5597,7 @@ def main():
                    "asking": _asking_dump(),
                    "paused": bool(PAUSED[0]),
                    "manual": _manual_dump(),      # 用户手工仓护栏（机器人不干涉）
+                   "ambig": _ambig_dump(),        # 🆕 归属待确认（同币交易所有仓+纸面数量差很大）
                    "img_sig_seen": _img_sig_dump(),   # 图上信号点位记忆（识别持仓进展通报）
                    "last_api": dict(API_CURSOR),  # API 模式的消息游标（毫秒）
                    "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
@@ -6164,7 +6417,9 @@ def main():
                             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
                         notify("【已结单·纸面】%s %s\n结果：%s @%.8g（剩余 %.0f%%）\n累计盈亏：%+.1fU（保证金 %.0fU）"
                                % (coin, tr["dir"], tr["exit_why"], stop, remaining * 100, tr["realized"], MARGIN))
-                        if _BEXEC_OK and tr.get("real_layer") == "实盘":
+                        if _BEXEC_OK and tr.get("real_layer") == "实盘" and ambig_guard(coin, "仓位了结后的撤单"):
+                            _ambig_hold_note(coin, "仓位了结后的撤单")
+                        elif _BEXEC_OK and tr.get("real_layer") == "实盘":
                             # 只对【开仓时就是实盘】的仓位动真实挂单；切模式前开的纸面仓一律不碰（用户 2026-09-15 要求）
                             try:
                                 bexec.cancel_all(coin.upper() + "USDT")
@@ -6206,10 +6461,16 @@ def main():
                         notify("【止盈成交·纸面】%s %s\nTP%d 成交 @%.8g（平%.0f%%）\n该档盈亏：%+.1fU · 累计：%+.1fU\n剩余仓位：%.0f%%%s"
                                % (coin, tr["dir"], hit_i + 1, tp, part * 100, pnl, tr["realized"], remaining * 100,
                                   ("\n止损已移到开仓价 %.8g（保本损）" % stop) if hit_i == 0 else ""))
-                        if _BEXEC_OK and tr.get("real_layer") == "实盘":
+                        if _BEXEC_OK and tr.get("real_layer") == "实盘" and ambig_guard(coin, "止损同步（TP 后）"):
+                            # 🆕 2026-09-18 归属待确认：不动这个币的真实挂单
+                            #   （sync_sl 会按数量改真实止损；数量差很大时改的可能正是用户手工仓的止损单）
+                            _ambig_hold_note(coin, "止损同步（TP 后）")
+                        elif _BEXEC_OK and tr.get("real_layer") == "实盘":
                             # 只对实盘仓动真实止损；切模式前开的纸面仓不碰。
                             # 同 ①：走 bexec.sync_sl 而非手工仓护栏 —— 手工仓进不了 open_pos，
                             # 而护栏名单会误报（误报后果是“该移的止损不移”= 裸奔）。
+                            # ⚠️ 归属待确认不适用这条推理：它是**纸面有记录的币**，会进 open_pos，
+                            #    见上面那一段（挡住才是用户 2026-09-18 要的）。
                             try:
                                 _rq = _real_qty_or_estimate(coin, tr)
                                 bexec.sync_sl(coin.upper() + "USDT", tr["dir"],
@@ -6237,6 +6498,7 @@ def main():
                        "asking": _asking_dump(),      # B11：待确认池落盘，重启不再静默丢失
                        "paused": bool(PAUSED[0]),     # 暂停态落盘，重启后依然生效
                        "manual": _manual_dump(),      # 手工仓护栏落盘（机器人不干涉用户手工仓）
+                       "ambig": _ambig_dump(),        # 🆕 归属待确认落盘（重启后仍先问用户、仍不发真单）
                        "img_sig_seen": _img_sig_dump(),   # 图上信号点位记忆（识别持仓进展通报）
                        "last_api": dict(API_CURSOR),  # API 模式消息游标（毫秒）
                        "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
@@ -6593,6 +6855,7 @@ if __name__ == "__main__":
                 bexec = _B2(rows, boom=boom)
                 bexec.LIVE[0] = live
                 MANUAL_COINS.clear(); MANUAL_COINS.update(manual)
+                AMBIG_COINS.clear()      # 🆕 归属待确认名单也必须每个用例从零开始（否则会串场）
                 open_pos_ref.clear()
                 if remaining is not None:
                     open_pos_ref[coin] = {"entry": 100.0, "remaining": remaining, "dir": "LONG"}
@@ -6616,10 +6879,15 @@ if __name__ == "__main__":
             _ck("集成② 已阻止真单", _rc["blocked"], True)
             _ck("集成② 差异文案含「数量不符」",
                 any("数量不符" in d for d in _rc["diffs"]), True)
-            # ③ 孤儿仓 → 登记手工仓 + 阻止
+            # ③ 孤儿仓 → 登记手工仓；⚠️ 但**不能再把它算成"对账不一致"**
+            #    （2026-09-18 修的既有缺陷：旧代码对已登记的手工仓照样生成 only_real 差异 →
+            #      consistent 永远 False → 实盘下闸门永久卡死 = 用户只要持有任何手工仓就开不出新仓。
+            #      这条断言原来写的是 blocked=True，它断言的正是那个缺陷。）
             _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0)], None)
             _ck("集成③ 孤儿仓登记为手工仓", _mn, {"ETH"})
-            _ck("集成③ 已阻止真单", _rc["blocked"], True)
+            _ck("集成③ 手工仓不卡死实盘闸门（2026-09-18 修复）", _rc["blocked"], False)
+            _ck("集成③ 差异明细照样保留（供日志/指令查询）",
+                any("孤儿仓/手工仓" in d for d in _rc["diffs"]), True)
             # ④ 手工仓不评判数量
             _r, _rc, _mn = _live_case([_prow("BTCUSDT", 99.0)], 1.0, manual={"BTC"})
             _ck("集成④ 手工仓数量不管 → 一致", _r, True)
@@ -6653,6 +6921,169 @@ if __name__ == "__main__":
             with contextlib.redirect_stdout(io.StringIO()):
                 watch_reconcile()
             _ck("集成⑧ 影子模式不做周期对账", len(_LIVE_ALERTS), 0)
+
+            # ==============================================================================
+            # 🆕 [8m-⑥] 手工仓 / 归属待确认闸门（用户 2026-09-18 明确要求）
+            # 背景事故：用户的手工仓 LABUSDT（交易所 11700 张）与机器人纸面账里同币的一条记录
+            #   （292 张，来自博主信号、mode=shadow）同时存在。旧判据「交易所有仓 且 纸面无记录」
+            #   认不出这种情况 → 一开实盘，机器人会把它当成自己的仓去挂真实止损 + 三层止盈，
+            #   直接动到用户的手工仓。用户要求：机器人自己拦住、主动问用户，
+            #   **在用户回话之前不对该币发任何真单**。
+            # ==============================================================================
+            print("-" * 66)
+            print("[8m-⑥] 手工仓/归属待确认闸门：同币交易所有仓+纸面数量差很大 → 先问用户，回话前一律不发真单")
+            _cap = []                      # 捕获通知（自检绝不真发飞书）
+            _keep_notify1 = globals()["notify"]
+            globals()["notify"] = lambda _t: _cap.append(str(_t))
+
+            def _quiet(fn, *a, **k):
+                """调用时把日志吞掉（自检输出只留断言行，便于看汇总）。"""
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return fn(*a, **k)
+
+            class _BK:
+                """带"调用记录"的假交易所：用来证明**一个真单都没发出去**。"""
+                LIVE = [True]
+
+                def __init__(self):
+                    self.calls = []
+
+                def positions(self):
+                    return []
+
+                def open_algo_orders(self, sym=None):
+                    return []
+
+                def open_orders(self, sym=None):
+                    return []
+
+                def place_sl_stop_market(self, *a, **k):
+                    self.calls.append(("place_sl", a))
+
+                def sync_sl(self, *a, **k):
+                    self.calls.append(("sync_sl", a))
+
+                def cancel_all(self, *a, **k):
+                    self.calls.append(("cancel_all", a))
+
+                def open_full_position(self, *a, **k):
+                    self.calls.append(("open_full", a))
+
+                def close_position_market(self, *a, **k):
+                    self.calls.append(("close", a))
+
+                def position_of(self, *a, **k):
+                    self.calls.append(("position_of", a))
+                    return {"positionAmt": "11700"}
+
+            try:
+                # ① 对账出 qty_mismatch → 该币进 AMBIG_COINS，并且**主动问用户**
+                #    （LAB 实例：纸面 292 张 vs 交易所 11700 张）
+                _cap.clear()
+                _r, _rc, _mn = _live_case([_prow("LABUSDT", 11700.0)], 292.0 / 9.0, coin="LAB")
+                _ck("⑧m-⑥① 数量差很大 → 该币进「归属待确认」", "LAB" in AMBIG_COINS, True)
+                _ck("⑧m-⑥① 实盘下计入闸门（阻止真单）", _rc["blocked"], True)
+                _ck("⑧m-⑥① 机器人主动问用户（含两种回话写法）",
+                     any(("归属待确认" in s) and ("是我的手工仓" in s) and ("是机器人的仓" in s)
+                         for s in _cap), True)
+                _cap.clear()
+                _r, _rc, _mn = _live_case([_prow("LABUSDT", 11700.0)], 292.0 / 9.0,
+                                          live=False, coin="LAB")
+                _ck("⑧m-⑥① 影子模式同样登记待确认", "LAB" in AMBIG_COINS, True)
+                _ck("⑧m-⑥① 影子模式只记录、不阻断（沿用旧语义）", _rc["blocked"], False)
+
+                # ② 归属待确认的币：真实开仓 / 平仓 / 挂保护**一律硬拦**
+                AMBIG_COINS.clear(); MANUAL_COINS.clear(); open_pos_ref.clear()
+                AMBIG_COINS.add("LAB")
+                _bk = _BK()
+                bexec = _bk
+                bexec.LIVE[0] = True
+                _cap.clear()
+                _ck("⑧m-⑥② 真实开仓被硬拦（返回 None，没生成任何计划）",
+                     _quiet(real_plan_open, "LAB", "LONG", 0.05, 0.04, [0.06]), None)
+                _ck("⑧m-⑥② 真实平仓/减仓被硬拦", _quiet(real_plan_close, "LAB", "LONG", 291), None)
+                _ck("⑧m-⑥② 没发出任何真实下单动作", _bk.calls, [])
+                _ck("⑧m-⑥② 拦下时告警（写明「不对它发任何真单」）",
+                     any(("归属待确认" in s) and ("不会对它发任何真单" in s) for s in _cap), True)
+                # 挂保护：看门狗不许替它补挂止损（否则等于拿机器人的数量去动用户的手工仓）
+                open_pos_ref["LAB"] = {"entry": 0.05, "remaining": 1.0, "dir": "LONG",
+                                       "sl": 0.04, "real_layer": "实盘"}
+                NAKED_WATCH.clear(); _LIVE_ALERTS.clear(); _cap.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    watch_naked()
+                _ck("⑧m-⑥② 看门狗不给它补挂止损", _bk.calls, [])
+                _ck("⑧m-⑥② 没动手也说了原因（不是静默）",
+                     any("归属待确认" in s for s in _cap), True)
+                _ck("⑧m-⑥② 止损数量只用纸面估算（绝不用交易所的 11700）",
+                     _quiet(_real_qty_or_estimate, "LAB", open_pos_ref["LAB"]),
+                     real_qty_estimate(0.05, 1.0))
+                _ck("⑧m-⑥②   → 压根没去读交易所持仓",
+                     [c for c in _bk.calls if c[0] == "position_of"], [])
+                AMBIG_COINS.clear()
+                _ck("⑧m-⑥② 对照：待确认解除后就用交易所数量（说明刚才是护栏起的作用）",
+                     _quiet(_real_qty_or_estimate, "LAB", open_pos_ref["LAB"]), 11700.0)
+
+                # ③ 用户回「X 是我的手工仓」→ 进手工仓护栏、退出待确认
+                AMBIG_COINS.clear(); MANUAL_COINS.clear()
+                AMBIG_COINS.add("LAB")
+                _cap.clear()
+                _ck("⑧m-⑥③ 「LAB 是我的手工仓」被认成指令",
+                     _quiet(handle_command, "LAB 是我的手工仓"), True)
+                _ck("⑧m-⑥③ 已登记为手工仓", "LAB" in MANUAL_COINS, True)
+                _ck("⑧m-⑥③ 已从待确认名单移除", "LAB" in AMBIG_COINS, False)
+                _ck("⑧m-⑥③ 回执说明已按手工仓保护",
+                     any(("你的手工仓" in s) and ("不会对它发任何真单" in s) for s in _cap), True)
+
+                # ④ 用户回「X 是机器人的仓」→ 退出待确认（数量仍不一致，只记录不改账）
+                AMBIG_COINS.clear(); MANUAL_COINS.clear()
+                AMBIG_COINS.add("LAB")
+                _cap.clear()
+                _ck("⑧m-⑥④ 「LAB 是机器人的仓」被认成指令",
+                     _quiet(handle_command, "LAB 是机器人的仓"), True)
+                _ck("⑧m-⑥④ 已从待确认名单移除", "LAB" in AMBIG_COINS, False)
+                _ck("⑧m-⑥④ 不误登记成手工仓", "LAB" in MANUAL_COINS, False)
+                _ck("⑧m-⑥④ 回执提醒数量仍不一致、机器人不会自动改账",
+                     any(("仍然不一致" in s) and ("不会自动改账" in s) for s in _cap), True)
+                AMBIG_COINS.clear(); AMBIG_COINS.add("LAB")
+                _ck("⑧m-⑥④ 也认「LAB 不是手工仓」这种说法",
+                     bool(_quiet(handle_command, "LAB 不是手工仓")), True)
+                _ck("⑧m-⑥④ 闲聊里的同款字样**不算**指令（防误伤）",
+                     _quiet(handle_command, "我还有个 BTC 的手工仓你帮我看看"), False)
+
+                # ⑤ 闸门：手工仓的 only_real 差异在实盘下**不**置 blocked；非手工的同币不一致要置 blocked
+                _r, _rc, _mn = _live_case([_prow("ETHUSDT", 3.0)], None)
+                _ck("⑧m-⑥⑤ 手工仓（交易所有/纸面没有）不再卡死实盘闸门", _rc["blocked"], False)
+                _ck("⑧m-⑥⑤   → 但仍然登记为手工仓（护栏照旧保护）", _mn, {"ETH"})
+                _ck("⑧m-⑥⑤   → 差异明细照样保留（供日志/指令查询）",
+                     any("孤儿仓/手工仓" in d for d in _rc["diffs"]), True)
+                _r, _rc, _mn = _live_case([_prow("BTCUSDT", 9.0)], 1.0, manual={"BTC"})
+                _ck("⑧m-⑥⑤ 已登记手工仓的数量差异不置 blocked", _rc["blocked"], False)
+                _r, _rc, _mn = _live_case([_prow("BTCUSDT", 9.0)], 2.0 / 3)
+                _ck("⑧m-⑥⑤ 非手工的同币数量不符 → 置 blocked", _rc["blocked"], True)
+                _r, _rc, _mn = _live_case([_prow("BTCUSDT", 9.0)], 1.0)
+                _ck("⑧m-⑥⑤ 非手工的同币数量一致 → 不置 blocked", _rc["blocked"], False)
+
+                # ⑥ 落盘 / 恢复（重启后仍然先问用户、仍然不发真单）
+                AMBIG_COINS.clear(); AMBIG_COINS.add("LAB")
+                json.dump({"open": {}, "ambig": _ambig_dump()},
+                          open(STATE, "w", encoding="utf-8"), ensure_ascii=False)
+                _ck("⑧m-⑥⑥ 待确认名单可落盘", _ambig_dump(), ["LAB"])
+                AMBIG_COINS.clear()
+                for _c in (json.load(open(STATE, encoding="utf-8")).get("ambig") or []):
+                    AMBIG_COINS.add(str(_c).upper())
+                _ck("⑧m-⑥⑥ 重启后能从 state.json 恢复", sorted(AMBIG_COINS), ["LAB"])
+                AMBIG_COINS.clear(); AMBIG_COINS.update(["LAB", "BTC"])
+                _ck("⑧m-⑥⑥ 交易所已经没有的币自动移出", _quiet(_ambig_prune, {"BTCUSDT"}), ["LAB"])
+                _ck("⑧m-⑥⑥   → 名单只剩交易所还有仓的", sorted(AMBIG_COINS), ["BTC"])
+
+                # ⑦ 自环：新通知前缀必须登记（同 [8g] 的判据 —— [8g] 所在分支要读生产机文件，
+                #    本机跑不了，所以这里同步查一条，免得漏登记要等上服务器才发现）
+                _ck("⑧m-⑥⑦ SELF_MARKS 含【归属待确认】", "【归属待确认】" in SELF_MARKS, True)
+            finally:
+                globals()["notify"] = _keep_notify1
+                AMBIG_COINS.clear(); MANUAL_COINS.clear()
+                open_pos_ref.clear(); NAKED_WATCH.clear(); _LIVE_ALERTS.clear()
+                bexec = _keep_brexec
 
             # 复原（虽然马上退出，还是复原一下）
             open_pos_ref.clear(); NAKED_WATCH.clear(); _LIVE_ALERTS.clear()
