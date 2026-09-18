@@ -77,6 +77,11 @@ def _mtime_str(rel):
 # 密钥：变量名与来源只在 config.py 里定义一次（**只从 .env / 环境变量读**）
 DS_KEY = config.secrets()["deepseek_api_key"]
 DS_API = "https://api.deepseek.com/chat/completions"
+# 🆕 2026-09-18（用户朋友建议 + 用户要求）：**模型名不再写死在代码里**。
+#   优先读 .env / 环境变量，其次用现在的默认值。换模型（含换供应商）只改配置，不动代码。
+#   ⚠️ 换之前请先用 tools/eval_charts.py 在同一批图上比准确率（朋友的评审要求）。
+VISION_MODEL_NAME = os.environ.get("DEEPSEEK_VISION_MODEL") or "deepseek-v4-flash-vision-exp"
+TEXT_MODEL_NAME = os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash"
 CST = datetime.timezone(datetime.timedelta(hours=8))
 
 GROUPS = ["机器人开单通知", "暴富龙", "UA-nurseneil2", "颜驰2群"]
@@ -919,7 +924,7 @@ def _ocr_one_label(im, x0, t):
         buf = RUN + "/tmp_one_label.png"
         crop.save(buf)
         b64 = base64.b64encode(open(buf, "rb").read()).decode()
-        body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+        body = {"model": VISION_MODEL_NAME, "temperature": 0,
                 "messages": [{"role": "system",
                               "content": "You transcribe the price number printed in this chart screenshot crop. STRICT JSON only."},
                              {"role": "user", "content": [
@@ -1009,7 +1014,7 @@ def _ocr_tags_batch(im, x0, merged):
     p = RUN + "/tmp_tags.png"
     canvas.save(p)
     b64 = base64.b64encode(open(p, "rb").read()).decode()
-    body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+    body = {"model": VISION_MODEL_NAME, "temperature": 0,
             "messages": [{"role": "system", "content": "You transcribe price numbers from chart labels. STRICT JSON only."},
                          {"role": "user", "content": [
                              {"type": "text", "text": "This image stacks %d price labels from a chart. Each label is marked with a yellow index number on its left. "
@@ -1494,7 +1499,7 @@ def _edge_price_by_vision(im, w, h, edges):
             content.append({"type": "image_url",
                             "image_url": {"url": "data:image/png;base64,"
                                                  + base64.b64encode(buf.getvalue()).decode()}})
-        body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+        body = {"model": VISION_MODEL_NAME, "temperature": 0,
                 "messages": [{"role": "system", "content": "只读图上真实可见的数字，不确定就 null。"},
                              {"role": "user", "content": content}]}
         r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY,
@@ -1839,7 +1844,7 @@ def parse_text(text):
               "⑦ 止盈若是区间（如「止盈2400到2350」）→ targetRanges=[[2350,2400]]，不要塞进 targets；"
               "⑧ 一档止盈只给一个数就放 targets；多个止盈按顺序放 targets。"
               "重要：方向必须按原文判断（做多/多/空/做空/LONG/SHORT）。")
-    body = {"model": "deepseek-v4-flash", "temperature": 0,
+    body = {"model": TEXT_MODEL_NAME, "temperature": 0,
             "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text[:900]}]}
     try:
         r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY, "Content-Type": "application/json"}, json=body, timeout=120)
@@ -2067,6 +2072,14 @@ def fast_parse(txt):
                     r"(?:现价|市价|CMP|@)\s*\$?([0-9]*\.?[0-9]+)"):
             mm2 = re.search(pat, txt, re.I)
             if mm2:
+                # 🔴 2026-09-18 用户实测报障（SUSHI 那条）：
+                #   原文 `Going long SUSHI here at CMP. TPs above, DCA @ 0.2164, 4H close under 0.2135 for stops.`
+                #   这里 `@ 0.2164` 被当成开仓价 → 待确认池变成"开仓=0.2164"（那其实是 **DCA 加仓价**）→
+                #   用户看到"开仓价全错"。现在：`@`/CMP 前 16 字里若出现 DCA/加仓/补仓，就**不当开仓价**。
+                _pre = txt[max(0, mm2.start() - 16):mm2.start()].upper()
+                if any(k in _pre for k in ("DCA", "加仓", "补仓", "追加")):
+                    log("   ↳ 跳过「%s」：它是 DCA/加仓价，不是开仓价" % mm2.group(0).strip())
+                    continue
                 try:
                     entry = float(mm2.group(1)); break
                 except Exception:
@@ -2486,48 +2499,46 @@ def _near(a, b, tol=0.005):
         return False
 
 
-def _img_is_repeat(chart, coin=None):
-    """这张图的点位是不是"最近刚见过的那一笔"？是 → 视为持仓进展通报。
+def _img_hash(rec):
+    """这张图的**内容指纹**（用文件字节算 md5）——用来做"同一张图"的纯去重。"""
+    imgs = (rec or {}).get("imgs") or []
+    if not imgs:
+        return None
+    try:
+        h = hashlib.md5()
+        with open(imgs[0], "rb") as f:
+            h.update(f.read())
+        return h.hexdigest()[:16]
+    except Exception:
+        return None
 
-    ⚠️ 2026-09-17 实测修正：原来要求"**开仓价**先对上"才继续比，但状态图的读数会偏
-    （黄金那张的状态图把开仓读成 4298，而正确是 4258；止损位反而对上了 4258.022）。
-    改成：**两个价位对得上就算同一笔**（候选的 开仓/止损/各档止盈 与记忆里的集合两两比），
-    这样"读偏一项、其余对得上"也能识别出来；真正的新信号不会有两项都撞上。
+
+def _img_pushed_hashes():
+    return {r.get("h") for r in _img_sig_dump() if r.get("h")}
+
+
+def _img_note_pushed(rec):
+    """记下"这张图（内容）已经推送过了"，供纯去重用。"""
+    _h = _img_hash(rec)
+    if not _h:
+        return
+    IMG_SIG_SEEN.append({"h": _h, "ts": time.time()})
+    del IMG_SIG_SEEN[:-IMG_SIG_MAX]
+    STATE_DIRTY[0] = True
+
+
+def _img_is_repeat(rec):
+    """这张图**内容**是不是已经推送过？（纯去重）
+
+    🔴 2026-09-18 用户报障后大改（原实现有严重误伤，必须记住）：
+      旧版拿"图上点位与最近见过的同一笔一致"当拦截理由 —— 用户当天**测试同一个信号**、
+      重发同一张 SUSHI 图时，三条全被判成「持仓进展通报」而**静默不推送**（用户看到的是"发图没反应"）。
+      点位相同**不等于**"不是新信号"：博主本来就可能重复发同一点位。
+      现在只做**内容级去重**（同一张图推过一次就不再推），"是不是开单信号"交给视觉判类闸门
+      （见 _img_should_skip / _img_kind）：晒收益、走势状态、推文、纯K线、新闻一律只记日志。
     """
-    if not (chart and chart.get("ok") and chart.get("entry")):
-        # 🆕 2026-09-17：读不出"角色"时，用**色块每条边的价格**当特征。
-        #   用户报障现场（20:04 黄金那张赚钱状态图）：旧逻辑要求 chart.ok 才能比对，
-        #   于是这张"同一笔的进展图"没被判为重复 → 又推送了一次。现在用色块边价照样能认出。
-        _lv0 = []
-        for _z in ((chart or {}).get("geo") or {}).get("zone_edges") or []:
-            for _k in ("p_top", "p_bot"):
-                _v = _z.get(_k)
-                if isinstance(_v, (int, float)) and _v > 0:
-                    _lv0.append(_v)
-        _lv0 = sorted(set(_lv0))
-        if len(_lv0) < 2:
-            return False
-        for r in _img_sig_dump():
-            _rv0 = [r.get("entry"), r.get("sl")] + list(r.get("tps") or [])
-            _rv0 = [v for v in _rv0 if isinstance(v, (int, float)) and v > 0]
-            _hit0 = sum(1 for a in _lv0 if any(_near(a, b, 0.005) for b in _rv0))
-            if _hit0 >= 2:
-                return True
-        return False
-    _lv = [chart.get("entry"), chart.get("sl")] + list(chart.get("tps") or [])
-    _lv = [v for v in _lv if isinstance(v, (int, float)) and v > 0]
-    if len(_lv) < 2:
-        return False
-    for r in _img_sig_dump():
-        _rv = [r.get("entry"), r.get("sl")] + list(r.get("tps") or [])
-        _rv = [v for v in _rv if isinstance(v, (int, float)) and v > 0]
-        _hit = 0
-        for a in _lv:
-            if any(_near(a, b, 0.005) for b in _rv):
-                _hit += 1
-        if _hit >= 2:
-            return True
-    return False
+    _h = _img_hash(rec)
+    return bool(_h and _h in _img_pushed_hashes())
 
 
 def _img_kind_by_vision(path):
@@ -2537,7 +2548,7 @@ def _img_kind_by_vision(path):
         ext = str(path).rsplit(".", 1)[-1].lower()
         with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
-        body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+        body = {"model": VISION_MODEL_NAME, "temperature": 0,
                 "messages": [{"role": "system", "content": "只输出 JSON，不要解释。"},
                              {"role": "user", "content": [
                                  {"type": "text", "text":
@@ -2558,19 +2569,76 @@ def _img_kind_by_vision(path):
         return ""
 
 
+_IMG_KINDS = ("signal", "pnl", "status", "tweet", "kline", "news", "other")
+_IMG_KIND_PROMPT = (
+    "给这张来自加密货币跟单群的图片分类。**只输出 JSON**：\n"
+    "{\"kind\":\"signal|pnl|status|tweet|kline|news|other\",\"why\":\"一句话中文理由\"}\n"
+    "★ 只有一种算 signal（要处理），其余全部算忽略：\n"
+    "· signal＝**开单信号图**：正在给出一条新的开仓信号 —— 图上用画图工具画了仓位"
+    "（一条开仓线 + 一段止损区间 + 一段止盈区间，通常两块以上不同颜色的填充色块，并带价格标注）。"
+    "颜色无所谓。目的：告诉别人现在该开仓、止损止盈放哪。\n"
+    "· pnl＝晒单/晒收益：账户截图（Balance/Equity/Margin/Positions/余额/净值）、平台的收益分享卡片"
+    "（一个大大的 +65.7% 与 Entry/Mark Price、推荐链接）、持仓列表晒盈利。\n"
+    "· status＝开单**之后**的走势状态图：这笔单已经开好了，只是发出来看行情走到哪了"
+    "（可能还画着之前那个仓位工具，但现价已明显离开开仓价、朝止盈方向跑，或写着浮盈/继续持有）。\n"
+    "· tweet＝推文/群聊截图（含转发点赞评论头像二维码等版式，哪怕夹着收益卡片也算 tweet）。\n"
+    "· kline＝纯K线图：只有蜡烛/均线/指标，**没有仓位工具、没有点位标注**。\n"
+    "· news＝新闻/公告/提示截图、表情包、无关截图。\n"
+    "· other＝以上都不是。\n"
+    "判断顺序：先问「这张图是不是在**给一条新的开仓信号**」；不是就选一个（宁可选其他，不要错判成 signal）。"
+    "颜色不重要（红绿、灰蓝都行）；看不清就 other 并写明。")
+
+
+def _img_kind(path):
+    """视觉判类：这张图到底是不是"开单信号"？（用户 2026-09-18 定的规矩）"""
+    try:
+        ext = str(path).rsplit(".", 1)[-1].lower()
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        body = {"model": VISION_MODEL_NAME, "temperature": 0,
+                "messages": [{"role": "system", "content": "只输出 JSON。"},
+                             {"role": "user", "content": [
+                                 {"type": "text", "text": _IMG_KIND_PROMPT},
+                                 {"type": "image_url",
+                                  "image_url": {"url": "data:image/%s;base64,%s"
+                                                       % ("png" if ext == "png" else "jpeg", b64)}}]}],
+                }
+        r = requests.post(DS_API, headers={"Authorization": "Bearer " + DS_KEY,
+                                          "Content-Type": "application/json"},
+                          json=body, timeout=120)
+        m = re.search(r"\{[\s\S]*\}", r.json()["choices"][0]["message"]["content"])
+        if not m:
+            return ""
+        d = json.loads(m.group(0))
+        k = str(d.get("kind") or "").lower().strip()
+        log("   🔍 图片判类：%s（%s）" % (k or "?", str(d.get("why") or "")[:50]))
+        return k if k in _IMG_KINDS else ""
+    except Exception as e:
+        log("   ⚠️ 图片判类失败：%s" % str(e)[:100])
+        return ""
+
+
 def _img_should_skip(g, r):
-    """True = 判为"已持仓状态图/账户截图"→ 不推送（只写日志）。"""
-    ch = r.get("chart") or {}
-    meta = r.get("meta") or {}
-    if _img_is_repeat(ch, meta.get("coin")):
-        log("   📎 [图] 点位与最近刚见过的同一笔一致 → 判为「持仓进展通报」，不推送")
+    """True = **不推送**（只记日志）。用户 2026-09-18 定的规矩：**开单信号以外的一律忽略**。
+
+    两道判据（顺序有意义）：
+      ① **纯内容去重**：同一张图（文件内容 md5 相同）已经推过一次 → 不再推。
+         （⚠️ 绝不再用"点位重复"当判据 —— 那会误伤"博主重发同一点位"和用户的正常测试）
+      ② **视觉判类闸门**：只有 signal 放行；pnl/status/tweet/kline/news/other → 只记日志。
+    判类调用异常（网络问题）时**放行**并写明 —— 宁可多推一条通知，也不静默丢真信号。
+    """
+    if _img_is_repeat(r):
+        log("   📎 [图] 这张图的内容与已推送过的完全相同 → 去重，不推送")
         return True
-    if not ch.get("ok"):
-        _imgs = r.get("imgs") or []
-        _k = _img_kind_by_vision(_imgs[0]) if _imgs else ""
-        if _k == "account":
-            log("   📎 [图] 视觉判定=券商账户/持仓截图 → 不推送")
-            return True
+    _imgs = r.get("imgs") or []
+    if not _imgs:
+        return False
+    _k = _img_kind(_imgs[0])
+    if _k and _k != "signal":
+        log("   📎 [图] 判类=%s（不是开单信号）→ 只记日志、不推送" % _k)
+        return True
+    if not _k:
+        log("   ⚠️ 图片判类没拿到结果（可能网络问题）→ 按「放行」处理，不静默丢")
     return False
 
 
@@ -2649,7 +2717,7 @@ def rawq_sweep(group=None, now=None):
             if _img_should_skip(g, r):
                 continue
             _push_img_only(g, r, now)
-            _img_sig_remember(r.get("chart"), (r.get("meta") or {}).get("coin"))
+            _img_note_pushed(r)
             log("   📎 [图] %.0f 秒内没等到带币种的文字 → 已单独推送（图=%d 张，图上有止损=%s）"
                 % (now - r.get("ts", now), len(r.get("imgs") or []),
                    bool((r.get("chart") or {}).get("sl"))))
@@ -3640,7 +3708,7 @@ def read_chart_meta(path):
     """从图上读出币种/方向，用于"只有一张图"的信号（币种印在图左上角）"""
     try:
         b64 = base64.b64encode(open(path, "rb").read()).decode()
-        body = {"model": "deepseek-v4-flash-vision-exp", "temperature": 0,
+        body = {"model": VISION_MODEL_NAME, "temperature": 0,
                 "messages": [{"role": "system", "content": "You read TradingView chart screenshots. STRICT JSON only."},
                              {"role": "user", "content": [
                                  {"type": "text", "text": "This image was posted with a crypto trade signal. Return "
@@ -4103,7 +4171,8 @@ def _chitchat_hint(g, sender_type, txt):
     t = (txt or "").strip()
     if not t or len(t) > 40:
         return False
-    if not re.search(r"开|关|仓|单|平|止|损|盈|确认|模式|持仓|状态|帮助|撤|停|继续|对账|手工仓|金额|杠杆|上限|监控", t):
+    if not re.search(r"开|关|仓|单|平|止|损|盈|确认|模式|持仓|状态|帮助|撤|停|继续|对账|手工仓|金额|杠杆|上限|监控"
+                     r"|指令|命令|菜单|用法|怎么用|咋用|help|HELP|Help|？|\?|机制|规则|说明", t):
         return False
     if time.time() - _HINT_LAST[0] < 20:
         log("   💬 指令群里没认出来的消息（%s）—— 20 秒内已提示过一次，不重复刷屏" % t[:20])
@@ -7542,16 +7611,31 @@ if __name__ == "__main__":
                        {"rgb": (24, 72, 40), "y0": 574, "y1": 651, "h": 77, "x0": 0, "x1": 100, "w": 100}]
         _r3 = read_zones(_tag_gold, _z_conflict, _f_gold) or {}
         _chk("颜色提示反了（绿在上=盈利色却在止盈位）→ 标 conflict 不硬判", _r3.get("conf"), "conflict")
-        # ③ 持仓状态图（同一笔的进展通报）→ 不推送
+        # ③ 图片闸门（2026-09-18 用户报障后**重写**：旧判据误伤了正常测试）
         IMG_SIG_SEEN.clear()
-        _img_sig_remember({"ok": True, "entry": 4258.0, "sl": 4239.0, "tps": [4380.0]}, "XAU")
-        _chk("同一笔的进展通报 → 判为重复（不推送）",
-             _img_is_repeat({"ok": True, "entry": 4258.05, "sl": 4239.0, "tps": [4380.0]}), True)
-        _chk("状态图把开仓读偏了、但止损/止盈对上 → 仍判重复（实测：4298 vs 4258）",
-             _img_is_repeat({"ok": True, "entry": 4298.115, "sl": 4258.022, "tps": [4380.0]}), True)
-        _chk("新的一笔（点位不同）→ 不算重复",
-             _img_is_repeat({"ok": True, "entry": 4300.0, "sl": 4250.0, "tps": [4500.0]}), False)
-        _chk("读不出点位的图 → 不算重复（交给账户截图判定）", _img_is_repeat({"ok": False}), False)
+        _p1, _p2 = "/tmp/gate_a.jpg", "/tmp/gate_b.jpg"
+        for _p, _b in ((_p1, b"AAA-image-bytes"), (_p2, b"BBB-image-bytes")):
+            with open(_p, "wb") as _f:
+                _f.write(_b)
+        _rec_a = {"imgs": [_p1], "chart": {"ok": True, "entry": 4258.0}, "meta": {}}
+        _chk("没推过的图 → 不算重复", _img_is_repeat(_rec_a), False)
+        _img_note_pushed(_rec_a)
+        _chk("同一张图再发 → 判为重复（纯内容去重）", _img_is_repeat(_rec_a), True)
+        _chk("换了一张图（哪怕点位一模一样）→ 绝不再误伤",
+             _img_is_repeat({"imgs": [_p2], "chart": {"ok": True, "entry": 4258.0}, "meta": {}}), False)
+        _g0 = globals().get("_img_kind")
+        try:
+            globals()["_img_kind"] = lambda _p: "status"
+            _chk("判类=status（走势状态图）→ 不推送", _img_should_skip("g", {"imgs": [_p2]}), True)
+            globals()["_img_kind"] = lambda _p: "pnl"
+            _chk("判类=pnl（晒收益）→ 不推送", _img_should_skip("g", {"imgs": [_p2]}), True)
+            globals()["_img_kind"] = lambda _p: "signal"
+            _chk("判类=signal（开单信号）→ 放行", _img_should_skip("g", {"imgs": [_p2]}), False)
+            globals()["_img_kind"] = lambda _p: ""
+            _chk("判类没拿到结果（网络问题）→ 放行，绝不静默丢",
+                 _img_should_skip("g", {"imgs": [_p2]}), False)
+        finally:
+            globals()["_img_kind"] = _g0
         IMG_SIG_SEEN.clear()
         # ④ 手工仓名单按交易所实时持仓核对（用户报障：LSK/XAU/XAUT 已平仓却还在名单里）
         MANUAL_COINS.clear()
@@ -7742,17 +7826,12 @@ if __name__ == "__main__":
                  "红色" not in (_r204.get("why") or ""), True)
         else:
             print("     （20:04 那张图不在，跳过）")
-        # 读不出角色时，用"色块边价"照样能认出"同一笔的进展图"
-        IMG_SIG_SEEN.clear()
-        _img_sig_remember({"ok": True, "entry": 4258.0, "sl": 4239.0, "tps": [4380.0]}, "XAU")
+        # ⚠️ 2026-09-18：旧的"用色块边价判同一笔 → 不推送"判据**已废弃**（它误伤了用户正常测试）。
+        #   现在只看"是不是开单信号"（判类闸门）+ 同一张图内容去重，见 [8m] ③。
         _fake_fail = {"ok": False, "why": "没找到止损线", "geo": {"zone_edges": [
             {"p_top": 4380.0, "p_bot": 4258.0}, {"p_top": 4258.0, "p_bot": 4239.0}]}}
-        _chk("读不出角色、但色块边价与已见过的一致 → 判为同一笔（不推送）",
-             _img_is_repeat(_fake_fail), True)
-        _chk("色块边价都对不上 → 不误判",
-             _img_is_repeat({"ok": False, "geo": {"zone_edges": [
-                 {"p_top": 5000.0, "p_bot": 4900.0}, {"p_top": 4800.0, "p_bot": 4700.0}]}}), False)
-        IMG_SIG_SEEN.clear()
+        _chk("（旧判据已废）点位相同不再作为「不推送」的理由",
+             _img_is_repeat({"imgs": ["/tmp/not-exist-xyz.jpg"]}), False)
         # 读不出角色时的推送文案：必须把"看到的色块区间"列出来
         _SENT.clear()
         _rec = {"group": "黄金mansoor", "when": "09-17 20:04:32", "imgs": ["x.jpg"],
