@@ -3691,8 +3691,21 @@ def read_chart_cached(path):
     try:
         # 读图方式由 runtime_config 的 chart_reader 决定（可用聊天指令改，热加载）
         if CHART_READER[0] == "llm" and _CHARTLLM_OK:
-            log("   🖼 读图方式：整图直读（大模型，%d 次）" % CHART_LLM_READS[0])
+            log("   🖼 读图方式：整图直读（大模型，%d 次并行）" % CHART_LLM_READS[0])
             r = chart_llm.read(path, agree=CHART_LLM_READS[0], log=log)
+            # 🆕 2026-09-18：llm 读不出/两次不一致时**自动退回几何读图**（geo 一直保留着）。
+            #   为什么：实测模型侧耗时波动极大（同一张图 12~99 秒），而且偶尔会读不出；
+            #   退回 geo 至少能拿到一份读数（8~18 秒、稳定），总比"整条信号读不出"强。
+            #   用了哪条路都会写进日志，且结论里带 mode 字段，可核验。
+            if not (r or {}).get("ok"):
+                _why_llm = (r or {}).get("why") or "未读到"
+                log("   ↳ llm 读图没结果（%s）→ 自动退回几何读图（geo）" % str(_why_llm)[:60])
+                _g = read_chart(path)
+                if (_g or {}).get("ok"):
+                    _g["reader_fallback"] = "llm→geo（llm: %s）" % str(_why_llm)[:60]
+                    log("   ↳ 几何读图补上了：止损 %s 开仓 %s 止盈 %s"
+                        % (_g.get("sl"), _g.get("entry"), _g.get("tps")))
+                    r = _g
         else:
             if CHART_READER[0] == "llm" and not _CHARTLLM_OK:
                 log("   ⚠️ chart_reader=llm 但读图模块不可用（%s）→ 回退现有读图" % _CHARTLLM_ERR)

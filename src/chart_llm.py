@@ -53,7 +53,7 @@ import re
 import requests
 
 DS_API = "https://api.deepseek.com/chat/completions"
-VISION_MODEL = "deepseek-v4-flash-vision-exp"
+VISION_MODEL = os.environ.get("DEEPSEEK_VISION_MODEL") or "deepseek-v4-flash-vision-exp"
 
 # 两次读数的相对容差（与 dryrun_bot2.two_read_ok 同口径）
 TWO_READ_TOL = 0.005
@@ -218,12 +218,52 @@ def read(path, agree=2, key=None, timeout=120, log=None):
     """整图直读。返回与 `dryrun_bot2.read_chart()` 同构的 dict。
 
     `agree=2`（默认）：同一张图**独立读两次**，不一致就 `ok=False`（绝不猜）。
+                      两次**并行**发出（见下方实测说明）。
     `agree=1`：只读一次 —— 没有交叉校验，用于成本/延迟敏感场景，风险自负。
+
+    🆕 2026-09-18 实测（为什么改成并行）：
+      模型侧耗时波动极大 —— 同一张图，实测出现过 12.3 秒、46.7 秒、**99.3 秒**；
+      而且**把图缩小并不会更快**（SUSHI 那张：原图 12.3s → 缩到 800px 99.3s）。
+      所以瓶颈不在我们发的图大小，而在模型侧排队/生成长度。
+      原来两次读数**串行** → 最坏接近两次叠加（近 200 秒）；改成**并行**后
+      = 较慢那一次的时间（实测 46.7s 的两读 → 41.1 秒）。
     """
     k = key or _cfg_key()
     if not k:
         return {"ok": False, "why": "没有 AI 密钥（.env 里的 DEEPSEEK_API_KEY）", "mode": "llm"}
     n = 2 if int(agree or 1) >= 2 else 1
+    if n >= 2:
+        import threading
+        _res = {}
+
+        def _worker(i):
+            try:
+                _res[i] = ("ok", _normalize(_call_once(path, k, timeout=timeout)))
+            except Exception as e:
+                _res[i] = ("err", str(e)[:100])
+        _ths = [threading.Thread(target=_worker, args=(i,)) for i in range(2)]
+        for _t in _ths:
+            _t.start()
+        for _t in _ths:
+            _t.join()
+        _outs = []
+        for i in range(2):
+            _st, _v = _res.get(i, ("err", "线程没有返回"))
+            if _st == "err":
+                return {"ok": False, "why": "直读失败：%s" % _v, "mode": "llm"}
+            if not _v.get("ok"):
+                if log:
+                    log("   ⚠️ 大模型直读未通过校验：%s" % _v.get("why"))
+                return _v
+            _outs.append(_v)
+        _ok, _why = _agree(_outs[0], _outs[1])
+        if not _ok:
+            if log:
+                log("   ⚠️ 大模型两次直读不一致 → 按未读到处理：%s" % _why)
+            return {"ok": False, "why": "两次直读不一致：%s" % _why, "mode": "llm",
+                    "dir": _outs[0].get("dir")}
+        _outs[0]["verify"] = {"reads": 2, "agreed": True, "parallel": True}
+        return _outs[0]
     first = None
     for i in range(n):
         try:
