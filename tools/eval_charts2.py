@@ -88,8 +88,15 @@ def _tps_str(tps):
 
 
 def _all_items(r):
-    """从读数里抽出五个判定项（方向/开仓/止损/止盈1/止盈2/止盈3），缺的返回 None。"""
+    """从读数里抽出判定项（中文键），缺的返回 None。
+
+    ⚠️ 必须**同时认英文键与中文键**：`read_chart()` / `chart_llm.read()` 返回的是英文键
+    （dir/entry/sl/tps），而 P1 内部已经归一化过的读数是中文键（方向/开仓/止损/止盈N）。
+    2026-09-19 实测踩过这个坑：P1 采信了（ok=True）但读数列被写成空，汇总表因此不可信。
+    """
     r = r or {}
+    if r.get("方向") or r.get("开仓") or r.get("止损"):
+        return {k: r.get(k) for k in ("方向", "开仓", "止损", "止盈1", "止盈2", "止盈3")}
     d = (r.get("dir") or (r.get("zones") or {}).get("dir") or None)
     d = (str(d).upper() if d else None)
     tps = list(r.get("tps") or [])
