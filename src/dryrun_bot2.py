@@ -32,9 +32,11 @@ except Exception as _e:
     chart_llm = None
     _CHARTLLM_OK, _CHARTLLM_ERR = False, str(_e)[:120]
 
-# 读图方式开关："geo" = 现有（像素几何 + 模型读数），"llm" = 整图直读。
+# 读图方式开关："geo" = 现有（像素几何 + 模型读数），"llm" = 整图直读，
+# "off" = 完全关闭读图（2026-11-11 用户决定：只识别文字再下单，不读任何图）。
 # ⚠️ 默认 geo。切 llm 前必须先用 tools/eval_charts.py 在同一批图上比过准确率 ——
 #    现有那条路是 4 天返工 9 次换来的，不能凭感觉换掉。
+# ⚠️ 切 off 后：set 文字里的价位照常解析；纯图消息直接忽略；图上的点位一律不读（绝不猜）。
 CHART_READER = ["geo"]
 CHART_LLM_READS = [2]      # 整图直读时同一张图读几次（≥2 才有一致性校验）
 
@@ -3229,6 +3231,11 @@ def rawq_sweep(group=None, now=None):
             if (now - r.get("ts", 0)) < RAWQ_WAIT:
                 continue
             r["pushed"] = True
+            # 🆕 chart_reader=off（2026-11-11 用户决定）：纯图消息直接忽略 ——
+            #    不判类、不推送、不读图（只按文字识别）。
+            if CHART_READER[0] == "off":
+                log("   📎 [图] 读图已关闭 → 忽略这条纯图消息（%d 张）" % len(r.get("imgs") or []))
+                continue
             # 🆕 迁为持仓进展通报 / 账户截图 → 不推送（只写日志，绝不静默丢）
             if _img_should_skip(g, r):
                 continue
@@ -4200,6 +4207,11 @@ def finalize_pending(open_pos):
 _CHART_CACHE = {}
 
 def read_chart_cached(path):
+    # 🆕 2026-11-11（用户决定）：chart_reader=off → 完全关闭读图，只按文字解析。
+    #    绝不调任何视觉/AI 读图接口；返回结构与"未读到"一致，下游一行不用改。
+    if CHART_READER[0] == "off":
+        log("   ⏹ 读图已关闭（chart_reader=off）→ 只按文字解析，不读图")
+        return {"ok": False, "why": "读图已关闭（chart_reader=off），只按文字解析", "mode": "off"}
     try:
         # ⚠️ 缓存键必须带上读图方式（自查后修正）：否则运行中把 chart_reader 从 geo 改成 llm，
         #    同一张图还会命中之前 geo 算出来的旧结果。
@@ -4240,6 +4252,9 @@ def read_chart_cached(path):
 
 def read_chart_meta(path):
     """从图上读出币种/方向，用于"只有一张图"的信号（币种印在图左上角）"""
+    # 🆕 chart_reader=off：不读图 → 也不从图上认币种（纯图消息由 rawq_sweep 直接忽略）
+    if CHART_READER[0] == "off":
+        return {}
     try:
         b64 = base64.b64encode(open(path, "rb").read()).decode()
         body = {"model": VISION_MODEL_NAME, "temperature": 0,
@@ -4466,8 +4481,8 @@ def load_runtime():
             # 熔断线：总敞口上限的百分比（用户 2026-09-15 要求按金额熔断）
             if cfg.get("loss_limit_pct") is not None:
                 LOSS_LIMIT_PCT[0] = float(cfg["loss_limit_pct"])
-            # 🆕 第4步：读图方式（geo = 现有 / llm = 整图直读）
-            if cfg.get("chart_reader") in ("geo", "llm"):
+            # 🆕 第4步：读图方式（geo = 现有 / llm = 整图直读 / off = 关闭读图只按文字）
+            if cfg.get("chart_reader") in ("geo", "llm", "off"):
                 CHART_READER[0] = cfg["chart_reader"]
             if cfg.get("chart_llm_reads") is not None:
                 CHART_LLM_READS[0] = max(1, int(cfg["chart_llm_reads"]))
@@ -4481,7 +4496,8 @@ def load_runtime():
                    "是" if REQUIRE_APPROVAL[0] else "否",
                    "是" if AI_FIRST[0] else "否", SILENCE_ALERT_H,
                    "是" if PAUSED[0] else "否",
-                   (CHART_READER[0] + ("×%d 次" % CHART_LLM_READS[0] if CHART_READER[0] == "llm" else ""))))
+                   ("关闭（只按文字识别）" if CHART_READER[0] == "off"
+                    else CHART_READER[0] + ("×%d 次" % CHART_LLM_READS[0] if CHART_READER[0] == "llm" else ""))))
     except Exception as e:
         log("读取运行配置失败: " + str(e)[:80])
 
