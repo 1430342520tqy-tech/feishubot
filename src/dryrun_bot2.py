@@ -3873,6 +3873,41 @@ def _apply_quote_update(g, upd):
                    % (coin, "做多" if tr["dir"] == "LONG" else "做空", tr.get("sl"),
                       "、".join("%.8g" % t for t in (tr.get("tps") or [])) or "未读到",
                       "\n（博主报成本損 → 止损已移到开仓价）" if upd["cost"] else ""))
+            # 🆕 2026-11-12（用户硬要求：实盘绝对不能挂错）：实盘仓 → 撤临止损/换真实止损、挂止盈，
+            #   挂完做**独立核对**（bracket_verify）；影子模式只记录计划。
+            if tr.get("real_layer") == "实盘" and _BEXEC_OK and not no_touch_block(coin, "止盈止损更新"):
+                _sym = coin.upper() + "USDT"
+                try:
+                    _qty = _real_qty_or_estimate(coin, tr)
+                    if (upd["stop"] is not None or upd["cost"]) and _qty:
+                        bexec.sync_sl(_sym, tr["dir"], float(tr["sl"]), _qty)
+                        log("   ↳ [实盘] 止损已替换：%s（数量 %s）" % (tr["sl"], _qty))
+                    if upd["tps"] and _qty:
+                        _tps_ok = [t for t in (tr.get("tps") or [])
+                                   if (t > tr["entry"] if tr["dir"] == "LONG" else t < tr["entry"])]
+                        _parts = bexec.split_tp_qty(_sym, _qty, len(_tps_ok))
+                        for _t, _q in zip(_tps_ok, _parts):
+                            bexec.place_tp_limit(_sym, tr["dir"], _t, _q)
+                        log("   ↳ [实盘] 止盈已挂：%s" % _tps_ok)
+                    _bv = bexec.bracket_verify(_sym, tr["dir"],
+                                               stop=(float(tr["sl"]) if tr.get("sl") else None),
+                                               tps=(tr.get("tps") or []))
+                    _miss = (_bv or {}).get("missing") or []
+                    if _miss or (_bv or {}).get("sl") is False:
+                        notify("⚠️【实盘·核对异常】%s 止损止盈挂单核对未通过：%s\n请立刻人工核对！"
+                               % (coin, "、".join(_miss) or "止损条件单未找到"))
+                        log("   ⛔ bracket_verify 未通过：%s" % str(_bv)[:160])
+                    else:
+                        log("   ↳ [实盘] bracket_verify 通过（止损+%d 档止盈）" % len(tr.get("tps") or []))
+                except Exception as _e:
+                    _live_alert("止盈止损更新", coin, str(_e))
+            elif _BEXEC_OK:
+                try:
+                    bexec.audit("update_sl_tp_plan", {"symbol": coin.upper() + "USDT", "dir": tr["dir"],
+                                                      "stop": tr.get("sl"), "tps": tr.get("tps"),
+                                                      "shadow": not bexec.LIVE[0]})
+                except Exception:
+                    pass
         return
     if coin in PENDING:
         _info = {}
@@ -4172,11 +4207,35 @@ def finalize_pending(open_pos):
         # 两件事**合成一次询问**，避免同一个信号被问两遍（旧代码会把达上限问一次，
         # 用户回「开」把信号放回 PENDING 后，审批闸门又问一次）。
         # 注意：已有持仓的止盈/止损更新不是"开新单"，不在这里拦。
+        # 🆕 2026-11-12（用户硬要求）：实盘前逐项核对 —— 用到的每个价格数字必须能在原文里找到，
+        #   找不到就不开（防 AI 编造 / 点数换算过的值直接进实盘）。
+        if _be_mode() == "实盘":
+            _raw = " ".join(p.get("texts") or [])
+            _nums = []
+            if p.get("entry") is not None:
+                _nums.append(("开仓", p.get("entry")))
+            if p.get("stop") is not None and not p.get("stop_provisional"):
+                _nums.append(("止损", p.get("stop")))
+            _nums += [("止盈%d" % (i + 1), t) for i, t in enumerate(tps)] if not tp_fallback else []
+            _miss = []
+            for _n, _v in _nums:
+                if _v is None:
+                    continue
+                _s = ("%.8g" % float(_v))
+                if (_s not in _raw) and (_s.rstrip("0").rstrip(".") not in _raw):
+                    _miss.append("%s=%s" % (_n, _s))
+            if _miss:
+                notify("【信号·拒绝·实盘】%s：这些价格在原文里找不到（疑似读错/被换算过）：%s\n原文：%s"
+                       % (coin, "、".join(_miss), (_raw[:160] or "")))
+                log("   ⛔ 实盘拒绝：原文找不到 %s" % _miss)
+                PENDING.pop(coin, None)
+                continue
         _ask_why = []
         if over_cap and not p.get("cap_override"):
             _ask_why.append("当前已持 %d 笔，达到持仓上限 %d 笔；回「开」= 把上限提高到 %d 笔并开这一单"
                             % (len(open_pos), MAX_OPEN, len(open_pos) + 1))
-        if REQUIRE_APPROVAL[0] and not p.get("approved") and coin not in open_pos:
+        # 🆕 2026-11-12（用户硬要求）：**实盘一律要人工确认**（即使 require_approval=false 也一样）。
+        if (REQUIRE_APPROVAL[0] or _be_mode() == "实盘") and not p.get("approved") and coin not in open_pos:
             _ask_why.append("按你的要求：所有订单在开之前都要经你审批（本次已通过全部机器校验）")
         if _ask_why:
             ask_user(coin, p, "；".join(_ask_why))
