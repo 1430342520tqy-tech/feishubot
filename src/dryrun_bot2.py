@@ -40,6 +40,14 @@ except Exception as _e:
 CHART_READER = ["geo"]
 CHART_LLM_READS = [2]      # 整图直读时同一张图读几次（≥2 才有一致性校验）
 
+# 🆕 2026-11-12（用户规则）：定仓方式 + 临止损
+#  fixed = 固定金额（保证金 × 杠杆 = 名义，数量与止损空间无关）
+#  risk  = 固定风险（名义 = 30U ÷ 止损%；需要止损已知 → 等止損卡到了再开）
+SIZING_MODE = ["fixed"]
+FIXED_MARGIN = [90.0]          # 固定金额模式：保证金 90U
+FIXED_LEV = [10]               # 固定金额模式：杠杆 10 倍 → 名义 900U
+PROV_STOP_PCT = [5.0]          # "先开仓后补止損"时，按博主开仓价挂 5%（无杠杆）临止损
+
 # 路径只有一个来源：`config.base()`（读环境变量 SIGNAL_BOT_BASE，默认生产路径）。
 BASE = config.base()
 # 路径只有 config.paths() 一处定义。
@@ -2502,8 +2510,35 @@ _AMBIG_TICKERS = {
     "LONG", "SHORT", "ENTRY", "BREAK", "ABOVE", "BELOW", "SUPPORT", "RESISTANCE",
 }
 
+_LTT_SIG = re.compile(r"#\s*([A-Za-z0-9]+)\s*(?:輕倉|轻仓)?\s*市[價价]\s*([多空])\s*(?:進場|进场)?\s*[:：]?\s*([\d]+(?:\.[\d]+)?)")
+_LTT_TP = re.compile(r"止[盈益]\s*[:：]\s*(.*?)\s*止[損损]\s*[:：]\s*([\d]+(?:\.[\d]+)?)")
+
+
+def _fast_parse_ltt(txt):
+    """ltt 群卡片格式（繁体）："#COIN 市價多/空 進場：价"（可选同卡带 止盈/止損）。
+
+    用户 2026-11-11 定：止盈按书写顺序 = TP1/TP2/TP3，不排序、不当中点。
+    """
+    m = _LTT_SIG.search(txt)
+    if not m:
+        return None
+    out = {"coin": m.group(1).upper(), "direction": "LONG" if m.group(2) == "多" else "SHORT",
+           "entry": float(m.group(3)), "entry_is_cmp": False, "targets": [], "stop": None,
+           "type": "open", "manage_action": None, "_fast": True}
+    body = txt.split("💬")[0]
+    u = _LTT_TP.search(body)
+    if u:
+        tp_part = re.sub(r"TP\d", "", u.group(1))
+        out["targets"] = [float(x) for x in re.findall(r"[\d]+(?:\.[\d]+)?", tp_part)]
+        out["stop"] = float(u.group(2))
+    return out
+
+
 def fast_parse(txt):
     """只匹配博主常用模板；命中即返回，未命中返回 None（交给 AI 解析）"""
+    _ltt = _fast_parse_ltt(txt)          # 🆕 ltt 群繁体卡片格式优先（本地正则，0 AI 调用）
+    if _ltt:
+        return _ltt
     raw = None
     dirc = None
     # ⚠️ B10 残留（2026-09-15 实测）：模板「Going long on UNI here at CMP」里，
@@ -3780,6 +3815,93 @@ def ask_user(coin, p, reason, quiet=False):
     log("   ❓ 已挂起等用户确认：%s（%s）｜%s" % (coin, reason, _timing_line(p, "耗时")))
 
 
+# ================= 🆕 2026-11-12：ltt 群「回复原信号」卡片 = 更新，绝不是新信号 =================
+_LTT_QUOTE = re.compile(r"#\s*([A-Za-z0-9]+)\s*(?:輕倉|轻仓)?\s*市[價价]\s*([多空])\s*(?:進場|进场)?\s*[:：]?\s*([\d]+(?:\.[\d]+)?)")
+_LTT_UPD = re.compile(r"止[盈益]\s*[:：]\s*(.*?)\s*止[損损]\s*[:：]\s*([\d]+(?:\.[\d]+)?)")
+
+
+def _parse_quote_update(txt):
+    """识别"回复原信号"的卡片（止盈止損卡 / 触发通报）。返回 dict 或 None。"""
+    if "💬" not in txt:
+        return None
+    body, quote = txt.split("💬", 1)
+    qm = _LTT_QUOTE.search(quote)
+    if not qm:
+        return None
+    b = body.strip()
+    tps, stop = [], None
+    um = _LTT_UPD.search(b)
+    if um:
+        tp_part = re.sub(r"TP\d", "", um.group(1))
+        tps = [float(x) for x in re.findall(r"[\d]+(?:\.[\d]+)?", tp_part)]
+        stop = float(um.group(2))
+    cost = ("成本損" in b) or ("成本损" in b) or ("保本" in b)
+    return {"coin": qm.group(1).upper(), "dir": "LONG" if qm.group(2) == "多" else "SHORT",
+            "qentry": float(qm.group(3)), "tps": tps, "stop": stop, "cost": cost,
+            "body": b, "any": bool(re.search(r"止盈|止損|止损|拿下|觸發|触发|翻倍|進場|盈利", b))}
+
+
+def _apply_quote_update(g, upd):
+    """把更新并进「持仓/待确认/待审批」；**绝不新建信号**（用户 2026-11-12 要求）。"""
+    coin = upd["coin"]
+    tr = open_pos_ref.get(coin)
+    if tr:
+        _changed = False
+        if upd["stop"] is not None:
+            tr["sl"] = float(upd["stop"]); tr["sl_provisional"] = False
+            tr["stop_src"] = "博主止損卡"; _changed = True
+        if upd["cost"]:
+            tr["sl"] = tr["entry"]; tr["sl_provisional"] = False
+            tr["stop_src"] = "博主报成本損 → 移到开仓价"; _changed = True
+        if upd["tps"]:
+            _side_ok = [t for t in upd["tps"] if (t > tr["entry"] if tr["dir"] == "LONG" else t < tr["entry"])]
+            if _side_ok:
+                tr["tps"] = sorted(set(list(tr.get("tps") or []) + _side_ok),
+                                   key=lambda t: abs(float(t) - tr["entry"]))[:TP_TIERS]
+                _changed = True
+        if _changed:
+            STATE_DIRTY[0] = True
+            with open(TRADES, "a", encoding="utf-8") as f:
+                f.write(json.dumps(tr, ensure_ascii=False) + "\n")
+            log("   ↻ 持仓 %s 更新：止损=%s 止盈=%s%s" % (coin, tr.get("sl"), tr.get("tps"),
+                                                       "（成本损/保本）" if upd["cost"] else ""))
+            notify("【信号·更新】%s %s\n收到博主卡片：止损=%s ｜ 止盈=%s%s"
+                   % (coin, "做多" if tr["dir"] == "LONG" else "做空", tr.get("sl"),
+                      "、".join("%.8g" % t for t in (tr.get("tps") or [])) or "未读到",
+                      "\n（博主报成本損 → 止损已移到开仓价）" if upd["cost"] else ""))
+        return
+    if coin in PENDING:
+        _info = {}
+        if upd["stop"] is not None:
+            _info["stop"] = upd["stop"]
+        if upd["tps"]:
+            _info["targets"] = upd["tps"]
+        if _info:
+            merge_pending(coin, g, info=_info, txt="")
+            log("   ↻ 待确认池 %s 收到止盈止损卡 → 已合并" % coin)
+        if upd["cost"] and PENDING.get(coin, {}).get("entry"):
+            PENDING[coin]["stop"] = PENDING[coin]["entry"]
+            PENDING[coin]["stop_provisional"] = False
+        return
+    if coin in ASKING and (upd["stop"] is not None or upd["tps"]):
+        _p = ASKING[coin].get("p") or {}
+        if upd["stop"] is not None:
+            _p["stop"] = float(upd["stop"]); _p["stop_provisional"] = False
+            _p["stop_src"] = "博主止損卡"
+        if upd["tps"]:
+            _side = [t for t in upd["tps"] if (t > _p["entry"] if (_p.get("dir") or "LONG") == "LONG" else t < _p["entry"])]
+            if _side:
+                _p["tps"] = sorted(set(list(_p.get("tps") or []) + _side),
+                                   key=lambda t: abs(float(t) - _p["entry"]))[:TP_TIERS]
+        log("   ↻ 审批中的 %s 参数已更新：止损=%s 止盈=%s" % (coin, _p.get("stop"), _p.get("tps")))
+        return
+    # 没找到原信号 → 用引用里的开仓价重建待确认（不静默丢）
+    if upd["stop"] is not None or upd["tps"]:
+        merge_pending(coin, g, info={"coin": coin, "direction": upd["dir"], "entry": upd["qentry"],
+                                     "stop": upd["stop"], "targets": upd["tps"]}, txt=upd["body"][:200])
+        log("   ↻ %s 收到止盈止损卡但没找到原信号 → 按引用重建待确认（开仓价 %s）" % (coin, upd["qentry"]))
+
+
 def expire_asking():
     """超时未回复的待确认信号自动作废"""
     now = time.time()
@@ -3890,9 +4012,18 @@ def finalize_pending(open_pos):
                     log("   ↳ 博主未给止损 → 按第一止盈 %.8g 的一半反推止损 %.8g（2:1）"
                         % (float(_tp1), p["stop"]))
         if p["stop"] is None and not tps:
-            notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
-                   % (coin, (p["texts"][0][:180] if p["texts"] else "")))
-            PENDING.pop(coin, None); continue
+            # 🆕 2026-11-12（用户规则 A）：先开仓后补止損 —— 固定金额模式下先挂 5%（无杠杆）临止损，
+            #    等博主止損卡到了由 _apply_quote_update 撤旧换新；固定风险模式则必须等止損卡才能定仓。
+            if SIZING_MODE[0] == "fixed" and isinstance(entry, (int, float)) and entry:
+                _pp = round(float(entry) * (1 - _d0 * float(PROV_STOP_PCT[0]) / 100.0), 10)
+                p["stop"] = _pp
+                p["stop_src"] = "临止损 %.0f%%（等博主止損卡替换）" % PROV_STOP_PCT[0]
+                p["stop_provisional"] = True
+                log("   ↳ 止損卡未到 → 先挂临止损 %.8g（博主开仓价的 %.1f%%，无杠杆）" % (_pp, PROV_STOP_PCT[0]))
+            else:
+                notify("【信号·待确认】%s\n没读到止损和止盈（图上/卡片/文字都没读到），等你确认后我再挂单\n原文：%s"
+                       % (coin, (p["texts"][0][:180] if p["texts"] else "")))
+                PENDING.pop(coin, None); continue
         # ===== B5-① 点数 vs 价格（2026-09-15 新增）=====
         # 「止损带个30点左右」「止损35点」「止盈3000点以上」里的数字是**点数**不是价格。
         # 旧行为：直接当成价格 → 止损=30 这种荒谬值（实测现场：BTC 止损读成 74，因为「74K」）。
@@ -4141,7 +4272,8 @@ def finalize_pending(open_pos):
               "order": 0.0, "push": 0.0, "wait": age, "messages": len(p["texts"])}
         t_order = time.time()
         tr = {"coin": coin, "dir": dirc, "entry": entry, "signal_entry": signal_entry, "add": p["add"],
-              "sl": p["stop"], "tps": tps, "tp_fallback": tp_fallback,
+              "sl": p["stop"], "sl_provisional": bool(p.get("stop_provisional")),
+              "tps": tps, "tp_fallback": tp_fallback,
               "tp_part": (R_FALLBACK_PART if tp_fallback else None),
               "entry_src": esrc, "stop_src": p.get("stop_src"),
               "t_open": datetime.datetime.fromtimestamp(p["first_ts"], CST).strftime("%m-%d %H:%M:%S"),
@@ -4374,7 +4506,7 @@ def range_mid(a, b, coin=None):
 
 # ---------------- 指令系统（只有你本人、在指定指令群、短消息才执行）----------------
 RUNTIME = _P["RUNTIME"]
-CMD_GROUPS = ["开单记录", "机器人开单通知"]   # 指令在这两个群里生效
+CMD_GROUPS = ["开单记录", "机器人开单通知", "跟单"]   # 指令在这些群里生效（🆕 2026-11-12 新增「跟单」）
 PAUSED = [False]              # 暂停：仍抓取记录，但不动作
 STATE_DIRTY = [False]
 
@@ -4486,6 +4618,15 @@ def load_runtime():
                 CHART_READER[0] = cfg["chart_reader"]
             if cfg.get("chart_llm_reads") is not None:
                 CHART_LLM_READS[0] = max(1, int(cfg["chart_llm_reads"]))
+            # 🆕 2026-11-12（用户规则）：定仓方式与临止损
+            if cfg.get("sizing_mode") in ("fixed", "risk"):
+                SIZING_MODE[0] = cfg["sizing_mode"]
+            if cfg.get("fixed_margin"):
+                FIXED_MARGIN[0] = float(cfg["fixed_margin"])
+            if cfg.get("fixed_leverage"):
+                FIXED_LEV[0] = int(cfg["fixed_leverage"])
+            if cfg.get("prov_stop_pct") is not None:
+                PROV_STOP_PCT[0] = float(cfg["prov_stop_pct"])
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
@@ -6274,6 +6415,14 @@ def main():
                                     continue
                             except Exception as _e:
                                 log("   指令处理异常 " + str(_e)[:90])
+                        # 🆕 2026-11-12（用户规则·防重复/防错单）：带"回复原信号"引用的卡片
+                        #    = 止盈/止损更新 / 触发通报 → 只合并到原信号/持仓，**绝不新建信号**。
+                        #    这个群把开仓卡和止盈止损卡分成两条消息（间隔 1~2 分钟），
+                        #    若不拦截，止盈止损卡会被当成新信号（延迟开仓/重复开单）。
+                        _upd = _parse_quote_update(txt)
+                        if _upd:
+                            _apply_quote_update(g, _upd)
+                            continue
                         # 门口关键词表在模块级 SIG_KW_GATE（便于自检直接校验，见 [8n]）
                         _has_kw = any(k in txt for k in SIG_KW_GATE)
                         # ⚠️ B16 修复（2026-09-15 实测）：原来是
@@ -6767,6 +6916,13 @@ def main():
                     filled = tr.setdefault("filled", [])
                     remaining = tr.get("remaining", 1.0)
                     stop = tr.get("sl")
+                    # 🆕 2026-11-12（用户规则）：只有 1 档止盈时，价格朝有利方向走 5%（不带杠杆）
+                    #    → 止损移到开仓价（保本损）。
+                    if len(tps) == 1 and not filled and tr.get("entry") and tr.get("sl") != tr["entry"]:
+                        if (px - tr["entry"]) * d >= 0.05 * tr["entry"]:
+                            tr["sl"] = tr["entry"]
+                            stop = tr["entry"]
+                            log("   ↳ 单目标止盈：价格已走 5%% → 止损移到开仓价（保本）")
                     # ① 止损优先
                     if stop is not None and (px - stop) * d <= 0:
                         pnl = (stop - tr["entry"]) * d / tr["entry"] * NOTIONAL * remaining
@@ -6804,9 +6960,15 @@ def main():
                             break
                     if hit_i is not None:
                         # 平仓比例：2R 兜底档 = 一次全平（tp_part=R_FALLBACK_PART=1.0，
-                        # 用户 09-13 定的「到价全平」）；常规档位按 1/档数 平分（3 档各 33.3%）。
+                        # 用户 09-13 定的「到价全平」）；常规档位按用户 2026-11-12 定的权重：
+                        # 1 档=100%、2 档=50/50、3 档=2/5、2/5、1/5。
                         # ⚠️ 旧注释写的是"2R 兜底档只平 1/3"，与 R_FALLBACK_PART=1.0 矛盾，已改正。
-                        part = tr.get("tp_part") or (1.0 / max(len(tps), 1))
+                        if tr.get("tp_fallback"):
+                            part = R_FALLBACK_PART
+                        else:
+                            _w = ([1.0] if len(tps) <= 1 else
+                                  ([0.5, 0.5] if len(tps) == 2 else [2.0 / 5, 2.0 / 5, 1.0 / 5]))
+                            part = _w[hit_i] if hit_i < len(_w) else 1.0 / max(len(tps), 1)
                         tp = tps[hit_i]
                         pnl = (tp - tr["entry"]) * d / tr["entry"] * NOTIONAL * part
                         tr["realized"] = tr.get("realized", 0.0) + pnl
