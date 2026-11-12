@@ -47,6 +47,8 @@ SIZING_MODE = ["fixed"]
 FIXED_MARGIN = [90.0]          # 固定金额模式：保证金 90U
 FIXED_LEV = [10]               # 固定金额模式：杠杆 10 倍 → 名义 900U
 PROV_STOP_PCT = [5.0]          # "先开仓后补止損"时，按博主开仓价挂 5%（无杠杆）临止损
+LIVE_AUTO = [False]            # 🆕 实盘是否免人工确认（用户 2026-11-12 决定：是）
+LIVE_MAX_STOP_PCT = 8.5        # 🆕 10 倍杠杆下，止损空间超过该值会被强平 → 实盘拒绝自动开
 
 # 路径只有一个来源：`config.base()`（读环境变量 SIGNAL_BOT_BASE，默认生产路径）。
 BASE = config.base()
@@ -4198,6 +4200,17 @@ def finalize_pending(open_pos):
         # 🆕 2026-11-12（用户硬要求）：实盘前逐项核对 —— 用到的每个价格数字必须能在原文里找到，
         #   找不到就不开（防 AI 编造 / 点数换算过的值直接进实盘）。
         if _be_mode() == "实盘":
+            # 🆕 防强平闸：10 倍杠杆下，止损空间超过 8.5% 会先被强平（强平距离≈1/10−维持保证金）。
+            if p.get("entry") and p.get("stop"):
+                _sp = abs(float(p["entry"]) - float(p["stop"])) / float(p["entry"])
+                if _sp * 100.0 > LIVE_MAX_STOP_PCT:
+                    notify("【信号·拒绝·实盘】%s 止损空间 %.1f%% 在 %d 倍杠杆下**可能先被强平**"
+                           "（阈值 %.1f%%）→ 不自动开；如需交易请先降杠杆或人工处理\n原文：%s"
+                           % (coin, _sp * 100.0, FIXED_LEV[0], LIVE_MAX_STOP_PCT,
+                              (p["texts"][0][:140] if p.get("texts") else "")))
+                    log("   ⛔ 实盘拒绝：止损空间 %.2f%% 超过 %.1f%%（10x 强平风险）" % (_sp * 100.0, LIVE_MAX_STOP_PCT))
+                    PENDING.pop(coin, None)
+                    continue
             _raw = " ".join(p.get("texts") or [])
             _nums = []
             if p.get("entry") is not None:
@@ -4222,8 +4235,9 @@ def finalize_pending(open_pos):
         if over_cap and not p.get("cap_override"):
             _ask_why.append("当前已持 %d 笔，达到持仓上限 %d 笔；回「开」= 把上限提高到 %d 笔并开这一单"
                             % (len(open_pos), MAX_OPEN, len(open_pos) + 1))
-        # 🆕 2026-11-12（用户硬要求）：**实盘一律要人工确认**（即使 require_approval=false 也一样）。
-        if (REQUIRE_APPROVAL[0] or _be_mode() == "实盘") and not p.get("approved") and coin not in open_pos:
+        # 🆕 2026-11-12（用户硬要求）：**实盘默认一律要人工确认**；
+        #   用户明确说"实盘也免确认"时（runtime 的 live_auto_confirm=true），实盘才自动开。
+        if (REQUIRE_APPROVAL[0] or (_be_mode() == "实盘" and not LIVE_AUTO[0])) and not p.get("approved") and coin not in open_pos:
             _ask_why.append("按你的要求：所有订单在开之前都要经你审批（本次已通过全部机器校验）")
         if _ask_why:
             ask_user(coin, p, "；".join(_ask_why))
@@ -4679,6 +4693,8 @@ def load_runtime():
                 FIXED_LEV[0] = int(cfg["fixed_leverage"])
             if cfg.get("prov_stop_pct") is not None:
                 PROV_STOP_PCT[0] = float(cfg["prov_stop_pct"])
+            if "live_auto_confirm" in cfg:
+                LIVE_AUTO[0] = bool(cfg["live_auto_confirm"])
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
@@ -6176,7 +6192,9 @@ def main():
                 log("真实下单层预热失败（不影响纸面运行）：%s" % str(_e)[:120])
         _cu = ("\n⚠️ 检测到停机期间积压 %d 条消息，正在按序回补（超过 %d 分钟的信号只通报、不下单）"
                % (catchup_total, CATCHUP_MAX_AGE // 60)) if catchup_total else ""
-        notify("【跟单机器人】dryRun 已启动（纸面模式，只抓开单信号，不会下单）" + _cu)
+        notify("【跟单机器人】dryRun 已启动（%s，只抓开单信号，%s）" % (
+            "实盘模式" if _be_mode() == "实盘" else "纸面模式",
+            "会真实下单" if _be_mode() == "实盘" else "不会下单") + _cu)
         hb = 0
         feed_prev = {}            # 群 -> 上次看到的会话列表预览
         safety = 0                # 兜底：每 N 轮无条件扫一次所有群
