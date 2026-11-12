@@ -706,27 +706,12 @@ def startup_reconcile():
         log("   [手工仓] 已登记 %d 个币为你的手工仓（机器人不会对它们发任何真单）：%s"
             % (len(MANUAL_COINS), "、".join(sorted(MANUAL_COINS))))
         STATE_DIRTY[0] = True
-        for _c in sorted(MANUAL_COINS):
-            notify("ℹ️【手工仓护栏】检测到交易所有你的手工仓：**%s**\n"
-                   "机器人不会对它做任何事（不开新仓、不平仓、不改止损、也不拿它的数量去挂保护）。\n"
-                   "手工仓平掉后发「解除手工仓 %s」即可解除这条护栏。" % (_c, _c))
+        # 🆕 2026-11-12（用户要求）：你自己开的手工仓**不告警**（只记日志，不推飞书）。
     if _new_orphans:
-        # 🆕 2026-09-18 三轮（用户决定）：这条告警**只喊人、不拦单** ——
-        #   「不拦」≠「不提示」：用户选择"孤儿仓我自己盯"，但他**必须先知道这次新出现了什么**，
-        #   尤其要能分辨两种情况：① 这些仓是他自己开的（正常手工仓，机器人不管就对了）；
-        #   ② **不是他开的**（例如 state.json 被删/损坏 → 机器人对自己的仓位失忆了）
-        #      —— 那种情况下机器人纸面是空的，会按新信号**重复开仓**，必须人工立刻核对。
-        #   ⚠️ 只有"本次新发现"才发（`_manual_known` 快照判定）→ 重启不刷屏。
-        notify("⚠️【手工仓护栏】**本次新发现 %d 个「交易所有仓、纸面上没记录」的币**：%s\n"
-               "机器人已把它们登记为你的手工仓：**不开新仓、不平仓、不改止损、"
-               "也不拿交易所的数量去挂保护**。\n"
-               "⚠️ **机器人不会因为这些币拦你的开仓**"
-               "（按你 2026-09-18 的决定：这些仓你自己盯）。\n"
-               "❗ 但请你核对一次：如果这些仓**不是你开的**"
-               "（例如 state.json 被删/损坏，机器人对自己的仓位失忆了），请**立刻人工核对** —— "
-               "那种情况下机器人会以为纸面是空的，**可能重复开仓**。\n"
-               "（这些手工仓平掉后发「解除手工仓 %s」即可解除这条护栏）"
-               % (len(_new_orphans), "、".join(_new_orphans), _new_orphans[0]))
+        # 🆕 2026-11-12（用户要求）：不推"新发现孤儿仓"告警（只记日志）。
+        #   保留 AMBIG（同币两边都有记录且数量差很大）的问询 —— 那是防"重复开仓"的安全闸门。
+        log("   [手工仓] 本次新发现 %d 个孤儿仓（交易所有仓、纸面无记录）→ 已登记，不告警：%s"
+            % (len(_new_orphans), "、".join(_new_orphans)))
     if AMBIG_COINS:
         STATE_DIRTY[0] = True
         log("   [归属待确认] %d 个币归属待你确认（回话之前不对它们发任何真单）：%s"
@@ -3882,6 +3867,7 @@ def _apply_quote_update(g, upd):
                     if (upd["stop"] is not None or upd["cost"]) and _qty:
                         bexec.sync_sl(_sym, tr["dir"], float(tr["sl"]), _qty)
                         log("   ↳ [实盘] 止损已替换：%s（数量 %s）" % (tr["sl"], _qty))
+                        notify("【实盘·止损已替换】%s 新止损 **%.8g**（数量 %s）" % (coin, float(tr["sl"]), _qty))
                     if upd["tps"] and _qty:
                         _tps_ok = [t for t in (tr.get("tps") or [])
                                    if (t > tr["entry"] if tr["dir"] == "LONG" else t < tr["entry"])]
@@ -3889,6 +3875,8 @@ def _apply_quote_update(g, upd):
                         for _t, _q in zip(_tps_ok, _parts):
                             bexec.place_tp_limit(_sym, tr["dir"], _t, _q)
                         log("   ↳ [实盘] 止盈已挂：%s" % _tps_ok)
+                        notify("【实盘·止盈已挂】%s 各档：%s"
+                               % (coin, "、".join("%.8g" % t for t in _tps_ok)))
                     _bv = bexec.bracket_verify(_sym, tr["dir"],
                                                stop=(float(tr["sl"]) if tr.get("sl") else None),
                                                tps=(tr.get("tps") or []))
