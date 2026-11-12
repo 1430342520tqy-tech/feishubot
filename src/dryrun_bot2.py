@@ -1708,6 +1708,8 @@ SIG_KW_GATE = [
     "止损", "止盈", "止损位", "止盈位", "目标位", "目标",
     "入场", "进场", "开仓", "加仓", "补仓", "挂单", "限价",
     "条件单", "平仓", "减仓", "跌破", "站稳", "突破",
+    # 🆕 2026-11-12：ltt 群繁体卡片关键词（缺了会被当成"闲聊"直接跳过）
+    "市價", "市价", "進場", "止損", "輕倉", "轻仓", "多單", "空單", "開倉", "進場價",
 ]
 
 
@@ -3858,6 +3860,8 @@ def _apply_quote_update(g, upd):
             if _side_ok:
                 tr["tps"] = sorted(set(list(tr.get("tps") or []) + _side_ok),
                                    key=lambda t: abs(float(t) - tr["entry"]))[:TP_TIERS]
+                tr["tp_fallback"] = False      # 真实止盈到了 → 撤掉 2R 兜底标记
+                tr["tp_part"] = None
                 _changed = True
         if _changed:
             STATE_DIRTY[0] = True
