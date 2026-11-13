@@ -863,9 +863,10 @@ def watch_entries():
                               _tps_ok, len(_tps)))
                     log("   🔴 [实盘成交] %s 已成交，但止损挂失败 → 已告警" % coin)
                 else:
-                    notify("【实盘·成交】%s %s 限价单已成交\n成交均价 %.8g ｜ 数量 %s\n"
+                    notify("【已开仓·实盘】%s %s 限价单已成交（**交易所成交已核对**）\n"
+                           "成交均价 **%.8g** ｜ 数量 %s ｜ 名义约 %.0fU（保证金 %.0fU × %d倍）\n"
                            "已挂：止盈 %d/%d 档（限价）+ 止损 %s（Algo STOP_MARKET）"
-                           % (coin, w["dir"], avg_px, filled_qty,
+                           % (coin, w["dir"], avg_px, filled_qty, filled_qty * avg_px, MARGIN, LEV,
                               _tps_ok, len(_tps), w.get("stop")))
                     log("   ✅ [实盘成交] %s 均价 %.8g 数量 %s → 止盈 %d/%d 档 + 止损已挂"
                         % (coin, avg_px, filled_qty, _tps_ok, len(_tps)))
@@ -2601,16 +2602,31 @@ def parse_text(text):
 # ---------------- 通知格式 ----------------
 def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timing=None,
              signal_entry=None, signal_src=None, crossed=False, entry_mode="市价",
-             entry_orders=None, entry_note=""):
+             entry_orders=None, entry_note="", real_fill=None, pending_limit=False):
     d = 1 if (direction or "LONG").upper() == "LONG" else -1
     lev = LEV
     L = []
-    L.append("【已开单·纸面】%s/USDT 永续 · %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
+    if pending_limit:
+        L.append("【实盘·限价单已挂出】%s/USDT 永续 · %s（**等待成交，未成交前不当作已开仓**）"
+                 % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
+    elif real_fill:
+        L.append("【已开仓·实盘】%s/USDT 永续 · %s（**交易所成交已核对**）"
+                 % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
+    else:
+        L.append("【已开单·纸面】%s/USDT 永续 · %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
     L.append("")
     L.append("来源：%s   信号时间：%s" % (src, when))
     L.append("金额：保证金 %.0fU %d倍 = 名义 %.0fU" % (MARGIN, lev, NOTIONAL))
     L.append("开仓：")
-    if entry_mode == "限价分批" and entry_orders:
+    if pending_limit:
+        L.append("限价单已挂出，成交后机器人会按交易所成交回报发【已开仓·实盘】")
+    elif real_fill:
+        L.append("交易所成交：均价 **%.8g** ｜ 数量 %s ｜ orderId %s"
+                 % (float(real_fill.get("price") or 0), real_fill.get("qty"), real_fill.get("oid")))
+        if abs(float(real_fill.get("price") or 0) - float(entry or 0)) / max(1e-9, float(entry or 1)) > 0.0005:
+            L.append("（与信号价 %.8g 的滑点 %.2f%%）"
+                     % (float(entry or 0), (float(real_fill["price"]) - float(entry)) / float(entry) * 100 * d))
+    elif entry_mode == "限价分批" and entry_orders:
         for i, o in enumerate(entry_orders, 1):
             L.append("挂单%d：%.8g → 保证金 %.0fU（%d倍 = %.0fU 名义）"
                      % (i, o["price"], o["margin"], lev, o["margin"] * lev))
@@ -2644,7 +2660,7 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
                 tier_u = (t - entry) * d / entry * NOTIONAL / n
                 full_u = (t - entry) * d / entry * NOTIONAL
                 L.append("止盈%d（挂单）：%.8g → 预期收益率 %+.2f%%（含 %d 倍杠杆）" % (i, t, gross * lev, lev))
-                L.append("　　　平1/3 · 该档 约 %+.1fU · 若全平在此价 约 %+.1fU" % (tier_u, full_u))
+                L.append("　　　按权重 2/5、2/5、1/5 分批 · 该档 约 %+.1fU · 若全平在此价 约 %+.1fU" % (tier_u, full_u))
         extra = ""
         if len(tps) < TP_TIERS:
             extra = "（本次只读到 %d 档）" % len(tps)
@@ -4631,6 +4647,30 @@ def finalize_pending(open_pos):
         if _rplan:
             log("   ↳ [真实下单层·%s] 已生成下单计划（市价/限价腿 + %d 档止盈 + Algo 止损）"
                 % (_be_mode(), len(_rplan.get("tps") or [])))
+        # 🆕 2026-11-13（用户要求：开仓消息必须准确）：实盘市价单 → 读交易所真实成交均价再发消息
+        _real_fill = None
+        if _rplan and _be_mode() == "实盘" and not _rplan.get("watch_fill"):
+            _oid = (_rplan.get("order_ids") or [None])[0]
+            if _oid:
+                for _tries in range(8):
+                    try:
+                        _st, _e2 = bexec.order_status(coin.upper() + "USDT", _oid)
+                    except Exception:
+                        _st = None
+                    if _st and float(_st.get("avgPrice") or 0) > 0:
+                        _real_fill = {"price": float(_st["avgPrice"]),
+                                      "qty": float(_st.get("executedQty") or 0), "oid": _oid}
+                        break
+                    time.sleep(0.35)
+            if _real_fill:
+                _old_entry = entry
+                entry = _real_fill["price"]
+                tr["entry"] = entry
+                tr["fill_qty"] = _real_fill["qty"] or ((NOTIONAL / entry) if entry else None)
+                log("   ↳ [实盘] 交易所成交回报：均价 %s 数量 %s（信号价 %s）"
+                    % (entry, _real_fill["qty"], _old_entry))
+            else:
+                log("   ⚠️ [实盘] 未取到成交回报，消息按信号价展示（可在币安核对）")
         timing = ("⏱ 从信号发出到推送 共 %.1fs（发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 等齐后续消息+出单 %.1fs）"
                   % (age, tm["detect"], tm["img"], tm["parse"], tm["chart"],
                      max(0.0, age - tm["detect"] - tm["img"] - tm["parse"] - tm["chart"])))
@@ -4643,7 +4683,8 @@ def finalize_pending(open_pos):
                               + ("｜⚠️ 测试阶段：当前已持 %d 笔（上限 %d）" % (len(open_pos), MAX_OPEN) if over_cap else "")),
                         add=p["add"], timing=timing, signal_entry=signal_entry,
                         signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode,
-                        entry_orders=entry_orders, entry_note=entry_note)
+                        entry_orders=entry_orders, entry_note=entry_note,
+                        real_fill=_real_fill, pending_limit=bool(_rplan and _rplan.get("watch_fill")))
         _rp = fmt_real_plan(_rplan) if _rplan else ""
         if _rp:
             _txt += "\n\n" + _rp
