@@ -433,10 +433,31 @@ def split_tp_qty(symbol, total_qty, tiers):
     parts, acc = [], 0.0
     for i in range(n):
         if i == n - 1:
-            parts.append(round(total_qty - acc, 10))
+            parts.append(round_step(total_qty - acc, spec(symbol).get("step")))
         else:
             parts.append(base)
             acc += base
+    return parts
+
+
+def tp_weights(n):
+    """用户 2026-11-12 定的止盈分档权重：1档=100%、2档=50/50、3档=2/5、2/5、1/5。"""
+    return [1.0] if n <= 1 else ([0.5, 0.5] if n == 2 else [2.0 / 5, 2.0 / 5, 1.0 / 5])
+
+
+def split_tp_qty_w(symbol, total_qty, tiers):
+    """按用户权重切分各档数量（最后一档吃余数，保证总数一致）。"""
+    n = max(len(tiers), 1)
+    w = tp_weights(n)
+    step = spec(symbol).get("step")
+    parts, acc = [], 0.0
+    for i in range(n):
+        if i == n - 1:
+            parts.append(round_step(total_qty - acc, step))
+        else:
+            q = round_step(total_qty * w[i], step)
+            parts.append(q)
+            acc += q
     return parts
 
 
@@ -515,24 +536,17 @@ def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=L
                 "symbol": symbol, "side": _side_for(dir_), "type": "MARKET",
                 "quantity": fmt_qty(symbol, notional / cur), "positionSide": _ps(dir_)}
     else:
-        diff = (cur - entry_price) / entry_price
-        chase = (dir_.upper() == "LONG" and diff > 0.02) or (dir_.upper() == "SHORT" and diff < -0.02)
-        if not chase:
-            plan["entry_legs"].append({"kind": "market", "notional": notional,
-                                       "ref_price": cur, "why": "差值≤2%，直接市价满仓"})
-        else:
-            px1 = entry_price * (1.01 if dir_.upper() == "LONG" else 0.99)
-            plan["entry_legs"] = [
-                {"kind": "limit", "price": fmt_price(symbol, px1), "notional": notional / 2,
-                 "why": "不追%s：第1笔" % ("高" if dir_.upper() == "LONG" else "空")},
-                {"kind": "limit", "price": fmt_price(symbol, entry_price), "notional": notional / 2,
-                 "why": "不追%s：第2笔" % ("高" if dir_.upper() == "LONG" else "空")}]
+        # 🆕 2026-11-13（用户 0.2% 规则）：给定博主价 → 按博主价挂**单笔限价**等回踩；
+        #   不再拆两笔追单（旧逻辑 diff>2% 拆两笔，与实际规则不符）。
+        plan["entry_legs"].append({"kind": "limit", "price": fmt_price(symbol, float(entry_price)),
+                                   "notional": notional,
+                                   "why": "按博主价挂限价等回踩（0.2% 规则：>0.2% 不利时不追）"})
     # ---- 止盈 + 止损 ----
     ref = float(plan["entry_legs"][0].get("price") or cur)
     tot_qty = round_step(spec(symbol).get("step") and (notional / ref), spec(symbol).get("step"))
     tps = [t for t in (tps or []) if isinstance(t, (int, float))][:3]
     if tps:
-        parts = split_tp_qty(symbol, tot_qty, tps)
+        parts = split_tp_qty_w(symbol, tot_qty, tps)
         for i, (t, q) in enumerate(zip(tps, parts)):
             leg = {"tier": i + 1, "price": fmt_price(symbol, t), "qty": fmt_qty(symbol, q)}
             if not LIVE[0]:

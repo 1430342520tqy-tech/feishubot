@@ -368,7 +368,7 @@ def watch_reconcile():
             fresh.add(sym)          # 刚变动过 → 真实成交可能还在路上，本轮跳过
             continue
         try:
-            paper_qty[sym] = real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
+            paper_qty[sym] = real_qty_estimate(tr["entry"], tr.get("remaining", 1.0), tr.get("notional"))
         except Exception:
             pass
     _res = ledger.reconcile(
@@ -381,9 +381,9 @@ def watch_reconcile():
             continue
         _seen.add(d["coin"])
         if d["kind"] == "qty_mismatch":
-            _live_alert("周期对账·数量不符", d["coin"], d["detail"],
-                        "纸面记录与交易所真实数量已脱节。机器人**不会自动改**，请人工核对。",
-                        naked=False)
+            # 🆕 2026-11-13（用户要求）：数量不符**不告警**，只写日志 ——
+            #   用户只关心"开了多少仓位/多少倍杠杆/多少保证金"。
+            log("   [周期对账] %s 数量与交易所不符（只记录，不告警）：%s" % (d["coin"], d["detail"]))
         elif d["kind"] == "only_paper":
             _live_alert("周期对账·仓位已不在交易所", d["coin"], d["detail"],
                         "交易所上已无此仓 → 可能止损触发或被手动平掉了，纸面记录可能已过时。",
@@ -539,7 +539,7 @@ def check_float_alert(open_pos):
                "**机器人不做任何自动操作**（不平仓、不改止损、不加仓）→ 请你手工处理。"
                % (c, "做多" if str(t.get("dir") or "LONG").upper() == "LONG" else "做空",
                   v, mg, abs(v) / mg * 100.0, float(FLOAT_ALERT_PCT[0]) * 100.0,
-                  float(price_of(c) or 0), float(t.get("entry") or 0), t.get("stop")))
+                  float(price_of(c) or 0), float(t.get("entry") or 0), t.get("sl")))
         log("   🔴 浮亏告警：%s 浮亏 %.2fU / 保证金 %.2fU（只报警，不动手）" % (c, v, mg))
     return None
 
@@ -648,7 +648,7 @@ def startup_reconcile():
     paper_qty = {}
     for c, tr in open_pos_ref.items():
         try:
-            paper_qty["%sUSDT" % c.upper()] = real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
+            paper_qty["%sUSDT" % c.upper()] = real_qty_estimate(tr["entry"], tr.get("remaining", 1.0), tr.get("notional"))
         except Exception:
             pass
     rsyms = set(real or {})
@@ -842,11 +842,12 @@ def watch_entries():
             if filled_qty > 0 and not any_live:
                 # ===== 成交完成 → 挂止盈 + 止损 =====
                 _tps = [t for t in (w.get("tps") or [])]
-                for t in _tps:      # 数量按实际成交量重算
-                    try:
-                        t["qty"] = bexec.fmt_qty(w["sym"], filled_qty / max(len(_tps), 1))
-                    except Exception:
-                        pass
+                try:      # 数量按实际成交量、按用户权重（2/5、2/5、1/5）重算
+                    _parts = bexec.split_tp_qty_w(w["sym"], filled_qty, _tps)
+                    for t, _q in zip(_tps, _parts):
+                        t["qty"] = bexec.fmt_qty(w["sym"], _q)
+                except Exception:
+                    pass
                 _res = bexec.after_entry_filled(w["sym"], w["dir"], _tps, w.get("stop"), filled_qty)
                 _tr = open_pos_ref.get(coin)
                 if _tr is not None:
@@ -1198,8 +1199,11 @@ def _ambig_prune(real_syms):
     return _stale
 
 
-def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
-    """开仓 → 交给真实下单层生成完整计划（市价/限价腿 + 各档止盈 + Algo 止损）"""
+def real_plan_open(coin, dirc, entry, stop, tps, margin=None, entry_mode="市价"):
+    """开仓 → 交给真实下单层生成完整计划（市价/限价腿 + 各档止盈 + Algo 止损）
+
+    🆕 2026-11-13：entry_mode 为「市价」→ 真实层走纯市价；否则按博主价挂限价（0.2% 规则）。
+    """
     if not _BEXEC_OK:
         return None
     # ===== 手工仓 / 归属待确认：用户的仓（或还没确认是谁的仓），绝不动（优先级高于一切）=====
@@ -1215,8 +1219,9 @@ def real_plan_open(coin, dirc, entry, stop, tps, margin=None):
     except Exception:
         pass
     try:
-        _plan = bexec.open_full_position(coin.upper() + "USDT", dirc, entry, stop,
-                                        list(tps or []), margin=margin or MARGIN)
+        _ep = None if str(entry_mode).startswith("市价") else entry
+        _plan = bexec.open_full_position(coin.upper() + "USDT", dirc, _ep, stop,
+                                        list(tps or []), margin=margin or MARGIN, lev=bexec.LEV)
         # 🆕 第3步：“半成功”（仓位已建立、但保护单没挂全）必须**大声报出来**，
         #    不能因为“函数正常返回了”就当成一切良好。
         _es = (_plan or {}).get("exec") or {}
@@ -1267,7 +1272,7 @@ def _real_qty_or_estimate(coin, tr):
     sym = coin.upper() + "USDT"
     if no_touch_guard(coin):
         log("   🛑 [手工仓/归属待确认] %s 的真实仓位机器人不碰 → 止损数量只用纸面估算，绝不用交易所数量" % coin)
-        return real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
+        return real_qty_estimate(tr["entry"], tr.get("remaining", 1.0), tr.get("notional"))
     if _BEXEC_OK:
         try:
             pos = bexec.position_of(sym, tr.get("dir"))
@@ -1277,13 +1282,17 @@ def _real_qty_or_estimate(coin, tr):
             log("   ⚠️ 交易所查不到 %s 的真实持仓（可能已平仓）→ 止损数量退回纸面估算" % coin)
         except Exception as e:
             log("   ⚠️ 查交易所真实持仓失败（%s）→ 止损数量退回纸面估算" % str(e)[:80])
-    return real_qty_estimate(tr["entry"], tr.get("remaining", 1.0))
+    return real_qty_estimate(tr["entry"], tr.get("remaining", 1.0), tr.get("notional"))
 
 
-def real_qty_estimate(entry, remaining):
-    """影子模式下估算真实持仓数量（实盘时以交易所实际持仓为准）"""
+def real_qty_estimate(entry, remaining, notional=None):
+    """影子模式下估算真实持仓数量（实盘时以交易所实际持仓为准）。
+
+    🆕 2026-11-13：优先用**该笔自己的名义**（tr["notional"]），否则才用全局默认。
+      否则配置从 3x 改成 10x 后，历史按 3x 开的仓位会被按 900U 估算 → 数量天然对不上。
+    """
     try:
-        return (NOTIONAL * float(remaining)) / float(entry)
+        return (float(notional or NOTIONAL) * float(remaining)) / float(entry)
     except Exception:
         return 0.0
 
@@ -3873,7 +3882,14 @@ def _apply_quote_update(g, upd):
                     if upd["tps"] and _qty:
                         _tps_ok = [t for t in (tr.get("tps") or [])
                                    if (t > tr["entry"] if tr["dir"] == "LONG" else t < tr["entry"])]
-                        _parts = bexec.split_tp_qty(_sym, _qty, len(_tps_ok))
+                        # 先撤掉旧的止盈限价单（开仓时可能是 2R 兜底单档），再按博主真实档位重挂
+                        for _o in (bexec.open_orders(_sym) or []):
+                            if str(_o.get("type") or "").upper() == "LIMIT":
+                                try:
+                                    bexec.cancel_order(_sym, _o.get("orderId"))
+                                except Exception:
+                                    pass
+                        _parts = bexec.split_tp_qty_w(_sym, _qty, _tps_ok)
                         for _t, _q in zip(_tps_ok, _parts):
                             bexec.place_tp_limit(_sym, tr["dir"], _t, _q)
                         log("   ↳ [实盘] 止盈已挂：%s" % _tps_ok)
@@ -4008,22 +4024,20 @@ def finalize_pending(open_pos):
                     entry_note = ("现价 %.8g 比博主价 %.8g 不利 → **按博主价挂限价，等回踩**（%s专属规则）"
                                   % (mkt, signal_entry, _grp))
                     log("   ↳ [%s专属] 按博主价挂限价 %.8g（现价 %.8g）" % (_grp, signal_entry, mkt))
-            elif dirc0 == "LONG" and diff < -0.02:       # 市价高于博主价 2% 以上 -> 不追高
-                p1 = signal_entry * 1.01
-                entry_orders = [{"kind": "限价", "price": p1, "margin": MARGIN / 2},
-                                {"kind": "限价", "price": signal_entry, "margin": MARGIN / 2}]
-                entry_mode = "限价分批"
-                entry = (p1 * 0.5 + signal_entry * 0.5)
-                entry_note = "现价 %.8g 比博主开仓价高 %.1f%%，超过 2%%，**不追高**，分两笔挂限价" % (mkt, -diff * 100)
-            elif dirc0 == "SHORT" and diff > 0.02:     # 市价低于博主价 2% 以上 -> 不追空
-                p1 = signal_entry * 0.99
-                entry_orders = [{"kind": "限价", "price": p1, "margin": MARGIN / 2},
-                                {"kind": "限价", "price": signal_entry, "margin": MARGIN / 2}]
-                entry_mode = "限价分批"
-                entry = (p1 * 0.5 + signal_entry * 0.5)
-                entry_note = "现价 %.8g 比博主开仓价低 %.1f%%，超过 2%%，**不追空**，分两笔挂限价" % (mkt, diff * 100)
+            elif abs(diff) <= 0.002:
+                entry_note = "现价与博主开仓价相差 %.2f%%（≤0.2%%），直接市价开" % (diff * 100)
+            elif (dirc0 == "LONG" and diff < 0) or (dirc0 == "SHORT" and diff > 0):
+                # >0.2% 且对我们不利 → 按博主价挂限价等回踩（用户 2026-11-11 规则）
+                entry_orders = [{"kind": "限价", "price": signal_entry, "margin": MARGIN}]
+                entry_mode = "限价（等回踩）"
+                entry = signal_entry
+                entry_note = ("现价 %.8g 与博主价 %.8g 相差 %.2f%%（>0.2%% 且不利）→ **按博主价挂限价等回踩**"
+                              % (mkt, signal_entry, abs(diff) * 100))
+                log("   ↳ 差值 %.2f%% >0.2%% 且不利 → 按博主价挂限价 %.8g（现价 %.8g）"
+                    % (abs(diff) * 100, signal_entry, mkt))
             elif signal_entry:
-                entry_note = "现价与博主开仓价相差 %.2f%%（≤2%%），直接市价开" % (diff * 100)
+                entry_note = ("现价 %.8g 比博主价 %.8g 更有利（相差 %.2f%% >0.2%%）→ 直接市价"
+                              % (mkt, signal_entry, abs(diff) * 100))
         # ===== 止损推导（用户规则2/5，适用所有博主）=====
         # 没给止损时：① 有百分比止损 → 按开仓价折算；② 否则有止盈 → 止损 = 第一止盈距离的一半（保证 2:1）
         _d0 = 1 if dirc0 == "LONG" else -1
@@ -4359,7 +4373,7 @@ def finalize_pending(open_pos):
         #   （一轮注释里"手工仓进不了 open_pos"这个前提是错的）。
         #   现在命中 no_touch 就强制标"影子"（只做纸面），双保险见那 4 处 no_touch_block。
         _mark_real_layer(coin, tr)
-        _rplan = real_plan_open(coin, dirc, entry, p["stop"], tps)   # 影子模式：只生成计划
+        _rplan = real_plan_open(coin, dirc, entry, p["stop"], tps, entry_mode=entry_mode)   # 影子模式：只生成计划
         tm["order"] = time.time() - t_order
         # 实盘 + 限价入场 → 登记成交监听（没成交前不跟踪止盈止损）
         if _rplan and _rplan.get("watch_fill"):
@@ -5996,6 +6010,16 @@ def main():
             if isinstance(_op, dict):
                 open_pos.update(_op)
                 log("已恢复持仓 %d 笔：%s" % (len(_op), "、".join(_op) or "-"))
+            # 🆕 2026-11-13（用户要求 #2）：限价入场监听也落盘 → 重启后不丢成交监听
+            _ew = sv.get("entry_watch")
+            if isinstance(_ew, dict) and _ew:
+                for _c, _w in _ew.items():
+                    if isinstance(_w, dict) and _w.get("order_ids"):
+                        _w.setdefault("deadline", time.time() + FILL_TIMEOUT)
+                        ENTRY_WATCH[_c] = _w
+                if ENTRY_WATCH:
+                    log("已恢复限价入场监听 %d 条（重启不丢成交监听）：%s"
+                        % (len(ENTRY_WATCH), "、".join(sorted(ENTRY_WATCH))))
             if last_id:
                 log("已载入上次进度：" + ", ".join("%s→%s" % (k, datetime.datetime.fromtimestamp(last_id[k] >> 32, CST).strftime("%m-%d %H:%M")) for k in last_id))
             _rk = sv.get("risk")
@@ -6173,6 +6197,7 @@ def main():
                    **_dump_lists(),
                    "img_sig_seen": _img_sig_dump(),   # 图上信号点位记忆（识别持仓进展通报）
                    "last_api": dict(API_CURSOR),  # API 模式的消息游标（毫秒）
+                   "entry_watch": ENTRY_WATCH,    # 🆕 限价入场成交监听（重启不丢）
                    "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                   open(STATE, "w"), ensure_ascii=False, indent=1)
         try:
@@ -7100,6 +7125,7 @@ def main():
                        **_dump_lists(),               # 🆕 二轮 F4：三份名单统一落盘（含 ambig_ack）
                        "img_sig_seen": _img_sig_dump(),   # 图上信号点位记忆（识别持仓进展通报）
                        "last_api": dict(API_CURSOR),  # API 模式消息游标（毫秒）
+                       "entry_watch": ENTRY_WATCH,    # 🆕 限价入场成交监听（重启不丢）
                        "ts": datetime.datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")},
                       open(STATE, "w"), ensure_ascii=False, indent=1)
             if hb % 10 == 0:
