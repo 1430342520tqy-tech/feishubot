@@ -1273,6 +1273,33 @@ def _real_qty_or_estimate(coin, tr):
     return real_qty_estimate(tr["entry"], tr.get("remaining", 1.0), tr.get("notional"))
 
 
+def _ensure_real_closed(coin, tr, why=""):
+    """🆕 2026-11-13（UB 事故修复）：纸面已了结时，**确保真实仓位也平掉**。
+
+    事故（UB LONG）：纸面按"最后价"判定止损/保本触发 → 机器人只 cancel_all 撤单，
+    没检查真实仓位；而币安止损单按 **MARK_PRICE** 触发、当时没触发 → 真实仓位变成
+    **没有任何止损的裸仓**，用户手动平掉。
+    现在：纸面了结 → 查交易所真实持仓，仍有仓就**市价平掉**，再撤剩余挂单。
+    """
+    if not (_BEXEC_OK and tr.get("real_layer") == "实盘"):
+        return
+    if no_touch_block(coin, "纸面了结后平真实仓"):
+        return
+    sym = coin.upper() + "USDT"
+    try:
+        pos = bexec.position_of(sym, tr.get("dir"))
+        q = abs(float((pos or {}).get("positionAmt") or 0))
+        if q > 0:
+            bexec.close_position_market(sym, tr.get("dir"), q)
+            log("   ↳ [实盘] 纸面已了结（%s）但交易所仍有 %s 张 → 已市价平掉" % (why, q))
+            notify("【实盘·已平】%s 纸面了结（%s），交易所仍有 %s 张 → 已市价平掉" % (coin, why, q))
+        else:
+            log("   ↳ [实盘] 纸面已了结（%s），交易所已无持仓" % why)
+    except Exception as e:
+        _live_alert("纸面了结后平真实仓", coin, e,
+                    "真实仓位可能仍在且没有止损保护，请立刻人工处理！")
+
+
 def real_qty_estimate(entry, remaining, notional=None):
     """影子模式下估算真实持仓数量（实盘时以交易所实际持仓为准）。
 
@@ -6994,6 +7021,16 @@ def main():
                     px = price_of(coin)
                     if px is None:
                         continue
+                    # 🆕 2026-11-13（UB 事故）：币安止损单按 **MARK_PRICE** 触发，
+                    #   纸面判止损也必须用标记价（否则最后价插针会让纸面"先止损"、真实却没触发 → 裸仓）。
+                    _px_stop = px
+                    if _BEXEC_OK:
+                        try:
+                            _mk = bexec.mark_price(coin.upper() + "USDT")
+                            if _mk:
+                                _px_stop = float(_mk)
+                        except Exception:
+                            pass
                     d = 1 if tr["dir"] == "LONG" else -1
                     tps = tr.get("tps") or []
                     filled = tr.setdefault("filled", [])
@@ -7006,8 +7043,8 @@ def main():
                             tr["sl"] = tr["entry"]
                             stop = tr["entry"]
                             log("   ↳ 单目标止盈：价格已走 5%% → 止损移到开仓价（保本）")
-                    # ① 止损优先
-                    if stop is not None and (px - stop) * d <= 0:
+                    # ① 止损优先（用标记价判断，与币安 STOP_MARKET 触发口径一致）
+                    if stop is not None and (_px_stop - stop) * d <= 0:
                         pnl = (stop - tr["entry"]) * d / tr["entry"] * NOTIONAL * remaining
                         tr["realized"] = tr.get("realized", 0.0) + pnl
                         tr.update({"status": "CLOSED", "exit": stop,
@@ -7026,6 +7063,9 @@ def main():
                             pass
                         elif _BEXEC_OK and tr.get("real_layer") == "实盘":
                             # 只对【开仓时就是实盘】的仓位动真实挂单；切模式前开的纸面仓一律不碰（用户 2026-09-15 要求）
+                            # 🆕 2026-11-13（UB 事故）：先确保真实仓位已平（币安止损按 MARK_PRICE 触发，
+                            #   纸面按最后价可能先触发）→ 仍有仓就市价平掉，再撤剩余挂单，绝不留下裸仓。
+                            _ensure_real_closed(coin, tr, "止损/保本")
                             try:
                                 bexec.cancel_all(coin.upper() + "USDT")
                                 log("   ↳ [真实下单层·实盘] 仓位已了结，已撤掉剩余挂单")
@@ -7101,6 +7141,14 @@ def main():
                             with open(TRADES, "a", encoding="utf-8") as f:   # 补写最终 CLOSED 记录（含结单时间）
                                 f.write(json.dumps(tr, ensure_ascii=False) + "\n")
                             notify("【已结单·纸面】%s %s\n全部止盈完成，累计盈亏：%+.1fU" % (coin, tr["dir"], tr["realized"]))
+                            # 🆕 2026-11-13（UB 事故）：纸面全部止盈 ≠ 交易所一定成交（限价单按最后价，
+                            #   纸面按最后价判定可能先于真实成交）→ 查真实仓位，仍有仓就市价平掉并撤余单。
+                            if _BEXEC_OK and tr.get("real_layer") == "实盘" and not no_touch_block(coin, "全部止盈后的平仓/撤单"):
+                                _ensure_real_closed(coin, tr, "全部止盈")
+                                try:
+                                    bexec.cancel_all(coin.upper() + "USDT")
+                                except Exception as _e:
+                                    _live_alert("撤单(全部止盈后)", coin, str(_e))
                             open_pos.pop(coin, None)
             except Exception as e:
                 log("持仓监控异常 " + str(e)[:100])
