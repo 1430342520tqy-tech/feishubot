@@ -1300,6 +1300,211 @@ def _ensure_real_closed(coin, tr, why=""):
                     "真实仓位可能仍在且没有止损保护，请立刻人工处理！")
 
 
+# ===================== 实盘"先执行、后通知"监控（2026-11-13 用户审核通过）=====================
+def _live_tp_ids_ensure(coin, tr):
+    """确保 tr 里有每档止盈对应的**真实订单号**（老仓位首次运行按价格匹配补全）。"""
+    sym = coin.upper() + "USDT"
+    tps = tr.get("tps") or []
+    ids = tr.get("real_tp_ids")
+    if not isinstance(ids, list) or len(ids) != len(tps):
+        ids = [None] * len(tps)
+    if any(ids):
+        tr["real_tp_ids"] = ids
+        return
+    try:
+        rows = bexec.open_orders(sym) or []
+    except Exception:
+        rows = []
+    for i, t in enumerate(tps):
+        for r in rows:
+            if str(r.get("type") or "").upper() != "LIMIT":
+                continue
+            try:
+                px = float(r.get("price"))
+            except Exception:
+                continue
+            if abs(px - float(t)) / max(1e-9, float(t)) < 0.003:
+                ids[i] = r.get("orderId")
+                break
+    tr["real_tp_ids"] = ids
+
+
+def _live_take_reduce(coin, tr):
+    """读取该币**新增的平仓成交**（按时间游标），返回 (数量, 加权均价, realizedPnl)。"""
+    sym = coin.upper() + "USDT"
+    since = int(tr.get("_ut_ms") or 0)
+    try:
+        rows = bexec._req("GET", "/fapi/v1/userTrades", {"symbol": sym, "limit": 100}) or []
+    except Exception:
+        return 0.0, 0.0, 0.0
+    if rows:
+        tr["_ut_ms"] = max(int(tr.get("_ut_ms") or 0), max(int(r.get("time") or 0) for r in rows))
+    close_side = "SELL" if tr["dir"] == "LONG" else "BUY"
+    red = [r for r in rows if int(r.get("time") or 0) > since and str(r.get("side") or "").upper() == close_side]
+    q = sum(float(r.get("qty") or 0) for r in red)
+    n = sum(float(r.get("qty") or 0) * float(r.get("price") or 0) for r in red)
+    rp = sum(float(r.get("realizedPnl") or 0) for r in red)
+    avg = (n / q) if q > 0 else 0.0
+    if q > 0:
+        tr["_last_exit_px"] = avg
+    if rp:
+        tr["realized"] = tr.get("realized", 0.0) + rp
+    return q, avg, rp
+
+
+def _live_finalize(coin, tr, open_pos, why):
+    """交易所已确认无持仓 → 才发【已结单·实盘】。"""
+    if tr.get("real_closed"):
+        return
+    sym = coin.upper() + "USDT"
+    tr["real_closed"] = True
+    exit_px = tr.get("_last_exit_px")
+    if not exit_px:
+        try:
+            exit_px = bexec.mark_price(sym)
+        except Exception:
+            exit_px = tr.get("exit") or tr.get("entry")
+    tr.update({"status": "CLOSED", "exit": exit_px, "exit_why": why,
+               "remaining": 0.0, "pnl": tr.get("realized", 0.0)})
+    _stat_close(tr)
+    try:
+        with open(TRADES, "a", encoding="utf-8") as f:
+            f.write(json.dumps(tr, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    notify("【已结单·实盘】%s %s\n结果：%s @%.8g（**交易所已确认无持仓**）\n实际盈亏：%+.2fU"
+           % (coin, tr["dir"], why, float(exit_px or 0), tr.get("realized", 0.0)))
+    try:
+        bexec.cancel_all(sym)
+    except Exception:
+        pass
+    open_pos.pop(coin, None)
+    log("   ✅ [实盘·已结单] %s %s @%s（交易所确认）" % (coin, tr["dir"], exit_px))
+
+
+def _monitor_live(coin, tr, open_pos):
+    """实盘仓监控：一切以交易所为准 —— 先确认成交/持仓，再更新纸面并通知。
+
+    规则（用户 2026-11-13 审核）：
+      · 止盈：对应限价单状态 = FILLED → 才算成交、才发【止盈成交·实盘】；
+      · 结单：交易所持仓 = 0 → 才发【已结单·实盘】（附成交均价/实际盈亏）；
+      · 止损：持仓归零且成交价靠近止损 → 结果记"止损"；
+      · 全程不按纸面价格"先下结论"。
+    """
+    if not _BEXEC_OK:
+        return
+    _now = time.time()
+    # 节流：每 1.5 秒最多查一次（每轮 0.5 秒，避免把币安接口打爆）
+    if _now - float(tr.get("_mon_t") or 0) < 1.5:
+        return
+    tr["_mon_t"] = _now
+    sym = coin.upper() + "USDT"
+    _live_tp_ids_ensure(coin, tr)
+    tps = tr.get("tps") or []
+    filled = tr.setdefault("filled", [])
+    # ---- ① 止盈档成交确认（订单已不在挂单列表 + 状态 FILLED）----
+    try:
+        open_rows = bexec.open_orders(sym) or []
+    except Exception:
+        open_rows = None
+    if open_rows is not None:
+        open_ids = set(r.get("orderId") for r in open_rows)
+        for i, oid in enumerate(tr.get("real_tp_ids") or []):
+            if not oid or i in filled or i >= len(tps):
+                continue
+            if oid in open_ids:
+                continue
+            st, _err = bexec.order_status(sym, oid)
+            if not st or str(st.get("status")) != "FILLED":
+                continue
+            px = float(st.get("avgPrice") or st.get("price") or tps[i])
+            q = float(st.get("executedQty") or 0)
+            filled.append(i)
+            tr["_paper_changed"] = time.time()
+            _q, _avg, _rp = _live_take_reduce(coin, tr)     # 累计真实已实现
+            init_q = float(tr.get("fill_qty") or ((tr.get("notional") or NOTIONAL) / float(tr["entry"])))
+            try:
+                pos = bexec.position_of(sym, tr["dir"])
+                qn = abs(float((pos or {}).get("positionAmt") or 0))
+            except Exception:
+                qn = 0.0
+            tr["remaining"] = max(0.0, qn / init_q) if init_q else 0.0
+            notify("【止盈成交·实盘】%s %s\nTP%d 已成交 @%.8g（数量 %s ｜ orderId %s）\n"
+                   "实际已实现：%+.2fU ｜ 交易所剩余：%.0f%%"
+                   % (coin, tr["dir"], i + 1, px, q, oid, tr.get("realized", 0.0), tr["remaining"] * 100))
+            log("   ✅ [实盘] TP%d 成交确认 @%s qty=%s → 剩余 %s" % (i + 1, px, q, qn))
+            if i == 0:
+                tr["sl"] = tr["entry"]
+                try:
+                    _rq = _real_qty_or_estimate(coin, tr)
+                    bexec.sync_sl(sym, tr["dir"], tr["sl"], _rq)
+                    log("   ↳ [实盘] TP1 后止损已移到开仓价（已核对）")
+                except Exception as _e:
+                    _live_alert("TP1后移保本", coin, _e, "真实止损可能未更新，请人工核对")
+            if qn <= 0:
+                _live_finalize(coin, tr, open_pos, "全部止盈")
+            return
+    # ---- ② 持仓归零 → 已结单（确认后通知）----
+    try:
+        pos = bexec.position_of(sym, tr["dir"])
+        qn = abs(float((pos or {}).get("positionAmt") or 0))
+    except Exception:
+        return
+    if qn <= 0:
+        _q, _avg, _rp = _live_take_reduce(coin, tr)
+        why = "交易所已平仓"
+        stop = tr.get("sl")
+        if _avg and stop and abs(float(_avg) - float(stop)) / max(1e-9, float(stop)) < 0.006:
+            why = "止损"
+        elif _avg and tps and all(abs(float(_avg) - float(t)) / max(1e-9, float(t)) < 0.01 for t in tps[:1]):
+            why = "止盈"
+        _live_finalize(coin, tr, open_pos, why)
+
+
+def check_real_stops(open_pos):
+    """每约 30 秒：核对每个实盘仓是否有有效止损单，缺失 → 补挂/告警（用户方案 3）。"""
+    if not _BEXEC_OK:
+        return
+    for coin, tr in list(open_pos.items()):
+        if tr.get("real_layer") != "实盘" or tr.get("pending_fill") or tr.get("real_closed"):
+            continue
+        if no_touch_block(coin, "止损单在线校验"):
+            continue
+        sym = coin.upper() + "USDT"
+        try:
+            pos = bexec.position_of(sym, tr["dir"])
+            qn = abs(float((pos or {}).get("positionAmt") or 0))
+        except Exception:
+            continue
+        if qn <= 0:
+            continue
+        sl = tr.get("sl") or tr.get("entry")
+        ok = False
+        try:
+            for a in (bexec.open_algo_orders(sym) or []):
+                if str(a.get("orderType") or "").upper() != "STOP_MARKET":
+                    continue
+                try:
+                    trig = float(a.get("triggerPrice") or 0)
+                    aq = float(a.get("quantity") or 0)
+                except Exception:
+                    continue
+                if sl and abs(trig - float(sl)) / max(1e-9, float(sl)) < 0.005 and aq >= 0.9 * qn:
+                    ok = True
+                    break
+        except Exception:
+            continue
+        if ok:
+            continue
+        try:
+            bexec.sync_sl(sym, tr["dir"], sl, qn)
+            notify("【风险·止损缺失】%s 交易所没有有效止损单 → **已补挂** 止损 %.8g（数量 %s）"
+                   % (coin, float(sl), qn))
+            log("   ⚠️ [实盘] 止损缺失 → 已补挂 %s 数量 %s" % (sl, qn))
+        except Exception as e:
+            _live_alert("止损单在线校验", coin, e, "该仓位**没有止损**，请立刻人工处理！")
+
+
 def real_qty_estimate(entry, remaining, notional=None):
     """影子模式下估算真实持仓数量（实盘时以交易所实际持仓为准）。
 
@@ -3891,7 +4096,9 @@ def _apply_quote_update(g, upd):
                 try:
                     _qty = _real_qty_or_estimate(coin, tr)
                     if (upd["stop"] is not None or upd["cost"]) and _qty:
-                        bexec.sync_sl(_sym, tr["dir"], float(tr["sl"]), _qty)
+                        _ns = bexec.sync_sl(_sym, tr["dir"], float(tr["sl"]), _qty)
+                        if isinstance(_ns, dict):
+                            tr["real_sl_id"] = _ns.get("algoId") or tr.get("real_sl_id")
                         log("   ↳ [实盘] 止损已替换：%s（数量 %s）" % (tr["sl"], _qty))
                         notify("【实盘·止损已替换】%s 新止损 **%.8g**（数量 %s）" % (coin, float(tr["sl"]), _qty))
                     if upd["tps"] and _qty:
@@ -3905,8 +4112,11 @@ def _apply_quote_update(g, upd):
                                 except Exception:
                                     pass
                         _parts = bexec.split_tp_qty_w(_sym, _qty, _tps_ok)
+                        _new_ids = []
                         for _t, _q in zip(_tps_ok, _parts):
-                            bexec.place_tp_limit(_sym, tr["dir"], _t, _q)
+                            _rr = bexec.place_tp_limit(_sym, tr["dir"], _t, _q)
+                            _new_ids.append((_rr or {}).get("orderId") if isinstance(_rr, dict) else None)
+                        tr["real_tp_ids"] = _new_ids
                         log("   ↳ [实盘] 止盈已挂：%s" % _tps_ok)
                         notify("【实盘·止盈已挂】%s 各档：%s"
                                % (coin, "、".join("%.8g" % t for t in _tps_ok)))
@@ -4389,6 +4599,23 @@ def finalize_pending(open_pos):
         #   现在命中 no_touch 就强制标"影子"（只做纸面），双保险见那 4 处 no_touch_block。
         _mark_real_layer(coin, tr)
         _rplan = real_plan_open(coin, dirc, entry, p["stop"], tps, entry_mode=entry_mode)   # 影子模式：只生成计划
+        # 🆕 2026-11-13（先执行后通知）：记录真实止盈单号 + 成交时间游标，供实盘监控核对
+        try:
+            _prot = (_rplan or {}).get("protection") or {}
+            _ids = [None] * len(tps)
+            for _x in (_prot.get("tps") or []):
+                if isinstance(_x, dict) and _x.get("orderId"):
+                    for _i, _t in enumerate(tps):
+                        if abs(float(_x.get("price") or 0) - float(_t)) <= max(1e-9, float(_t) * 0.003):
+                            _ids[_i] = _x["orderId"]
+            tr["real_tp_ids"] = _ids
+            _slp = _prot.get("sl")
+            tr["real_sl_id"] = (_slp.get("algoId") if isinstance(_slp, dict) else None)
+            tr["_ut_ms"] = int(time.time() * 1000)
+            tr["fill_qty"] = (NOTIONAL / float(entry)) if entry else None
+            tr.setdefault("realized", 0.0)
+        except Exception:
+            pass
         tm["order"] = time.time() - t_order
         # 实盘 + 限价入场 → 登记成交监听（没成交前不跟踪止盈止损）
         if _rplan and _rplan.get("watch_fill"):
@@ -6980,6 +7207,11 @@ def main():
                     watch_reconcile()      # 周期对账：管“数量对不上”（只告警，不自动改）
                 except Exception as e:
                     log("周期对账异常 " + str(e)[:100])
+                # 🆕 2026-11-13（用户方案 3）：每约 30 秒核对实盘仓的止损单是否在线
+                try:
+                    check_real_stops(open_pos)
+                except Exception as e:
+                    log("止损在线校验异常 " + str(e)[:100])
                 # 🆕 2026-09-18 用户新定的两条风控（只报警，不自动动手）
                 try:
                     check_float_alert(open_pos)        # 逐笔浮亏 ≥ 保证金 30% → 报警
@@ -7018,6 +7250,14 @@ def main():
                 for coin, tr in list(open_pos.items()):
                     if tr.get("pending_fill"):
                         continue          # 实盘限价单还没成交 → 不跟踪止盈止损（等成交监听接管）
+                    # 🆕 2026-11-13（用户审核通过）：实盘一律以交易所为准（先执行、后通知）；
+                    #   纸面不再按价格先结算、先发消息。
+                    if tr.get("real_layer") == "实盘":
+                        try:
+                            _monitor_live(coin, tr, open_pos)
+                        except Exception as _e:
+                            log("实盘监控异常 " + str(_e)[:120])
+                        continue
                     px = price_of(coin)
                     if px is None:
                         continue
