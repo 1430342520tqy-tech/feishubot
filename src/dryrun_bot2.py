@@ -250,7 +250,7 @@ def _be_mode():
 # 限价入场是【异步】的：挂上去要等价格回踩才知道成交，而**没持仓时挂止盈/止损会被币安拒**。
 # 所以：限价入场 → 只下入场腿 → 登记到 ENTRY_WATCH → 轮询成交 → 成交后挂止盈(限价)+止损(Algo)。
 ENTRY_WATCH = {}          # coin -> {sym, dir, order_ids, tps, stop, deadline, assumed_entry}
-FILL_TIMEOUT = 1800       # 30 分钟没成交 → 撤单并通知你
+FILL_TIMEOUT = 1800       # 限价单首次等待 30 分钟 → 提醒一次并**继续等待（不撤单）**
 
 
 _LIVE_ALERTS = set()      # 告警去重，避免刷屏
@@ -883,21 +883,19 @@ def watch_entries():
                                          w.get("stop"), filled_qty)
                 ENTRY_WATCH.pop(coin, None)
             elif now > w["deadline"]:
-                # 完全没成交 → 撤单并通知
-                try:
-                    bexec.cancel_all(w["sym"])
-                except Exception:
-                    pass
-                ENTRY_WATCH.pop(coin, None)
-                _tr = open_pos_ref.get(coin)
-                if _tr is not None:
-                    open_pos_ref.pop(coin, None)
-                    STATE_DIRTY[0] = True
-                notify("【实盘·未成交】%s %s 的限价单挂了 %d 分钟仍未成交，已自动撤单（未开仓）。\n"
-                       "挂单价：%s ｜ 期间市价未回踩"
-                       % (coin, w["dir"], FILL_TIMEOUT // 60,
-                          [l.get("price") for l in (w.get("legs") or [])] or w.get("assumed_entry")))
-                log("   ⏰ [实盘未成交] %s 超时撤单" % coin)
+                # 🆕 2026-11-13（用户要求）：价格偏离 >0.2% 时按博主价挂限价等回踩，
+                #   **不得因为"没达到要求/超时"就直接撤单不开了** —— 继续挂着等成交。
+                #   只在第一次超时时提醒一次，之后每小时静默续期；成交后照常挂止盈止损。
+                if not w.get("waited_notified"):
+                    w["waited_notified"] = True
+                    w["deadline"] = now + 3600
+                    notify("【实盘·限价等待】%s %s 的限价单还没成交（挂单价 %s），"
+                           "**继续挂着等回踩，不会自动撤单**。\n成交后会自动按博主的止盈/止损挂好。"
+                           % (coin, w["dir"],
+                              [l.get("price") for l in (w.get("legs") or [])] or w.get("assumed_entry")))
+                    log("   ⏳ [实盘等待] %s 限价单未成交 → 继续等待（不撤单）" % coin)
+                else:
+                    w["deadline"] = now + 3600
         except Exception as e:
             log("   成交监听异常 %s: %s" % (coin, str(e)[:120]))
 
@@ -4579,13 +4577,24 @@ def finalize_pending(open_pos):
                     % (coin, _ex.get("tps")))
                 PENDING.pop(coin, None)
                 continue
-            notify("【信号·跳过】%s 已有持仓，不重复开单\n现有：%s 入场 %.8g · 止损 %.8g · 剩余 %.0f%%\n本次信号原文：%s"
-                   % (coin, _ex.get("dir"), _ex.get("entry") or 0, _ex.get("sl") or 0,
-                      (_ex.get("remaining", 1.0) * 100),
-                      (p["texts"][0][:120] if p["texts"] else "")))
-            log("   ↳ %s 已有持仓，跳过本次信号（防重复开单）" % coin)
-            PENDING.pop(coin, None)
-            continue
+            _old_tr = open_pos.get(coin) or {}
+            if _old_tr.get("pending_fill") and _be_mode() == "实盘":
+                # 旧限价单一直没成交（按用户要求不自动撤单）→ 新信号到达时，用新信号替换旧挂单
+                try:
+                    bexec.cancel_all(coin.upper() + "USDT")
+                except Exception:
+                    pass
+                ENTRY_WATCH.pop(coin, None)
+                open_pos.pop(coin, None)
+                log("   ↳ %s 旧限价单未成交 → 新信号到达：已撤旧单，按新信号重新挂" % coin)
+            else:
+                notify("【信号·跳过】%s 已有持仓，不重复开单\n现有：%s 入场 %.8g · 止损 %.8g · 剩余 %.0f%%\n本次信号原文：%s"
+                       % (coin, _ex.get("dir"), _ex.get("entry") or 0, _ex.get("sl") or 0,
+                          (_ex.get("remaining", 1.0) * 100),
+                          (p["texts"][0][:120] if p["texts"] else "")))
+                log("   ↳ %s 已有持仓，跳过本次信号（防重复开单）" % coin)
+                PENDING.pop(coin, None)
+                continue
         dirc = dirc0
         tm = {"detect": p["t_found"] - p["first_ts"], "img": max(0.0, p["t_img"] - p["t_found"]),
               "parse": max(0.0, p["t_parse"] - p["t_img"]), "chart": max(0.0, p["t_chart"] - p["t_parse"]),
