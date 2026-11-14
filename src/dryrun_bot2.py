@@ -2661,13 +2661,15 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
         L.append("止损：图上/卡片/文字都没读到，等你确认（暂不挂）")
     if tps:
         n = len(tps[:TP_TIERS])
+        _w = ([1.0] if n <= 1 else ([0.5, 0.5] if n == 2 else [2.0 / 5, 2.0 / 5, 1.0 / 5]))
+        _wstr = "、".join("%d%%" % round(x * 100) for x in _w)
         for i, t in enumerate(tps[:TP_TIERS], 1):
             if isinstance(entry, (int, float)) and entry:
                 gross = (t - entry) / entry * 100 * d
                 tier_u = (t - entry) * d / entry * NOTIONAL / n
                 full_u = (t - entry) * d / entry * NOTIONAL
                 L.append("止盈%d（挂单）：%.8g → 预期收益率 %+.2f%%（含 %d 倍杠杆）" % (i, t, gross * lev, lev))
-                L.append("　　　按权重 2/5、2/5、1/5 分批 · 该档 约 %+.1fU · 若全平在此价 约 %+.1fU" % (tier_u, full_u))
+                L.append("　　　按权重 %s 分批 · 该档 约 %+.1fU · 若全平在此价 约 %+.1fU" % (_wstr, tier_u, full_u))
         extra = ""
         if len(tps) < TP_TIERS:
             extra = "（本次只读到 %d 档）" % len(tps)
