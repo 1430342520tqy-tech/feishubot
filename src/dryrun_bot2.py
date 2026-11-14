@@ -4097,8 +4097,13 @@ def _apply_quote_update(g, upd):
         if upd["tps"]:
             _side_ok = [t for t in upd["tps"] if (t > tr["entry"] if tr["dir"] == "LONG" else t < tr["entry"])]
             if _side_ok:
-                tr["tps"] = sorted(set(list(tr.get("tps") or []) + _side_ok),
-                                   key=lambda t: abs(float(t) - tr["entry"]))[:TP_TIERS]
+                # 🆕 2026-11-14（USUAL 事故）：博主补的止盈是**完整档位**，必须**替换**而不是合并 ——
+                #   旧逻辑把开仓时的 2R 兜底档留在里面，结果 2 个止盈变 3 个。
+                if not tr.get("filled"):
+                    tr["tps"] = sorted(_side_ok, key=lambda t: abs(float(t) - tr["entry"]))
+                else:
+                    tr["tps"] = sorted(set(list(tr.get("tps") or []) + _side_ok),
+                                       key=lambda t: abs(float(t) - tr["entry"]))[:TP_TIERS]
                 tr["tp_fallback"] = False      # 真实止盈到了 → 撤掉 2R 兜底标记
                 tr["tp_part"] = None
                 _changed = True
