@@ -871,6 +871,15 @@ def watch_entries():
                     log("   ✅ [实盘成交] %s 均价 %.8g 数量 %s → 止盈 %d/%d 档 + 止损已挂"
                         % (coin, avg_px, filled_qty, _tps_ok, len(_tps)))
                 ENTRY_WATCH.pop(coin, None)
+            elif filled_qty <= 0 and not any_live:
+                # 🆕 2026-11-14：限价单已不在交易所（被手动撤销/过期）→ 放弃监听并移除纸面，
+                #   否则会留下"纸面有仓、交易所无仓"的假持仓，触发对账闸门。
+                ENTRY_WATCH.pop(coin, None)
+                open_pos_ref.pop(coin, None)
+                STATE_DIRTY[0] = True
+                notify("【实盘·限价单不存在】%s %s 的限价单已不在交易所（可能被撤销/过期），未开仓 → 已移除该信号。"
+                       % (coin, w["dir"]))
+                log("   ⚠️ [实盘] %s 限价单已不存在（未成交）→ 已放弃监听并移除纸面仓" % coin)
             elif filled_qty > 0 and any_live and now > w["deadline"]:
                 # 部分成交且超时：保留已成交部分，撤掉剩余，并告知
                 try:
@@ -883,7 +892,7 @@ def watch_entries():
                                          w.get("stop"), filled_qty)
                 ENTRY_WATCH.pop(coin, None)
             elif now > w["deadline"]:
-                # 🆕 2026-11-13（用户要求）：价格偏离 >0.2% 时按博主价挂限价等回踩，
+                # 🆕 2026-11-14（用户要求）：价格偏离 >0.5% 时按博主价挂限价等回踩，
                 #   **不得因为"没达到要求/超时"就直接撤单不开了** —— 继续挂着等成交。
                 #   只在第一次超时时提醒一次，之后每小时静默续期；成交后照常挂止盈止损。
                 if not w.get("waited_notified"):
@@ -1189,7 +1198,7 @@ def _ambig_prune(real_syms):
 def real_plan_open(coin, dirc, entry, stop, tps, margin=None, entry_mode="市价"):
     """开仓 → 交给真实下单层生成完整计划（市价/限价腿 + 各档止盈 + Algo 止损）
 
-    🆕 2026-11-13：entry_mode 为「市价」→ 真实层走纯市价；否则按博主价挂限价（0.2% 规则）。
+    🆕 2026-11-14：entry_mode 为「市价」→ 真实层走纯市价；否则按博主价挂限价（0.5% 规则）。
     """
     if not _BEXEC_OK:
         return None
@@ -4263,19 +4272,19 @@ def finalize_pending(open_pos):
                     entry_note = ("现价 %.8g 比博主价 %.8g 不利 → **按博主价挂限价，等回踩**（%s专属规则）"
                                   % (mkt, signal_entry, _grp))
                     log("   ↳ [%s专属] 按博主价挂限价 %.8g（现价 %.8g）" % (_grp, signal_entry, mkt))
-            elif abs(diff) <= 0.002:
-                entry_note = "现价与博主开仓价相差 %.2f%%（≤0.2%%），直接市价开" % (diff * 100)
+            elif abs(diff) <= 0.005:
+                entry_note = "现价与博主开仓价相差 %.2f%%（≤0.5%%），直接市价开" % (diff * 100)
             elif (dirc0 == "LONG" and diff < 0) or (dirc0 == "SHORT" and diff > 0):
-                # >0.2% 且对我们不利 → 按博主价挂限价等回踩（用户 2026-11-11 规则）
+                # >0.5% 且对我们不利 → 按博主价挂限价等回踩（用户 2026-11-14 改为 0.5% 阈值）
                 entry_orders = [{"kind": "限价", "price": signal_entry, "margin": MARGIN}]
                 entry_mode = "限价（等回踩）"
                 entry = signal_entry
-                entry_note = ("现价 %.8g 与博主价 %.8g 相差 %.2f%%（>0.2%% 且不利）→ **按博主价挂限价等回踩**"
+                entry_note = ("现价 %.8g 与博主价 %.8g 相差 %.2f%%（>0.5%% 且不利）→ **按博主价挂限价等回踩**"
                               % (mkt, signal_entry, abs(diff) * 100))
-                log("   ↳ 差值 %.2f%% >0.2%% 且不利 → 按博主价挂限价 %.8g（现价 %.8g）"
+                log("   ↳ 差值 %.2f%% >0.5%% 且不利 → 按博主价挂限价 %.8g（现价 %.8g）"
                     % (abs(diff) * 100, signal_entry, mkt))
             elif signal_entry:
-                entry_note = ("现价 %.8g 比博主价 %.8g 更有利（相差 %.2f%% >0.2%%）→ 直接市价"
+                entry_note = ("现价 %.8g 比博主价 %.8g 更有利（相差 %.2f%% >0.5%%）→ 直接市价"
                               % (mkt, signal_entry, abs(diff) * 100))
         # ===== 止损推导（用户规则2/5，适用所有博主）=====
         # 没给止损时：① 有百分比止损 → 按开仓价折算；② 否则有止盈 → 止损 = 第一止盈距离的一半（保证 2:1）
