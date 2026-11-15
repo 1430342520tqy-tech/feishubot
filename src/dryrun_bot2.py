@@ -2627,6 +2627,8 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
     L.append("开仓：")
     if pending_limit:
         L.append("限价单已挂出，成交后机器人会按交易所成交回报发【已开仓·实盘】")
+        if entry_note:
+            L.append("（%s）" % entry_note)
     elif real_fill:
         L.append("交易所成交：均价 **%.8g** ｜ 数量 %s ｜ orderId %s"
                  % (float(real_fill.get("price") or 0), real_fill.get("qty"), real_fill.get("oid")))
@@ -4121,7 +4123,7 @@ def _apply_quote_update(g, upd):
                       "\n（博主报成本損 → 止损已移到开仓价）" if upd["cost"] else ""))
             # 🆕 2026-11-12（用户硬要求：实盘绝对不能挂错）：实盘仓 → 撤临止损/换真实止损、挂止盈，
             #   挂完做**独立核对**（bracket_verify）；影子模式只记录计划。
-            if tr.get("real_layer") == "实盘" and _BEXEC_OK and not no_touch_block(coin, "止盈止损更新"):
+            if tr.get("real_layer") == "实盘" and _BEXEC_OK and not tr.get("pending_fill") and not no_touch_block(coin, "止盈止损更新"):
                 _sym = coin.upper() + "USDT"
                 try:
                     _qty = _real_qty_or_estimate(coin, tr)
@@ -4135,8 +4137,11 @@ def _apply_quote_update(g, upd):
                         _tps_ok = [t for t in (tr.get("tps") or [])
                                    if (t > tr["entry"] if tr["dir"] == "LONG" else t < tr["entry"])]
                         # 先撤掉旧的止盈限价单（开仓时可能是 2R 兜底单档），再按博主真实档位重挂
+                        # 🆕 2026-11-15（ARIA 事故）：只撤 **reduceOnly 的止盈单**；
+                        #   绝不能把还在等待成交的**入场限价单**一起撤掉（否则永远开不了仓）。
                         for _o in (bexec.open_orders(_sym) or []):
-                            if str(_o.get("type") or "").upper() == "LIMIT":
+                            if (str(_o.get("type") or "").upper() == "LIMIT"
+                                    and str(_o.get("reduceOnly")).lower() in ("true", "1")):
                                 try:
                                     bexec.cancel_order(_sym, _o.get("orderId"))
                                 except Exception:
