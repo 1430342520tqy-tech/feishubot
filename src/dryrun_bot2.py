@@ -520,7 +520,13 @@ def floating_pnl(open_pos):
 
 
 def check_float_alert(open_pos):
-    """逐笔浮亏 ≥ 该笔保证金的 30% → **只报警**（机器人不做任何操作）。"""
+    """逐笔浮亏 ≥ 该笔保证金的 30% → **只报警**（机器人不做任何操作）。
+
+    🆕 2026-11-22（用户要求）：浮亏告警可关闭（float_alert_pct=0 → 完全不发）；
+       **止损提醒不受影响**（止损成交结单、30 秒止损缺失校验仍照常）。
+    """
+    if float(FLOAT_ALERT_PCT[0]) <= 0:
+        return None
     for c, t in (open_pos or {}).items():
         v = _pos_pnl(c, t)
         if v is None or v >= 0:
@@ -5034,6 +5040,9 @@ def load_runtime():
                 PROV_STOP_PCT[0] = float(cfg["prov_stop_pct"])
             if "live_auto_confirm" in cfg:
                 LIVE_AUTO[0] = bool(cfg["live_auto_confirm"])
+            # 🆕 2026-11-22（用户要求）：浮亏告警阈值（0 = 关闭；止损提醒不受影响）
+            if cfg.get("float_alert_pct") is not None:
+                FLOAT_ALERT_PCT[0] = float(cfg["float_alert_pct"])
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
