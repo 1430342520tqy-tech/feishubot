@@ -2614,8 +2614,12 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
     lev = LEV
     L = []
     if pending_limit:
-        L.append("【实盘·限价单已挂出】%s/USDT 永续 · %s（**等待成交，未成交前不当作已开仓**）"
-                 % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
+        if _BEXEC_OK and bexec.LIVE[0]:
+            L.append("【实盘·限价单已挂出】%s/USDT 永续 · %s（**等待成交，未成交前不当作已开仓**）"
+                     % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
+        else:
+            L.append("【纸面·限价挂出（等待回踩）】%s/USDT 永续 · %s（**未成交前不记账**）"
+                     % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
     elif real_fill:
         L.append("【已开仓·实盘】%s/USDT 永续 · %s（**交易所成交已核对**）"
                  % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
@@ -4599,12 +4603,13 @@ def finalize_pending(open_pos):
                 PENDING.pop(coin, None)
                 continue
             _old_tr = open_pos.get(coin) or {}
-            if _old_tr.get("pending_fill") and _be_mode() == "实盘":
-                # 旧限价单一直没成交（按用户要求不自动撤单）→ 新信号到达时，用新信号替换旧挂单
-                try:
-                    bexec.cancel_all(coin.upper() + "USDT")
-                except Exception:
-                    pass
+            if _old_tr.get("pending_fill"):
+                # 旧限价单一直没成交 → 新信号到达：撤掉旧挂单（实盘），按新信号重新挂
+                if _be_mode() == "实盘":
+                    try:
+                        bexec.cancel_all(coin.upper() + "USDT")
+                    except Exception:
+                        pass
                 ENTRY_WATCH.pop(coin, None)
                 open_pos.pop(coin, None)
                 log("   ↳ %s 旧限价单未成交 → 新信号到达：已撤旧单，按新信号重新挂" % coin)
@@ -4701,6 +4706,13 @@ def finalize_pending(open_pos):
                     % (entry, _real_fill["qty"], _old_entry))
             else:
                 log("   ⚠️ [实盘] 未取到成交回报，消息按信号价展示（可在币安核对）")
+        # 🆕 2026-11-22（用户要求：统计必须真实）：纸面模式下 >0.5% 的限价单不再"立即按博主价成交"，
+        #   而是像实盘一样**等价格回踩到该价位才记账**；没触及就不算开仓。
+        _pending_limit = bool(_rplan and _rplan.get("watch_fill"))
+        if _be_mode() != "实盘" and entry_mode and not str(entry_mode).startswith("市价"):
+            _pending_limit = True
+            tr["pending_fill"] = True
+            log("   ↳ [纸面] 限价单挂出 %.8g → 等价格回踩成交（未触及不记账）" % float(entry))
         timing = ("⏱ 从信号发出到推送 共 %.1fs（发现 %.1fs / 抓图 %.1fs / 解析 %.1fs / 读图 %.1fs / 等齐后续消息+出单 %.1fs）"
                   % (age, tm["detect"], tm["img"], tm["parse"], tm["chart"],
                      max(0.0, age - tm["detect"] - tm["img"] - tm["parse"] - tm["chart"])))
@@ -4714,7 +4726,7 @@ def finalize_pending(open_pos):
                         add=p["add"], timing=timing, signal_entry=signal_entry,
                         signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode,
                         entry_orders=entry_orders, entry_note=entry_note,
-                        real_fill=_real_fill, pending_limit=bool(_rplan and _rplan.get("watch_fill")))
+                        real_fill=_real_fill, pending_limit=_pending_limit)
         _rp = fmt_real_plan(_rplan) if _rplan else ""
         if _rp:
             _txt += "\n\n" + _rp
@@ -7320,7 +7332,22 @@ def main():
             try:
                 for coin, tr in list(open_pos.items()):
                     if tr.get("pending_fill"):
-                        continue          # 实盘限价单还没成交 → 不跟踪止盈止损（等成交监听接管）
+                        if tr.get("real_layer") == "实盘":
+                            continue      # 实盘限价单：由 ENTRY_WATCH 监听成交
+                        # 🆕 2026-11-22（统计真实）：纸面限价单也必须等价格回踩到挂单价才成交
+                        _px0 = price_of(coin)
+                        _d0 = 1 if tr["dir"] == "LONG" else -1
+                        if _px0 is not None and ((_d0 == 1 and _px0 <= float(tr["entry"])) or
+                                                 (_d0 == -1 and _px0 >= float(tr["entry"]))):
+                            tr["pending_fill"] = False
+                            tr["t_open_ts"] = int(time.time())
+                            tr["t_open_iso"] = datetime.datetime.fromtimestamp(tr["t_open_ts"], CST).strftime("%Y-%m-%d %H:%M:%S")
+                            STATE_DIRTY[0] = True
+                            notify("【纸面·限价成交】%s %s 回踩到 %.8g → 已按限价记账（现价 %.8g）"
+                                   % (coin, tr["dir"], float(tr["entry"]), _px0))
+                            log("   ↳ [纸面] %s 限价单成交 @%.8g" % (coin, float(tr["entry"])))
+                        else:
+                            continue
                     # 🆕 2026-11-13（用户审核通过）：实盘一律以交易所为准（先执行、后通知）；
                     #   纸面不再按价格先结算、先发消息。
                     if tr.get("real_layer") == "实盘":
