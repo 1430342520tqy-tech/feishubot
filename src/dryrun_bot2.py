@@ -7385,8 +7385,17 @@ def main():
                     if stop is not None and (_px_stop - stop) * d <= 0:
                         pnl = (stop - tr["entry"]) * d / tr["entry"] * NOTIONAL * remaining
                         tr["realized"] = tr.get("realized", 0.0) + pnl
+                        # 🆕 2026-11-22：区分三种"止损" —— 原始止损 / TP1后保本 / 博主报成本損保本
+                        try:
+                            _is_be = (tr.get("entry") and abs(float(stop) - float(tr["entry"])) / float(tr["entry"]) < 1e-9)
+                        except Exception:
+                            _is_be = False
+                        if _is_be:
+                            _why_stop = "保本止损(TP1后)" if filled else "保本止损(成本損→开仓价)"
+                        else:
+                            _why_stop = "止损"
                         tr.update({"status": "CLOSED", "exit": stop,
-                                   "exit_why": ("止损" if not filled else "保本止损(TP1后)"),
+                                   "exit_why": _why_stop,
                                    "pnl": tr["realized"], "remaining": 0.0})
                         # 止损是 STOP_MARKET 触发后市价平 → taker
                         _add_fee(tr, NOTIONAL * remaining * (stop / tr["entry"]), FEE_TAKER, "止损平仓")
