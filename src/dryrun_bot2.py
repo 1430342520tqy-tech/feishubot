@@ -49,6 +49,7 @@ FIXED_LEV = [10]               # 固定金额模式：杠杆 10 倍 → 名义 9
 PROV_STOP_PCT = [5.0]          # "先开仓后补止損"时，按博主开仓价挂 5%（无杠杆）临止损
 LIVE_AUTO = [False]            # 🆕 实盘是否免人工确认（用户 2026-11-12 决定：是）
 LIVE_MAX_STOP_PCT = 8.0        # 🆕 单笔止损空间上限（%）；0=不限。全仓强平线另算（账户权益≤维持保证金）
+RISK_PER_TRADE = [50.0]        # 🆕 固定风险模式：每笔到止损最多亏 50U → 名义 = 50 / 止损%
 
 # 路径只有一个来源：`config.base()`（读环境变量 SIGNAL_BOT_BASE，默认生产路径）。
 BASE = config.base()
@@ -2615,9 +2616,12 @@ def parse_text(text):
 # ---------------- 通知格式 ----------------
 def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timing=None,
              signal_entry=None, signal_src=None, crossed=False, entry_mode="市价",
-             entry_orders=None, entry_note="", real_fill=None, pending_limit=False):
+             entry_orders=None, entry_note="", real_fill=None, pending_limit=False,
+             margin=None, notional=None, lev_override=None):
     d = 1 if (direction or "LONG").upper() == "LONG" else -1
-    lev = LEV
+    _m = float(margin) if margin is not None else MARGIN
+    _n = float(notional) if notional is not None else NOTIONAL
+    lev = int(lev_override) if lev_override is not None else LEV
     L = []
     if pending_limit:
         if _BEXEC_OK and bexec.LIVE[0]:
@@ -2633,7 +2637,7 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
         L.append("【已开单·纸面】%s/USDT 永续 · %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
     L.append("")
     L.append("来源：%s   信号时间：%s" % (src, when))
-    L.append("金额：保证金 %.0fU %d倍 = 名义 %.0fU" % (MARGIN, lev, NOTIONAL))
+    L.append("金额：保证金 %.0fU %d倍 = 名义 %.0fU" % (_m, lev, _n))
     L.append("开仓：")
     if pending_limit:
         L.append("限价单已挂出，成交后机器人会按交易所成交回报发【已开仓·实盘】")
@@ -2665,7 +2669,7 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
     ref = signal_entry if isinstance(signal_entry, (int, float)) and signal_entry else entry
     if isinstance(sl, (int, float)) and isinstance(entry, (int, float)) and entry:
         L.append("止损（挂单）：%.8g" % sl)
-        L.append("　　→ 按实际成交 %.2f%%（不含杠杆）· 约 %+.1fU" % ((sl - entry) / entry * 100 * d, (sl - entry) * d / entry * NOTIONAL))
+        L.append("　　→ 按实际成交 %.2f%%（不含杠杆）· 约 %+.1fU" % ((sl - entry) / entry * 100 * d, (sl - entry) * d / entry * _n))
         L.append("　　→ 含 %d 倍杠杆 %.2f%%（占保证金）" % (lev, (sl - entry) / entry * 100 * d * lev))
         if ref and abs(ref - entry) / entry > 0.0005:
             L.append("　　→ 博主止损收益率（不算杠杆）%.2f%%" % ((sl - ref) / ref * 100 * d))
@@ -2678,8 +2682,8 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
         for i, t in enumerate(tps[:TP_TIERS], 1):
             if isinstance(entry, (int, float)) and entry:
                 gross = (t - entry) / entry * 100 * d
-                tier_u = (t - entry) * d / entry * NOTIONAL / n
-                full_u = (t - entry) * d / entry * NOTIONAL
+                tier_u = (t - entry) * d / entry * _n / n
+                full_u = (t - entry) * d / entry * _n
                 L.append("止盈%d（挂单）：%.8g → 预期收益率 %+.2f%%（含 %d 倍杠杆）" % (i, t, gross * lev, lev))
                 L.append("　　　按权重 %s 分批 · 该档 约 %+.1fU · 若全平在此价 约 %+.1fU" % (_wstr, tier_u, full_u))
         extra = ""
@@ -4325,9 +4329,11 @@ def finalize_pending(open_pos):
                     log("   ↳ 博主未给止损 → 按第一止盈 %.8g 的一半反推止损 %.8g（2:1）"
                         % (float(_tp1), p["stop"]))
         if p["stop"] is None and not tps:
-            # 🆕 2026-11-12（用户规则 A）：先开仓后补止損 —— 固定金额模式下先挂 5%（无杠杆）临止损，
-            #    等博主止損卡到了由 _apply_quote_update 撤旧换新；固定风险模式则必须等止損卡才能定仓。
-            if SIZING_MODE[0] == "fixed" and isinstance(entry, (int, float)) and entry:
+            # 🆕 2026-11-12（用户规则 A）：先开仓后补止損 —— 先挂 5%（无杠杆）临止损，
+            #    等博主止損卡到了由 _apply_quote_update 撤旧换新。
+            # 🆕 2026-11-22：固定风险模式同样先用临止损定仓（5% → 风险 50U 反推名义），
+            #    止損卡到达后只换止损价、不改仓位。
+            if isinstance(entry, (int, float)) and entry:
                 _pp = round(float(entry) * (1 - _d0 * float(PROV_STOP_PCT[0]) / 100.0), 10)
                 p["stop"] = _pp
                 p["stop_src"] = "临止损 %.0f%%（等博主止損卡替换）" % PROV_STOP_PCT[0]
@@ -4468,11 +4474,16 @@ def finalize_pending(open_pos):
         over_cap = (len(open_pos) >= MAX_OPEN and coin not in open_pos)
         # ===== 总敞口上限（2026-09-15 风控）=====
         _exp = _current_exposure(open_pos)
-        if (not over_cap) and coin not in open_pos and _exp + MARGIN > _exposure_cap() + 1e-6:
+        _m_est = MARGIN
+        if SIZING_MODE[0] == "risk" and isinstance(entry, (int, float)) and p.get("stop"):
+            _spx = abs(float(entry) - float(p["stop"])) / float(entry)
+            if _spx > 0:
+                _m_est = (float(RISK_PER_TRADE[0]) / _spx) / float(LEV)
+        if (not over_cap) and coin not in open_pos and _exp + _m_est > _exposure_cap() + 1e-6:
             notify("【信号·熔断】%s 未开：加上它总敞口将达 %.0fU，超过上限 %.0fU\n"
                    "（当前敞口 %.0fU ｜ 要放宽可发「修改持仓上限 N」或调 max_total_margin）"
-                   % (coin, _exp + MARGIN, _exposure_cap(), _exp))
-            log("   🛑 总敞口超限：%.0f + %.0f > %.0f" % (_exp, MARGIN, _exposure_cap()))
+                   % (coin, _exp + _m_est, _exposure_cap(), _exp))
+            log("   🛑 总敞口超限：%.0f + %.0f > %.0f" % (_exp, _m_est, _exposure_cap()))
             PENDING.pop(coin, None)
             continue
         # ===== 审批闸门（用户 2026-09-15 第 12/13 条硬要求）=====
@@ -4650,8 +4661,19 @@ def finalize_pending(open_pos):
         tr["signal_ts"] = int(p["first_ts"])
         tr["t_open_ts"] = int(time.time())          # 实际开仓（成交）时刻
         tr["t_open_iso"] = datetime.datetime.fromtimestamp(tr["t_open_ts"], CST).strftime("%Y-%m-%d %H:%M:%S")
-        tr["margin"], tr["lev"], tr["notional"] = MARGIN, LEV, NOTIONAL
-        _add_fee(tr, NOTIONAL, (FEE_TAKER if entry_mode == "市价" else FEE_MAKER),
+        # 🆕 2026-11-22（用户要求）：固定风险模式 —— 每笔到止损最多亏 risk_per_trade（默认 50U），
+        #   名义 = 风险 / 止损%；保证金 = 名义 / 杠杆。固定金额模式保持不变（代码保留）。
+        _margin, _lev, _notional = MARGIN, LEV, NOTIONAL
+        if SIZING_MODE[0] == "risk" and isinstance(entry, (int, float)) and p.get("stop"):
+            _sp_r = abs(float(entry) - float(p["stop"])) / float(entry) if entry else 0
+            if _sp_r > 0:
+                _notional = float(RISK_PER_TRADE[0]) / _sp_r
+                _lev = LEV
+                _margin = _notional / _lev
+                log("   ↳ [固定风险] 止损 %.2f%% → 名义 %.0fU · 保证金 %.0fU（到止损风险 %.0fU）"
+                    % (_sp_r * 100, _notional, _margin, RISK_PER_TRADE[0]))
+        tr["margin"], tr["lev"], tr["notional"] = _margin, _lev, _notional
+        _add_fee(tr, _notional, (FEE_TAKER if entry_mode == "市价" else FEE_MAKER),
                  "开仓(%s)" % entry_mode)
         # ===== 建/更新纸面仓：标真实层（二轮 F3 根因修复，实现见 _mark_real_layer）=====
         # 病根：这一行原来直接写 `tr["real_layer"] = _be_mode()`，只看 LIVE 开关 →
@@ -4659,7 +4681,7 @@ def finalize_pending(open_pos):
         #   （一轮注释里"手工仓进不了 open_pos"这个前提是错的）。
         #   现在命中 no_touch 就强制标"影子"（只做纸面），双保险见那 4 处 no_touch_block。
         _mark_real_layer(coin, tr)
-        _rplan = real_plan_open(coin, dirc, entry, p["stop"], tps, entry_mode=entry_mode)   # 影子模式：只生成计划
+        _rplan = real_plan_open(coin, dirc, entry, p["stop"], tps, entry_mode=entry_mode, margin=_margin)   # 影子模式：只生成计划
         # 🆕 2026-11-13（先执行后通知）：记录真实止盈单号 + 成交时间游标，供实盘监控核对
         try:
             _prot = (_rplan or {}).get("protection") or {}
@@ -4673,7 +4695,7 @@ def finalize_pending(open_pos):
             _slp = _prot.get("sl")
             tr["real_sl_id"] = (_slp.get("algoId") if isinstance(_slp, dict) else None)
             tr["_ut_ms"] = int(time.time() * 1000)
-            tr["fill_qty"] = (NOTIONAL / float(entry)) if entry else None
+            tr["fill_qty"] = (_notional / float(entry)) if entry else None
             tr.setdefault("realized", 0.0)
         except Exception:
             pass
@@ -4711,7 +4733,7 @@ def finalize_pending(open_pos):
                 _old_entry = entry
                 entry = _real_fill["price"]
                 tr["entry"] = entry
-                tr["fill_qty"] = _real_fill["qty"] or ((NOTIONAL / entry) if entry else None)
+                tr["fill_qty"] = _real_fill["qty"] or ((_notional / entry) if entry else None)
                 log("   ↳ [实盘] 交易所成交回报：均价 %s 数量 %s（信号价 %s）"
                     % (entry, _real_fill["qty"], _old_entry))
             else:
@@ -4736,7 +4758,8 @@ def finalize_pending(open_pos):
                         add=p["add"], timing=timing, signal_entry=signal_entry,
                         signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode,
                         entry_orders=entry_orders, entry_note=entry_note,
-                        real_fill=_real_fill, pending_limit=_pending_limit)
+                        real_fill=_real_fill, pending_limit=_pending_limit,
+                        margin=_margin, notional=_notional, lev_override=_lev)
         _rp = fmt_real_plan(_rplan) if _rplan else ""
         if _rp:
             _txt += "\n\n" + _rp
@@ -5036,6 +5059,8 @@ def load_runtime():
             # 🆕 2026-11-12（用户规则）：定仓方式与临止损
             if cfg.get("sizing_mode") in ("fixed", "risk"):
                 SIZING_MODE[0] = cfg["sizing_mode"]
+            if cfg.get("risk_per_trade") is not None:
+                RISK_PER_TRADE[0] = float(cfg["risk_per_trade"])
             if cfg.get("fixed_margin"):
                 FIXED_MARGIN[0] = float(cfg["fixed_margin"])
             if cfg.get("fixed_leverage"):
@@ -7398,7 +7423,7 @@ def main():
                             log("   ↳ 单目标止盈：价格已走 5%% → 止损移到开仓价（保本）")
                     # ① 止损优先（用标记价判断，与币安 STOP_MARKET 触发口径一致）
                     if stop is not None and (_px_stop - stop) * d <= 0:
-                        pnl = (stop - tr["entry"]) * d / tr["entry"] * NOTIONAL * remaining
+                        pnl = (stop - tr["entry"]) * d / tr["entry"] * float(tr.get("notional") or NOTIONAL) * remaining
                         tr["realized"] = tr.get("realized", 0.0) + pnl
                         # 🆕 2026-11-22：区分三种"止损" —— 原始止损 / TP1后保本 / 博主报成本損保本
                         try:
@@ -7413,7 +7438,7 @@ def main():
                                    "exit_why": _why_stop,
                                    "pnl": tr["realized"], "remaining": 0.0})
                         # 止损是 STOP_MARKET 触发后市价平 → taker
-                        _add_fee(tr, NOTIONAL * remaining * (stop / tr["entry"]), FEE_TAKER, "止损平仓")
+                        _add_fee(tr, float(tr.get("notional") or NOTIONAL) * remaining * (stop / tr["entry"]), FEE_TAKER, "止损平仓")
                         _stat_close(tr)
                         with open(TRADES, "a", encoding="utf-8") as f:
                             f.write(json.dumps(tr, ensure_ascii=False) + "\n")
@@ -7455,10 +7480,10 @@ def main():
                                   ([0.5, 0.5] if len(tps) == 2 else [2.0 / 5, 2.0 / 5, 1.0 / 5]))
                             part = _w[hit_i] if hit_i < len(_w) else 1.0 / max(len(tps), 1)
                         tp = tps[hit_i]
-                        pnl = (tp - tr["entry"]) * d / tr["entry"] * NOTIONAL * part
+                        pnl = (tp - tr["entry"]) * d / tr["entry"] * float(tr.get("notional") or NOTIONAL) * part
                         tr["realized"] = tr.get("realized", 0.0) + pnl
                         # 止盈是【限价单】成交 → maker 万2；成交名义按成交价算
-                        _add_fee(tr, NOTIONAL * part * (tp / tr["entry"]), FEE_MAKER, "止盈%d" % (hit_i + 1))
+                        _add_fee(tr, float(tr.get("notional") or NOTIONAL) * part * (tp / tr["entry"]), FEE_MAKER, "止盈%d" % (hit_i + 1))
                         filled.append(hit_i)
                         remaining = max(0.0, remaining - part)
                         tr["remaining"] = remaining
