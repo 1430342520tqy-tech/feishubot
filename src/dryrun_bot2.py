@@ -4484,15 +4484,18 @@ def finalize_pending(open_pos):
         # 🆕 2026-11-12（用户硬要求）：实盘前逐项核对 —— 用到的每个价格数字必须能在原文里找到，
         #   找不到就不开（防 AI 编造 / 点数换算过的值直接进实盘）。
         if _be_mode() == "实盘":
-            # 🆕 防强平闸：10 倍杠杆下，止损空间超过 8.5% 会先被强平（强平距离≈1/10−维持保证金）。
+            # 🆕 防强平闸：按**当前杠杆**动态计算（强平距离≈1/杠杆−维持保证金）。
+            #   10x → ≈8.5%；20x → ≈4.25%。止损空间超过它会被先强平 → 实盘拒绝自动开。
+            _max_sp = min(float(LIVE_MAX_STOP_PCT), 85.0 / max(1.0, float(FIXED_LEV[0] if SIZING_MODE[0] == "fixed" else LEV)))
             if p.get("entry") and p.get("stop"):
                 _sp = abs(float(p["entry"]) - float(p["stop"])) / float(p["entry"])
-                if _sp * 100.0 > LIVE_MAX_STOP_PCT:
+                if _sp * 100.0 > _max_sp:
                     notify("【信号·拒绝·实盘】%s 止损空间 %.1f%% 在 %d 倍杠杆下**可能先被强平**"
-                           "（阈值 %.1f%%）→ 不自动开；如需交易请先降杠杆或人工处理\n原文：%s"
-                           % (coin, _sp * 100.0, FIXED_LEV[0], LIVE_MAX_STOP_PCT,
+                           "（当前杠杆安全阈值 %.2f%%）→ 不自动开；如需交易请降杠杆或人工处理\n原文：%s"
+                           % (coin, _sp * 100.0, int(FIXED_LEV[0] if SIZING_MODE[0] == "fixed" else LEV), _max_sp,
                               (p["texts"][0][:140] if p.get("texts") else "")))
-                    log("   ⛔ 实盘拒绝：止损空间 %.2f%% 超过 %.1f%%（10x 强平风险）" % (_sp * 100.0, LIVE_MAX_STOP_PCT))
+                    log("   ⛔ 实盘拒绝：止损空间 %.2f%% 超过 %.2f%%（%dx 强平风险）"
+                        % (_sp * 100.0, _max_sp, int(FIXED_LEV[0] if SIZING_MODE[0] == "fixed" else LEV)))
                     PENDING.pop(coin, None)
                     continue
             _raw = " ".join(p.get("texts") or [])
