@@ -48,7 +48,7 @@ FIXED_MARGIN = [90.0]          # 固定金额模式：保证金 90U
 FIXED_LEV = [10]               # 固定金额模式：杠杆 10 倍 → 名义 900U
 PROV_STOP_PCT = [5.0]          # "先开仓后补止損"时，按博主开仓价挂 5%（无杠杆）临止损
 LIVE_AUTO = [False]            # 🆕 实盘是否免人工确认（用户 2026-11-12 决定：是）
-LIVE_MAX_STOP_PCT = 8.5        # 🆕 10 倍杠杆下，止损空间超过该值会被强平 → 实盘拒绝自动开
+LIVE_MAX_STOP_PCT = 8.0        # 🆕 单笔止损空间上限（%）；0=不限。全仓强平线另算（账户权益≤维持保证金）
 
 # 路径只有一个来源：`config.base()`（读环境变量 SIGNAL_BOT_BASE，默认生产路径）。
 BASE = config.base()
@@ -4484,18 +4484,19 @@ def finalize_pending(open_pos):
         # 🆕 2026-11-12（用户硬要求）：实盘前逐项核对 —— 用到的每个价格数字必须能在原文里找到，
         #   找不到就不开（防 AI 编造 / 点数换算过的值直接进实盘）。
         if _be_mode() == "实盘":
-            # 🆕 防强平闸：按**当前杠杆**动态计算（强平距离≈1/杠杆−维持保证金）。
-            #   10x → ≈8.5%；20x → ≈4.25%。止损空间超过它会被先强平 → 实盘拒绝自动开。
-            _max_sp = min(float(LIVE_MAX_STOP_PCT), 85.0 / max(1.0, float(FIXED_LEV[0] if SIZING_MODE[0] == "fixed" else LEV)))
-            if p.get("entry") and p.get("stop"):
+            # 🆕 2026-11-22：防强平闸 = **单笔止损空间上限**（不是组合强平线）。
+            #   全仓下真正的强平线由"账户权益 ≤ 维持保证金"决定（当前账户 1209U、满仓 7 笔约需整体逆向 13%）。
+            #   这里限制的是"单笔止损最多能有多宽"，默认 8%（亏损≈96U），仍远早于强平。
+            #   可通过 runtime 的 live_max_stop_pct 调整；0 = 不限制（不建议）。
+            _max_sp = float(LIVE_MAX_STOP_PCT)
+            if p.get("entry") and p.get("stop") and _max_sp > 0:
                 _sp = abs(float(p["entry"]) - float(p["stop"])) / float(p["entry"])
                 if _sp * 100.0 > _max_sp:
-                    notify("【信号·拒绝·实盘】%s 止损空间 %.1f%% 在 %d 倍杠杆下**可能先被强平**"
-                           "（当前杠杆安全阈值 %.2f%%）→ 不自动开；如需交易请降杠杆或人工处理\n原文：%s"
-                           % (coin, _sp * 100.0, int(FIXED_LEV[0] if SIZING_MODE[0] == "fixed" else LEV), _max_sp,
+                    notify("【信号·拒绝·实盘】%s 止损空间 %.1f%% 超过单笔上限 %.1f%%"
+                           "（约亏 %.0fU）→ 不自动开；如需交易请人工处理或调整 live_max_stop_pct\n原文：%s"
+                           % (coin, _sp * 100.0, _max_sp, NOTIONAL * _sp,
                               (p["texts"][0][:140] if p.get("texts") else "")))
-                    log("   ⛔ 实盘拒绝：止损空间 %.2f%% 超过 %.2f%%（%dx 强平风险）"
-                        % (_sp * 100.0, _max_sp, int(FIXED_LEV[0] if SIZING_MODE[0] == "fixed" else LEV)))
+                    log("   ⛔ 实盘拒绝：止损空间 %.2f%% 超过单笔上限 %.2f%%" % (_sp * 100.0, _max_sp))
                     PENDING.pop(coin, None)
                     continue
             _raw = " ".join(p.get("texts") or [])
@@ -4989,7 +4990,7 @@ HELP_TEXT = """【机器人指令】在「跟单」群里直接发（短消息�
 
 
 def load_runtime():
-    global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE, STRICT_LIMIT_GROUPS, MAX_OPEN
+    global GROUPS, MARGIN, LEV, NOTIONAL, TEST_MODE, STRICT_LIMIT_GROUPS, MAX_OPEN, LIVE_MAX_STOP_PCT
     global MAX_CONSEC_LOSS, DAILY_LOSS_LIMIT, MAX_TOTAL_MARGIN, SILENCE_ALERT_H, FETCH_MODE
     try:
         if os.path.exists(RUNTIME):
@@ -5044,6 +5045,8 @@ def load_runtime():
             if "live_auto_confirm" in cfg:
                 LIVE_AUTO[0] = bool(cfg["live_auto_confirm"])
             # 🆕 2026-11-22（用户要求）：浮亏告警阈值（0 = 关闭；止损提醒不受影响）
+            if cfg.get("live_max_stop_pct") is not None:
+                LIVE_MAX_STOP_PCT = float(cfg["live_max_stop_pct"])
             if cfg.get("float_alert_pct") is not None:
                 FLOAT_ALERT_PCT[0] = float(cfg["float_alert_pct"])
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
