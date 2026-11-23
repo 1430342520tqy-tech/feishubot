@@ -847,20 +847,35 @@ def watch_entries():
                         t["qty"] = bexec.fmt_qty(w["sym"], _q)
                 except Exception:
                     pass
-                _res = bexec.after_entry_filled(w["sym"], w["dir"], _tps, w.get("stop"), filled_qty)
                 _tr = open_pos_ref.get(coin)
+                _stop_use = w.get("stop")
+                if not _stop_use and (avg_px or w.get("assumed_entry")):
+                    _d0 = 1 if w["dir"] == "LONG" else -1
+                    _stop_use = round(float(avg_px or w.get("assumed_entry")) * (1 - _d0 * 0.05), 10)
+                    if _tr is not None:
+                        _tr["sl"] = _stop_use
+                        _tr["sl_provisional"] = True
+                        _tr["stop_src"] = "临止损5%（等博主卡片替换）"
+                    log("   ↳ [实盘] 成交时卡片未到 → 先挂 5%% 硬止损 %.8g" % _stop_use)
+                _res = bexec.after_entry_filled(w["sym"], w["dir"], _tps, _stop_use, filled_qty)
                 if _tr is not None:
                     _tr["entry"] = avg_px or _tr.get("entry")
                     _tr["pending_fill"] = False
                     _tr["fill_qty"] = filled_qty
                     _tr["fill_px"] = avg_px
                     STATE_DIRTY[0] = True
+                    # 🆕 2026-11-23：成交后若止损卡已到且空间>5.5% → 立即减仓到 50U 风险
+                    if w.get("stop"):
+                        try:
+                            _card_apply(coin, _tr, w.get("stop"))
+                        except Exception as _e:
+                            log("   ⚠️ 成交后卡片处理异常 %s" % str(_e)[:120])
                 # ⚠️ 评估 M2（我自己写错的）：绝不能丢弃返回值、无条件报"已挂"。
                 _sl_res = (_res or {}).get("sl")
                 _sl_ok = isinstance(_sl_res, dict) and not _sl_res.get("err")
                 _tps_ok = sum(1 for x in ((_res or {}).get("tps") or [])
                               if not (isinstance(x, dict) and x.get("err")))
-                if w.get("stop") and not _sl_ok:
+                if _stop_use and not _sl_ok:
                     _live_alert("成交后挂止损", coin, str(_sl_res)[:180],
                                 "仓位已真实成交（数量 %s 均价 %.8g）但止损未确认成功" % (filled_qty, avg_px))
                     notify("【实盘·成交但要你处理】%s %s 已成交\n成交均价 %.8g ｜ 数量 %s\n"
@@ -874,7 +889,7 @@ def watch_entries():
                            "成交均价 **%.8g** ｜ 数量 %s ｜ 名义约 %.0fU（保证金 %.0fU × %d倍）\n"
                            "已挂：止盈 %d/%d 档（限价）+ 止损 %s（Algo STOP_MARKET）"
                            % (coin, w["dir"], avg_px, filled_qty, filled_qty * avg_px, MARGIN, LEV,
-                              _tps_ok, len(_tps), w.get("stop")))
+                              _tps_ok, len(_tps), _stop_use))
                     log("   ✅ [实盘成交] %s 均价 %.8g 数量 %s → 止盈 %d/%d 档 + 止损已挂"
                         % (coin, avg_px, filled_qty, _tps_ok, len(_tps)))
                 ENTRY_WATCH.pop(coin, None)
@@ -1395,6 +1410,15 @@ def _live_finalize(coin, tr, open_pos, why):
     log("   ✅ [实盘·已结单] %s %s @%s（交易所确认）" % (coin, tr["dir"], exit_px))
 
 
+def _be_index(n):
+    """保本损触发档位（用户 2026-11-23）：3档→TP2 成交后；2档→TP1 成交后；1档→不挂保本损（全部止盈）"""
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    return 1 if n >= 3 else (0 if n == 2 else None)
+
+
 def _monitor_live(coin, tr, open_pos):
     """实盘仓监控：一切以交易所为准 —— 先确认成交/持仓，再更新纸面并通知。
 
@@ -1446,12 +1470,12 @@ def _monitor_live(coin, tr, open_pos):
                    "实际已实现：%+.2fU ｜ 交易所剩余：%.0f%%"
                    % (coin, tr["dir"], i + 1, px, q, oid, tr.get("realized", 0.0), tr["remaining"] * 100))
             log("   ✅ [实盘] TP%d 成交确认 @%s qty=%s → 剩余 %s" % (i + 1, px, q, qn))
-            if i == 0:
+            if _be_index(len(tr.get("tps") or [])) == i:
                 tr["sl"] = tr["entry"]
                 try:
                     _rq = _real_qty_or_estimate(coin, tr)
                     bexec.sync_sl(sym, tr["dir"], tr["sl"], _rq)
-                    log("   ↳ [实盘] TP1 后止损已移到开仓价（已核对）")
+                    log("   ↳ [实盘] 第%d档止盈后止损已移到开仓价（已核对）" % (i + 1))
                 except Exception as _e:
                     _live_alert("TP1后移保本", coin, _e, "真实止损可能未更新，请人工核对")
             if qn <= 0:
@@ -2690,7 +2714,7 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
         elif crossed:
             extra = "（注：有止盈价已被现价越过）"
         L.append("")
-        L.append("规则：TP1 成交后止损移到开仓价（保本损）" + extra)
+        L.append("规则：3档→TP2成交后移保本；2档→TP1成交后移保本；1档→全部止盈不平移" + extra)
     else:
         L.append("")
         L.append("规则：止盈图上/卡片/文字都没读到，暂不挂（等你确认）")
@@ -4131,29 +4155,16 @@ def _card_apply(coin, tr, new_stop):
     target_n = risk / sp
     target_m = target_n / float(LEV)
     if tr.get("pending_fill"):
-        try:
-            bexec.cancel_all(sym)
-        except Exception:
-            pass
-        try:
-            r = bexec.limit_open(sym, tr["dir"], entry, target_n, float(LEV))
-        except Exception as e:
-            _live_alert("卡片重挂限价", coin, e)
-            return
-        tr["notional"] = target_n
-        tr["margin"] = target_m
-        tr["lev"] = LEV
+        # 🆕 2026-11-23（ZEC 事故后修正）：**绝不撤还在等成交的入场限价单**。
+        #   卡片只更新"成交后要用的止损/止盈"，成交后由 watch_entries 按 5% 硬止损 + 博主止盈建仓，
+        #   再按止损空间决定减仓/不动。
         w = ENTRY_WATCH.get(coin)
         if w:
-            if isinstance(r, dict) and r.get("orderId"):
-                w["order_ids"] = [r["orderId"]]
             w["stop"] = stop
             w["tps"] = tr.get("tps") or w.get("tps")
-            _dl = int(tr.get("signal_ts") or time.time()) + FILL_TIMEOUT
-            w["deadline"] = _dl
-        notify("【卡片·重挂限价】%s 止损空间 %.2f%% → 名义 %.0fU/保证金 %.0fU（风险 %.0fU），"
-               "仍挂博主价 %.8g；4 小时内未成交撤单" % (coin, sp * 100, target_n, target_m, risk, entry))
-        log("   ↳ [卡片] %s 限价未成交 → 撤旧单，按风险 %.0fU 重挂 名义 %.0fU" % (coin, risk, target_n))
+        log("   ↳ [卡片] %s 限价单未成交 → **保留原限价单**，只记录止损 %.8g，成交后再处理" % (coin, stop))
+        notify("【卡片·已收到】%s 止损=%.8g ｜ 止盈=%s\n入场限价单**继续保留**（不撤单），成交后再按规则处理。"
+               % (coin, stop, "、".join("%.8g" % t for t in (tr.get("tps") or [])) or "未读到"))
         return
     if sp <= 0.055:
         return
@@ -4174,6 +4185,25 @@ def _card_apply(coin, tr, new_stop):
             bexec.sync_sl(sym, tr["dir"], stop, _real_qty_or_estimate(coin, tr))
         except Exception as e:
             _live_alert("减仓后止损", coin, e)
+        # 减仓后按剩余数量重挂止盈（撤掉旧的 reduceOnly 限价单，避免数量超仓）
+        try:
+            _q = _real_qty_or_estimate(coin, tr)
+            for _o in (bexec.open_orders(sym) or []):
+                if (str(_o.get("type") or "").upper() == "LIMIT"
+                        and str(_o.get("reduceOnly")).lower() in ("true", "1")):
+                    try:
+                        bexec.cancel_order(sym, _o.get("orderId"))
+                    except Exception:
+                        pass
+            _tps_ok = [t for t in (tr.get("tps") or []) if (t > entry if d == 1 else t < entry)]
+            _parts = bexec.split_tp_qty_w(sym, _q, _tps_ok)
+            _ids = []
+            for _t, _qq in zip(_tps_ok, _parts):
+                _rr = bexec.place_tp_limit(sym, tr["dir"], _t, _qq)
+                _ids.append((_rr or {}).get("orderId") if isinstance(_rr, dict) else None)
+            tr["real_tp_ids"] = _ids
+        except Exception as e:
+            _live_alert("减仓后重挂止盈", coin, e)
     else:
         try:
             px = price_of(coin) or entry
@@ -4399,14 +4429,26 @@ def finalize_pending(open_pos):
             elif abs(diff) <= 0.005:
                 entry_note = "现价与博主开仓价相差 %.2f%%（≤0.5%%），直接市价开" % (diff * 100)
             elif (dirc0 == "LONG" and diff < 0) or (dirc0 == "SHORT" and diff > 0):
-                # >0.5% 且对我们不利 → 按博主价挂限价等回踩（用户 2026-11-14 改为 0.5% 阈值）
-                entry_orders = [{"kind": "限价", "price": signal_entry, "margin": MARGIN}]
+                # 🆕 2026-11-23（用户规则）：
+                #   · 不利幅度 >3% → 不开仓
+                #   · 0.5% < 不利幅度 ≤3% → 限价挂在「不利幅度的一半」处
+                _adv = ((mkt - signal_entry) / signal_entry) if dirc0 == "LONG" \
+                    else ((signal_entry - mkt) / signal_entry)
+                if _adv > 0.03:
+                    notify("【信号·放弃】%s 追单不利 **%.2f%% > 3%%** → 按规则**不开仓**\n"
+                           "（博主价 %.8g ｜ 现价 %.8g）" % (coin, _adv * 100, signal_entry, mkt))
+                    log("   ⛔ 追单不利 %.2f%% >3%% → 放弃 %s" % (_adv * 100, coin))
+                    PENDING.pop(coin, None)
+                    continue
+                _limit_px = (signal_entry * (1 + _adv / 2.0)) if dirc0 == "LONG" \
+                    else (signal_entry * (1 - _adv / 2.0))
+                entry_orders = [{"kind": "限价", "price": _limit_px, "margin": MARGIN}]
                 entry_mode = "限价（等回踩）"
-                entry = signal_entry
-                entry_note = ("现价 %.8g 与博主价 %.8g 相差 %.2f%%（>0.5%% 且不利）→ **按博主价挂限价等回踩**"
-                              % (mkt, signal_entry, abs(diff) * 100))
-                log("   ↳ 差值 %.2f%% >0.5%% 且不利 → 按博主价挂限价 %.8g（现价 %.8g）"
-                    % (abs(diff) * 100, signal_entry, mkt))
+                entry = _limit_px
+                entry_note = ("现价 %.8g 比博主价 %.8g 不利 %.2f%%（>0.5%%）→ **限价挂在不利幅度的一半**：%.8g"
+                              % (mkt, signal_entry, _adv * 100, _limit_px))
+                log("   ↳ 不利 %.2f%%（0.5%%~3%%）→ 限价挂一半处 %.8g（博主价 %.8g）"
+                    % (_adv * 100, _limit_px, signal_entry))
             elif signal_entry:
                 entry_note = ("现价 %.8g 比博主价 %.8g 更有利（相差 %.2f%% >0.5%%）→ 直接市价"
                               % (mkt, signal_entry, abs(diff) * 100))
@@ -4811,7 +4853,7 @@ def finalize_pending(open_pos):
                                  "tps": _rplan.get("tps") or [], "stop": p["stop"],
                                  "legs": _rplan.get("entry_legs") or [],
                                  "assumed_entry": entry,
-                                 "deadline": time.time() + FILL_TIMEOUT}
+                                 "deadline": int(p.get("first_ts") or time.time()) + FILL_TIMEOUT}
             tr["pending_fill"] = True
             log("   ↳ [实盘] 限价单已挂出，等待成交（%d 分钟内未成交会自动撤单并通知）"
                 % (FILL_TIMEOUT // 60))
@@ -7594,7 +7636,7 @@ def main():
                         # 标记“纸面刚变动” → 周期对账会给真实成交留 RECON_GRACE 秒宽限期，
                         # 免得刚记账就报“数量不符”（假警报）
                         tr["_paper_changed"] = time.time()
-                        if hit_i == 0 and tr["entry"]:            # TP1 后止损移保本
+                        if _be_index(len(tps)) == hit_i and tr["entry"]:  # 3档TP2后/2档TP1后/1档不移
                             tr["sl"] = tr["entry"]
                             stop = tr["entry"]
                         with open(TRADES, "a", encoding="utf-8") as f:
@@ -7602,7 +7644,7 @@ def main():
                         nxt = next((tps[j] for j in range(len(tps)) if j not in filled), None)
                         notify("【止盈成交·纸面】%s %s\nTP%d 成交 @%.8g（平%.0f%%）\n该档盈亏：%+.1fU · 累计：%+.1fU\n剩余仓位：%.0f%%%s"
                                % (coin, tr["dir"], hit_i + 1, tp, part * 100, pnl, tr["realized"], remaining * 100,
-                                  ("\n止损已移到开仓价 %.8g（保本损）" % stop) if hit_i == 0 else ""))
+                                  ("\n止损已移到开仓价 %.8g（保本损）" % stop) if _be_index(len(tps)) == hit_i else ""))
                         if _BEXEC_OK and tr.get("real_layer") == "实盘" and no_touch_block(coin, "止损同步（TP 后）"):
                             # 🆕 2026-09-18 归属待确认 + 二轮 F3：不动这个币的真实挂单
                             #   （sync_sl 会按数量改真实止损；数量差很大时改的可能正是用户手工仓的止损单）。
