@@ -6447,8 +6447,102 @@ def position_sanity(open_pos, notify_user=True):
     return bad
 
 
+def _income_sum(start_ms, end_ms):
+    """交易所已实现盈亏（REALIZED_PNL + 手续费 + 资金费），按币种汇总。"""
+    out = {}
+    if not _BEXEC_OK:
+        return out
+    cur = int(start_ms)
+    while cur < end_ms:
+        nxt = min(int(end_ms), cur + 7 * 86400000)
+        try:
+            rows = bexec._req("GET", "/fapi/v1/income",
+                              {"startTime": cur, "endTime": nxt, "limit": 1000}, signed=True) or []
+        except Exception:
+            rows = []
+        for r in rows:
+            if r.get("incomeType") not in ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE"):
+                continue
+            sym = r.get("symbol") or "-"
+            out[sym] = out.get(sym, 0.0) + float(r.get("income") or 0)
+        cur = nxt
+    return out
+
+
+def _day_start_ms(ts=None):
+    lt = time.localtime(ts or time.time())
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)) * 1000)
+
+
+def _daily_report():
+    """每天 10:00 发到「跟单」群的简明统计（盈亏以交易所实收为准，含手续费/资金费）。"""
+    now = time.time()
+    today = _income_sum(_day_start_ms(now), int(now * 1000))
+    cum = _income_sum(int(time.mktime((2026, 9, 1, 0, 0, 0, 0, 0, -1)) * 1000), int(now * 1000))
+    dstr = time.strftime("%m-%d", time.localtime(now))
+    opens = []
+    try:
+        for line in open(TRADES, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            if str(r.get("t_open") or "").startswith(dstr) and r.get("status") == "OPEN":
+                opens.append("%s %s %.8g" % (r.get("coin"), "多" if r.get("dir") == "LONG" else "空",
+                                             float(r.get("entry") or 0)))
+    except Exception:
+        pass
+    L = ["【每日统计】" + dstr]
+    L.append("今日开单：" + ("、".join(sorted(set(opens))) if opens else "无"))
+    tp = {k: v for k, v in today.items() if abs(v) > 0.0001}
+    if tp:
+        L.append("今日盈亏（交易所实收）：" + " ｜ ".join("%s %+.2fU" % (k, v) for k, v in sorted(tp.items())))
+    else:
+        L.append("今日盈亏（交易所实收）：0.00U")
+    L.append("今日合计：%+.2fU" % sum(today.values()))
+    L.append("累计（含手续费/资金费）：%+.2fU" % sum(cum.values()))
+    L.append("当前持仓：")
+    had = False
+    for c, tr in list(open_pos.items()):
+        had = True
+        amt, up = 0.0, 0.0
+        try:
+            if _BEXEC_OK:
+                pos = bexec.position_of(c.upper() + "USDT", tr.get("dir") or "LONG")
+                amt = abs(float((pos or {}).get("positionAmt") or 0))
+                up = float((pos or {}).get("unRealizedProfit") or 0)
+        except Exception:
+            pass
+        L.append("· %s %s %.8g ｜ 数量 %.3f ｜ 浮盈 %+.2fU"
+                 % (c, "多" if (tr.get("dir") or "LONG") == "LONG" else "空",
+                    float(tr.get("entry") or 0), amt, up))
+    if not had:
+        L.append("无")
+    notify("\n".join(L))
+    log("   📊 每日统计已发送")
+
+
+def _daily_report_loop():
+    sent = set()
+    while True:
+        try:
+            lt = time.localtime()
+            key = time.strftime("%Y-%m-%d", lt)
+            if lt.tm_hour == 10 and lt.tm_min < 10 and key not in sent:
+                _daily_report()
+                sent.add(key)
+        except Exception as e:
+            log("每日统计异常：%s" % str(e)[:120])
+        time.sleep(30)
+
+
 def main():
     log("==== dryRun 机器人 v2 启动（每群独立标签页）====")
+    try:
+        threading.Thread(target=_daily_report_loop, daemon=True).start()
+        log("   📊 每日统计线程已启动（每天 10:00 发跟单群）")
+    except Exception as _e:
+        log("   ⚠️ 每日统计线程启动失败：%s" % str(_e)[:120])
     last_id = {}
     open_pos = open_pos_ref          # 指令系统与主循环共用同一个持仓字典
     load_runtime()
