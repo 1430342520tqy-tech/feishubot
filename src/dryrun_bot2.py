@@ -6478,7 +6478,7 @@ def _daily_report():
     """每天 10:00 发到「跟单」群的简明统计（盈亏以交易所实收为准，含手续费/资金费）。"""
     now = time.time()
     today = _income_sum(_day_start_ms(now), int(now * 1000))
-    cum = _income_sum(int(time.mktime((2026, 9, 1, 0, 0, 0, 0, 0, -1)) * 1000), int(now * 1000))
+    cum = _income_sum(int(time.mktime((2026, 11, 22, 0, 0, 0, 0, 0, -1)) * 1000), int(now * 1000))
     dstr = time.strftime("%m-%d", time.localtime(now))
     opens = []
     try:
@@ -6500,7 +6500,7 @@ def _daily_report():
     else:
         L.append("今日盈亏（交易所实收）：0.00U")
     L.append("今日合计：%+.2fU" % sum(today.values()))
-    L.append("累计（含手续费/资金费）：%+.2fU" % sum(cum.values()))
+    L.append("累计（11-22 实盘以来，含手续费/资金费）：%+.2fU" % sum(cum.values()))
     L.append("当前持仓：")
     had = False
     for c, tr in list(open_pos.items()):
@@ -6528,7 +6528,7 @@ def _daily_report_loop():
         try:
             lt = time.localtime()
             key = time.strftime("%Y-%m-%d", lt)
-            if lt.tm_hour == 10 and lt.tm_min < 10 and key not in sent:
+            if lt.tm_hour == 22 and lt.tm_min < 10 and key not in sent:
                 _daily_report()
                 sent.add(key)
         except Exception as e:
@@ -6540,7 +6540,7 @@ def main():
     log("==== dryRun 机器人 v2 启动（每群独立标签页）====")
     try:
         threading.Thread(target=_daily_report_loop, daemon=True).start()
-        log("   📊 每日统计线程已启动（每天 10:00 发跟单群）")
+        log("   📊 每日统计线程已启动（每天 22:00 发跟单群，累计从 11-22 实盘起算）")
     except Exception as _e:
         log("   ⚠️ 每日统计线程启动失败：%s" % str(_e)[:120])
     last_id = {}
