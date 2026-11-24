@@ -2636,6 +2636,68 @@ def parse_text(text):
         return {}
 
 # ---------------- 通知格式 ----------------
+def _expect_lines(entry, sl, tps, margin, notional, d, lev=None):
+    """每档累计预期收益（扣费）、保证金收益率、真实盈亏比、止损预期亏损。"""
+    out = []
+    try:
+        entry = float(entry); sl = float(sl); margin = float(margin); notional = float(notional)
+    except Exception:
+        return out
+    if entry <= 0 or notional <= 0:
+        return out
+    w = ([1.0] if len(tps) <= 1 else ([0.5, 0.5] if len(tps) == 2 else [1 / 3, 1 / 3, 1 / 3]))
+    entry_fee = notional * FEE_TAKER
+    stop_loss = abs(sl - entry) / entry * notional
+    stop_fee = stop_loss * FEE_TAKER
+    sl_pct = abs(sl - entry) / entry * 100
+    out.append("硬止损：%.8g ｜ 预期 -%.2f%%（约 -%.1fU，含手续费）" % (sl, sl_pct, stop_loss + entry_fee + stop_fee))
+    stop_net = stop_loss + entry_fee + stop_fee
+    cum = 0.0
+    for i, tp in enumerate(tps[:3]):
+        gross = (tp - entry) * d / entry * notional * w[i]
+        cum += gross
+        fee_tp = notional * w[i] * FEE_MAKER
+        net = cum - entry_fee - notional * sum(w[:i + 1]) * FEE_MAKER
+        rr = (net / stop_net) if stop_net > 0 else 0
+        out.append("止盈%d @%.8g：累计 %+.1fU ｜ 保证金收益率 %+.1f%% ｜ 真实盈亏比 %.2f"
+                   % (i + 1, tp, net, net / margin * 100 if margin else 0, rr))
+    return out
+
+
+def fmt_open_simple(coin, dirc, src, when, my_px, blog_px, sl, tps, margin, notional, timing,
+                    mode="filled", note="", tp_fallback=False):
+    d = 1 if dirc == "LONG" else -1
+    L = []
+    if mode == "pending":
+        L.append("【实盘·限价挂出】%s/USDT 永续 · %s（未成交，不当作已开仓）"
+                 % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
+    else:
+        L.append("【已开仓·实盘】%s/USDT 永续 · %s" % (coin, "做多 LONG" if d == 1 else "做空 SHORT"))
+    L.append("")
+    L.append("来源：%s" % src)
+    L.append("时间：%s" % when)
+    L.append("金额：保证金 %.0fU %d倍" % (margin, int(LEV)))
+    L.append("开仓：")
+    if mode == "pending":
+        L.append("掛單價：%.8g（等回踩成交）" % my_px)
+    else:
+        L.append("交易所成交：均价 %.8g" % my_px)
+    L.append("博主的开仓价：%.8g" % blog_px)
+    L.append("")
+    if sl:
+        L.extend(_expect_lines(my_px, sl, tps or [], margin, notional, d))
+    if not tps:
+        L.append("博主未给止盈，已按 2:1 盈亏比自动挂止盈")
+    elif tp_fallback:
+        L.append("博主未给止盈，已按 2:1 盈亏比 在 %.8g 自动挂止盈" % tps[0])
+    if note:
+        L.append("")
+        L.append(note)
+    L.append("")
+    L.append(timing)
+    return "\n".join(L)
+
+
 def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timing=None,
              signal_entry=None, signal_src=None, crossed=False, entry_mode="市价",
              entry_orders=None, entry_note="", real_fill=None, pending_limit=False,
@@ -2699,7 +2761,7 @@ def fmt_plan(coin, direction, entry, sl, tps, src, when, note="", add=None, timi
         L.append("止损：图上/卡片/文字都没读到，等你确认（暂不挂）")
     if tps:
         n = len(tps[:TP_TIERS])
-        _w = ([1.0] if n <= 1 else ([0.5, 0.5] if n == 2 else [2.0 / 5, 2.0 / 5, 1.0 / 5]))
+        _w = ([1.0] if n <= 1 else ([0.5, 0.5] if n == 2 else [1.0 / 3, 1.0 / 3, 1.0 / 3]))
         _wstr = "、".join("%d%%" % round(x * 100) for x in _w)
         for i, t in enumerate(tps[:TP_TIERS], 1):
             if isinstance(entry, (int, float)) and entry:
@@ -4122,6 +4184,118 @@ def _parse_quote_update(txt):
             "body": b, "any": bool(re.search(r"止盈|止損|止损|拿下|觸發|触发|翻倍|進場|盈利", b))}
 
 
+RESIZE_WATCH = {}
+
+
+def _resize_apply(coin, tr, px, delta_n):
+    """按成交价 px 执行调仓 delta_n（正=加仓，负=减仓），更新均价/名义/手续费。"""
+    try:
+        px = float(px); delta_n = float(delta_n)
+        avg = float(tr.get("entry") or 0); cur = float(tr.get("notional") or (MARGIN * LEV))
+    except Exception:
+        return
+    if px <= 0 or avg <= 0 or cur <= 0 or abs(delta_n) < 1e-9:
+        return
+    d = 1 if tr.get("dir") == "LONG" else -1
+    fee = abs(delta_n) * (FEE_TAKER if not tr.get("_resize_maker") else FEE_MAKER)
+    if delta_n > 0:
+        tr["entry"] = (avg * cur + px * delta_n) / (cur + delta_n)
+    else:
+        _red = -delta_n
+        tr["realized"] = float(tr.get("realized") or 0) + (px - avg) * d / avg * _red
+    tr["notional"] = cur + delta_n
+    tr["margin"] = (cur + delta_n) / float(LEV)
+    tr["fee"] = float(tr.get("fee") or 0) + fee
+    tr.pop("_resize_maker", None)
+    # 重挂止损/止盈（按新数量）
+    if tr.get("real_layer") == "实盘" and _BEXEC_OK:
+        sym = coin.upper() + "USDT"
+        try:
+            q = _real_qty_or_estimate(coin, tr)
+            bexec.sync_sl(sym, tr["dir"], float(tr["sl"]), q)
+            for _o in (bexec.open_orders(sym) or []):
+                if (str(_o.get("type") or "").upper() == "LIMIT"
+                        and str(_o.get("reduceOnly")).lower() in ("true", "1")):
+                    try:
+                        bexec.cancel_order(sym, _o.get("orderId"))
+                    except Exception:
+                        pass
+            _tps_ok = [t for t in (tr.get("tps") or [])
+                       if (t > tr["entry"] if tr["dir"] == "LONG" else t < tr["entry"])]
+            _parts = bexec.split_tp_qty_w(sym, q, _tps_ok)
+            _ids = []
+            for _t, _qq in zip(_tps_ok, _parts):
+                _rr = bexec.place_tp_limit(sym, tr["dir"], _t, _qq)
+                _ids.append((_rr or {}).get("orderId") if isinstance(_rr, dict) else None)
+            tr["real_tp_ids"] = _ids
+        except Exception as e:
+            _live_alert("调仓后重挂", coin, e)
+
+
+def _resize_start(coin, tr, delta_n, auto_market=False):
+    """第一次卡片触发的调仓：不利→限价(4h)；有利/≤0.5%→市价。paper 直接按市价记账。"""
+    d = 1 if tr.get("dir") == "LONG" else -1
+    try:
+        se = float(tr.get("signal_entry") or tr.get("entry") or 0)
+        px = price_of(coin) or float(tr.get("entry") or 0)
+    except Exception:
+        return
+    adv = ((px - se) / se) if d == 1 else ((se - px) / se)
+    if tr.get("real_layer") != "实盘" or not _BEXEC_OK:
+        _resize_apply(coin, tr, px, delta_n)
+        return
+    sym = coin.upper() + "USDT"
+    if adv > 0.005 and not auto_market:
+        lim = se * (1 + adv / 2.0) if d == 1 else se * (1 - adv / 2.0)
+        try:
+            if delta_n > 0:
+                _r = bexec.limit_open(sym, tr["dir"], lim, delta_n, float(LEV))
+            else:
+                _r = bexec.place_tp_limit(sym, tr["dir"], lim, abs(delta_n) / px)
+        except Exception as e:
+            _live_alert("调仓挂限价", coin, e)
+            return
+        oid = (_r or {}).get("orderId") if isinstance(_r, dict) else None
+        RESIZE_WATCH[coin] = {"sym": sym, "delta_n": delta_n, "price": lim, "oid": oid,
+                              "deadline": time.time() + FILL_TIMEOUT}
+        notify("【卡片·调仓挂单】%s 挂限价 %.8g（不利 %.2f%% 的一半），4 小时内未成交则不调仓"
+               % (coin, lim, adv * 100))
+        log("   ↳ [调仓] %s 限价挂单 %.8g delta=%.0f" % (coin, lim, delta_n))
+        return
+    try:
+        if delta_n > 0:
+            bexec.market_open(sym, tr["dir"], delta_n)
+        else:
+            bexec.close_position_market(sym, tr["dir"], abs(delta_n) / px)
+    except Exception as e:
+        _live_alert("调仓市价", coin, e)
+        return
+    _resize_apply(coin, tr, px, delta_n)
+
+
+def watch_resizes():
+    for coin, w in list(RESIZE_WATCH.items()):
+        try:
+            st, err = bexec.order_status(w["sym"], w["oid"])
+            fq = float((st or {}).get("executedQty") or 0)
+            ap = float((st or {}).get("avgPrice") or 0)
+            if fq > 0:
+                tr = open_pos_ref.get(coin)
+                if tr is not None:
+                    _resize_apply(coin, tr, ap or w["price"], w["delta_n"])
+                RESIZE_WATCH.pop(coin, None)
+                notify("【卡片·调仓已成交】%s @%.8g，仓位已按新均价更新" % (coin, ap or w["price"]))
+            elif time.time() > w["deadline"]:
+                try:
+                    bexec.cancel_order(w["sym"], w["oid"])
+                except Exception:
+                    pass
+                RESIZE_WATCH.pop(coin, None)
+                notify("【卡片·调仓超时】%s 4 小时未成交 → 撤单，不调仓" % coin)
+        except Exception:
+            pass
+
+
 def _card_apply(coin, tr, new_stop):
     """卡片到达后的仓位处理（用户 2026-11-23 规则）：
        · 已过 TP1/已保本 → 不动
@@ -4166,56 +4340,12 @@ def _card_apply(coin, tr, new_stop):
         notify("【卡片·已收到】%s 止损=%.8g ｜ 止盈=%s\n入场限价单**继续保留**（不撤单），成交后再按规则处理。"
                % (coin, stop, "、".join("%.8g" % t for t in (tr.get("tps") or [])) or "未读到"))
         return
-    if sp <= 0.055:
-        return
+    # 🆕 2026-11-24（用户 D 方案）：首次卡片 → 双向调仓到 50U 风险；不利挂限价(4h)，有利/≤0.5% 市价
     cur_n = float(tr.get("notional") or (MARGIN * LEV))
-    if target_n >= cur_n * 0.999:
+    delta = target_n - cur_n
+    if abs(delta) < max(1.0, cur_n * 0.01):
         return
-    frac = (cur_n - target_n) / cur_n
-    if tr.get("real_layer") == "实盘":
-        try:
-            bexec.close_position_market(sym, tr["dir"], (cur_n - target_n) / entry)
-        except Exception as e:
-            _live_alert("卡片减仓", coin, e)
-            return
-        tr["notional"] = target_n
-        tr["margin"] = target_m
-        tr["remaining"] = max(0.0, float(tr.get("remaining") or 1.0) * (1 - frac))
-        try:
-            bexec.sync_sl(sym, tr["dir"], stop, _real_qty_or_estimate(coin, tr))
-        except Exception as e:
-            _live_alert("减仓后止损", coin, e)
-        # 减仓后按剩余数量重挂止盈（撤掉旧的 reduceOnly 限价单，避免数量超仓）
-        try:
-            _q = _real_qty_or_estimate(coin, tr)
-            for _o in (bexec.open_orders(sym) or []):
-                if (str(_o.get("type") or "").upper() == "LIMIT"
-                        and str(_o.get("reduceOnly")).lower() in ("true", "1")):
-                    try:
-                        bexec.cancel_order(sym, _o.get("orderId"))
-                    except Exception:
-                        pass
-            _tps_ok = [t for t in (tr.get("tps") or []) if (t > entry if d == 1 else t < entry)]
-            _parts = bexec.split_tp_qty_w(sym, _q, _tps_ok)
-            _ids = []
-            for _t, _qq in zip(_tps_ok, _parts):
-                _rr = bexec.place_tp_limit(sym, tr["dir"], _t, _qq)
-                _ids.append((_rr or {}).get("orderId") if isinstance(_rr, dict) else None)
-            tr["real_tp_ids"] = _ids
-        except Exception as e:
-            _live_alert("减仓后重挂止盈", coin, e)
-    else:
-        try:
-            px = price_of(coin) or entry
-        except Exception:
-            px = entry
-        tr["realized"] = float(tr.get("realized") or 0) + (px - entry) * d / entry * cur_n * frac
-        tr["notional"] = target_n
-        tr["margin"] = target_m
-        tr["remaining"] = max(0.0, float(tr.get("remaining") or 1.0) * (1 - frac))
-    notify("【卡片·减仓】%s 止损空间 %.2f%% >5.5%% → 名义 %.0fU 降到 %.0fU（保证金 %.0fU），"
-           "按博主止损 %.8g，最多亏 %.0fU" % (coin, sp * 100, cur_n, target_n, target_m, stop, risk))
-    log("   ↳ [卡片] %s 减仓：名义 %.0f→%.0f（风险 %.0fU）" % (coin, cur_n, target_n, risk))
+    _resize_start(coin, tr, delta)
 
 
 def _apply_quote_update(g, upd):
@@ -4225,15 +4355,14 @@ def _apply_quote_update(g, upd):
     if tr:
         _changed = False
         if upd["stop"] is not None:
-            if tr.get("filled"):
-                log("   ↳ [卡片] %s 已过 TP1 → 不用博主止损覆盖保本止损" % coin)
-            else:
-                tr["sl"] = float(upd["stop"]); tr["sl_provisional"] = False
+            _v = float(upd["stop"])
+            _ok_side = (_v < float(tr["entry"])) if tr["dir"] == "LONG" else (_v > float(tr["entry"]))
+            if _ok_side:
+                tr["sl"] = _v; tr["sl_provisional"] = False
                 tr["stop_src"] = "博主止損卡"; _changed = True
         if upd["cost"]:
-            if not tr.get("filled"):
-                tr["sl"] = tr["entry"]; tr["sl_provisional"] = False
-                tr["stop_src"] = "博主报成本損 → 移到开仓价"; _changed = True
+            tr["sl"] = tr["entry"]; tr["sl_provisional"] = False
+            tr["stop_src"] = "博主报成本損 → 移到开仓价"; _changed = True
         if upd["tps"]:
             _side_ok = [t for t in upd["tps"] if (t > tr["entry"] if tr["dir"] == "LONG" else t < tr["entry"])]
             if _side_ok:
@@ -4253,14 +4382,25 @@ def _apply_quote_update(g, upd):
                 f.write(json.dumps(tr, ensure_ascii=False) + "\n")
             log("   ↻ 持仓 %s 更新：止损=%s 止盈=%s%s" % (coin, tr.get("sl"), tr.get("tps"),
                                                        "（成本损/保本）" if upd["cost"] else ""))
-            notify("【信号·更新】%s %s\n收到博主卡片：止损=%s ｜ 止盈=%s%s"
-                   % (coin, "做多" if tr["dir"] == "LONG" else "做空", tr.get("sl"),
-                      "、".join("%.8g" % t for t in (tr.get("tps") or [])) or "未读到",
-                      "\n（博主报成本損 → 止损已移到开仓价）" if upd["cost"] else ""))
-            # 🆕 2026-11-23（用户规则）：卡片到达 → 按止损空间决定 减仓 / 只换止损 / 不动
-            if (upd["stop"] is not None or upd["cost"]) and tr.get("sl"):
+            _mgn = float(tr.get("margin") or (MARGIN * LEV))
+            _ntl = float(tr.get("notional") or (MARGIN * LEV))
+            notify("\n".join([
+                "【卡片更新】%s/USDT 永续 · %s" % (coin, "做多 LONG" if tr["dir"] == "LONG" else "做空 SHORT"),
+                "",
+                "来源：%s" % (tr.get("group") or "-"),
+                "时间：%s" % time.strftime("%m-%d %H:%M:%S"),
+                "金额：保证金 %.0fU %d倍" % (_mgn, int(LEV)),
+                "开仓：",
+                "交易所成交：均价 %.8g" % float(tr.get("entry") or 0),
+                "",
+            ] + _expect_lines(float(tr.get("entry") or 0), float(tr.get("sl") or 0),
+                              tr.get("tps") or [], _mgn, _ntl, 1 if tr["dir"] == "LONG" else -1)
+              + (["", "（博主报成本損 → 止损已移到开仓价）"] if upd["cost"] else [])))
+            # 🆕 2026-11-23：第一次卡片才做「减仓/不动」判断；之后的止损更新只平移止损、不动仓位
+            if (upd["stop"] is not None or upd["cost"]) and tr.get("sl") and not tr.get("card_applied"):
                 try:
                     _card_apply(coin, tr, tr.get("sl"))
+                    tr["card_applied"] = True
                 except Exception as _e:
                     log("   ⚠️ 卡片处理异常 %s" % str(_e)[:120])
             # 🆕 2026-11-12（用户硬要求：实盘绝对不能挂错）：实盘仓 → 撤临止损/换真实止损、挂止盈，
@@ -4897,18 +5037,11 @@ def finalize_pending(open_pos):
         t_push0 = time.time()
         d0 = 1 if dirc == "LONG" else -1
         crossed = any(((t - entry) * d0 <= 0) for t in tps)   # 止盈价是否已被现价越过（真实下单必须处理）
-        _txt = fmt_plan(coin, dirc, entry, p["stop"], tps, p["group"], tr["t_open"],
-                        note=("止损来自%s，共合并 %d 条消息（文案/卡片/图）" % (p.get("stop_src") or "-", len(p["texts"]) + (1 if p["imgs"] else 0))
-                              + ("｜⚠️ 博主未给止盈，已按 **2:1 盈亏比** 在 %.8g 自动挂止盈（到价**全平**；若博主后续补了真实止盈位会自动撤掉重挂）" % tps[0] if tp_fallback else "")
-                              + ("｜⚠️ 测试阶段：当前已持 %d 笔（上限 %d）" % (len(open_pos), MAX_OPEN) if over_cap else "")),
-                        add=p["add"], timing=timing, signal_entry=signal_entry,
-                        signal_src=p.get("entry_src"), crossed=crossed, entry_mode=entry_mode,
-                        entry_orders=entry_orders, entry_note=entry_note,
-                        real_fill=_real_fill, pending_limit=_pending_limit,
-                        margin=_margin, notional=_notional, lev_override=_lev)
-        _rp = fmt_real_plan(_rplan) if _rplan else ""
-        if _rp:
-            _txt += "\n\n" + _rp
+        _txt = fmt_open_simple(coin, dirc, p["group"], tr["t_open"], float(entry), float(signal_entry or entry),
+                               p["stop"], tps, _margin, _notional, timing,
+                               mode=("pending" if _pending_limit else "filled"),
+                               note=(("当前已持 %d 笔（上限 %d）" % (len(open_pos), MAX_OPEN)) if over_cap else ""),
+                               tp_fallback=tp_fallback)
         notify(_txt)
         tm["push"] = time.time() - t_push0
         with open(TRADES, "a", encoding="utf-8") as f:
@@ -6492,6 +6625,14 @@ def _daily_report():
                                              float(r.get("entry") or 0)))
     except Exception:
         pass
+    # 补：open_pos 里的持仓（手工登记/补开）也算进“今日开单”
+    try:
+        for c, tr in list(open_pos_ref.items()):
+            if str(tr.get("t_open") or "").startswith(dstr):
+                opens.append("%s %s %.8g" % (c, "多" if tr.get("dir") == "LONG" else "空",
+                                             float(tr.get("entry") or 0)))
+    except Exception:
+        pass
     L = ["【每日统计】" + dstr]
     L.append("今日开单：" + ("、".join(sorted(set(opens))) if opens else "无"))
     tp = {k: v for k, v in today.items() if abs(v) > 0.0001}
@@ -6503,7 +6644,7 @@ def _daily_report():
     L.append("累计（11-22 实盘以来，含手续费/资金费）：%+.2fU" % sum(cum.values()))
     L.append("当前持仓：")
     had = False
-    for c, tr in list(open_pos.items()):
+    for c, tr in list(open_pos_ref.items()):
         had = True
         amt, up = 0.0, 0.0
         try:
@@ -7557,6 +7698,7 @@ def main():
             # 实盘限价入场的成交监听
             try:
                 watch_entries()
+                watch_resizes()
             except Exception as e:
                 log("成交监听异常 " + str(e)[:100])
             # 裸仓看门狗（每约 30 秒查一次）
@@ -7710,14 +7852,14 @@ def main():
                             break
                     if hit_i is not None:
                         # 平仓比例：2R 兜底档 = 一次全平（tp_part=R_FALLBACK_PART=1.0，
-                        # 用户 09-13 定的「到价全平」）；常规档位按用户 2026-11-12 定的权重：
-                        # 1 档=100%、2 档=50/50、3 档=2/5、2/5、1/5。
+                        # 用户 09-13 定的「到价全平」）；常规档位按用户 2026-11-23 定的权重：
+                        # 1 档=100%、2 档=50/50、3 档=各 1/3（2026-11-23 用户改）。
                         # ⚠️ 旧注释写的是"2R 兜底档只平 1/3"，与 R_FALLBACK_PART=1.0 矛盾，已改正。
                         if tr.get("tp_fallback"):
                             part = R_FALLBACK_PART
                         else:
                             _w = ([1.0] if len(tps) <= 1 else
-                                  ([0.5, 0.5] if len(tps) == 2 else [2.0 / 5, 2.0 / 5, 1.0 / 5]))
+                                  ([0.5, 0.5] if len(tps) == 2 else [1.0 / 3, 1.0 / 3, 1.0 / 3]))
                             part = _w[hit_i] if hit_i < len(_w) else 1.0 / max(len(tps), 1)
                         tp = tps[hit_i]
                         pnl = (tp - tr["entry"]) * d / tr["entry"] * float(tr.get("notional") or NOTIONAL) * part
