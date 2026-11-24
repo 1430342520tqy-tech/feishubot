@@ -5921,7 +5921,11 @@ def handle_command(txt):
                   RISK.get("day_trades", 0), RISK.get("day_pnl", 0.0), DAILY_LOSS_LIMIT, _rec))
     elif cmd.startswith("解除手工仓") or cmd.startswith("手工仓已平"):
         # 用户 2026-09-16：手工仓平掉后，用这条指令解除护栏
-        _cs = [c for c in re.split(r"[\s,，、]+", cmd) if c and c not in ("解除手工仓", "手工仓已平")]
+        _core = cmd
+        for _p in ("解除手工仓", "手工仓已平"):
+            if _core.startswith(_p):
+                _core = _core[len(_p):]
+        _cs = [c for c in re.split(r"[\s,，、]+", _core) if c]
         if not _cs or "全部" in cmd:
             _cs = sorted(MANUAL_COINS)
         _done = []
