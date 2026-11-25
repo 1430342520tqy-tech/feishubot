@@ -4356,6 +4356,9 @@ def _card_apply(coin, tr, new_stop):
                % (coin, stop, "、".join("%.8g" % t for t in (tr.get("tps") or [])) or "未读到"))
         return
     # 🆕 2026-11-24（用户 D 方案）：首次卡片 → 双向调仓到 50U 风险；不利挂限价(4h)，有利/≤0.5% 市价
+    if not RESIZE_ON[0]:
+        log("   ↳ [卡片] 调仓模式=关（固定900U）→ 不加减仓，只保留止损/止盈更新")
+        return
     cur_n = float(tr.get("notional") or (MARGIN * LEV))
     delta = target_n - cur_n
     if abs(delta) < max(1.0, cur_n * 0.01):
@@ -5239,6 +5242,7 @@ def range_mid(a, b, coin=None):
 RUNTIME = _P["RUNTIME"]
 CMD_GROUPS = ["开单记录", "机器人开单通知", "跟单"]   # 指令在这些群里生效（🆕 2026-11-12 新增「跟单」）
 PAUSED = [False]              # 暂停：仍抓取记录，但不动作
+RESIZE_ON = [True]            # 首次卡片是否调仓到 50U 风险（False = 固定 900U，不加减仓）
 STATE_DIRTY = [False]
 
 # ===== 消息级去重：防止重启/游标回退后把旧信号当新信号重复开单 =====
@@ -5368,6 +5372,8 @@ def load_runtime():
                 LIVE_MAX_STOP_PCT = float(cfg["live_max_stop_pct"])
             if cfg.get("float_alert_pct") is not None:
                 FLOAT_ALERT_PCT[0] = float(cfg["float_alert_pct"])
+            if cfg.get("resize_mode") is not None:
+                RESIZE_ON[0] = str(cfg.get("resize_mode")).lower() != "off"
             # 真实下单层开关：跟随 runtime_config.json（热加载时也会走到这里）
             if _BEXEC_OK:
                 bexec.LIVE[0] = bool(cfg.get("live_trading", False))
@@ -6090,6 +6096,24 @@ def handle_command(txt):
                 notify("【指令】%s 止损已移到开仓价 %.8g（保本损）" % (c, tr["entry"]))
             else:
                 notify("【指令】没有 %s 的持仓" % c)
+    elif cmd.startswith("关闭调仓") or cmd.startswith("关闭减仓加仓"):
+        RESIZE_ON[0] = False
+        try:
+            cfg = json.load(open(RUNTIME, encoding="utf-8"))
+            cfg["resize_mode"] = "off"
+            json.dump(cfg, open(RUNTIME, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+        notify("【指令】调仓已关闭：以后首次卡片**不加减仓**，固定 900U（止损宽时单笔亏损会 >50U）")
+    elif cmd.startswith("开启调仓") or cmd.startswith("打开调仓"):
+        RESIZE_ON[0] = True
+        try:
+            cfg = json.load(open(RUNTIME, encoding="utf-8"))
+            cfg["resize_mode"] = "on"
+            json.dump(cfg, open(RUNTIME, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+        notify("【指令】调仓已开启：首次卡片按止损空间把仓位调到 50U 风险（加/减仓）")
     elif cmd.startswith("暂停"):
         PAUSED[0] = True
         STATE_DIRTY[0] = True          # 落盘：重启后仍然是暂停态（否则"暂停"对维护没用）
