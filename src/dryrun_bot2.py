@@ -2650,17 +2650,22 @@ def _expect_lines(entry, sl, tps, margin, notional, d, lev=None):
     stop_loss = abs(sl - entry) / entry * notional
     stop_fee = stop_loss * FEE_TAKER
     sl_pct = abs(sl - entry) / entry * 100
-    out.append("硬止损：%.8g ｜ 预期 -%.2f%%（约 -%.1fU，含手续费）" % (sl, sl_pct, stop_loss + entry_fee + stop_fee))
+    _is_be = abs(sl - entry) / entry < 0.0005      # 保本止损（止损≈开仓价）
+    if _is_be:
+        out.append("硬止损：%.8g ｜ 保本（仅手续费风险，约 %.1fU）" % (sl, entry_fee + stop_fee))
+    else:
+        out.append("硬止损：%.8g ｜ 预期 -%.2f%%（约 -%.1fU，含手续费）"
+                   % (sl, sl_pct, stop_loss + entry_fee + stop_fee))
     stop_net = stop_loss + entry_fee + stop_fee
     cum = 0.0
     for i, tp in enumerate(tps[:3]):
         gross = (tp - entry) * d / entry * notional * w[i]
         cum += gross
-        fee_tp = notional * w[i] * FEE_MAKER
         net = cum - entry_fee - notional * sum(w[:i + 1]) * FEE_MAKER
         rr = (net / stop_net) if stop_net > 0 else 0
-        out.append("止盈%d @%.8g：累计 %+.1fU ｜ 保证金收益率 %+.1f%% ｜ 真实盈亏比 %.2f"
-                   % (i + 1, tp, net, net / margin * 100 if margin else 0, rr))
+        _rr_txt = "保本止损（仅手续费风险）" if _is_be else ("%.2f : 1" % rr)
+        out.append("止盈%d @%.8g：累计 %+.1fU ｜ 保证金收益率 %+.1f%% ｜ 真实盈亏比 %s"
+                   % (i + 1, tp, net, net / margin * 100 if margin else 0, _rr_txt))
     return out
 
 
