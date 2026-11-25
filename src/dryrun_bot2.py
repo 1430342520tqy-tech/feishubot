@@ -4219,6 +4219,7 @@ def _resize_apply(coin, tr, px, delta_n):
         tr["realized"] = float(tr.get("realized") or 0) + (px - avg) * d / avg * _red
     tr["notional"] = cur + delta_n
     tr["margin"] = (cur + delta_n) / float(LEV)
+    tr["fill_qty"] = (cur + delta_n) / float(tr["entry"]) if float(tr["entry"]) else tr.get("fill_qty")
     tr["fee"] = float(tr.get("fee") or 0) + fee
     tr.pop("_resize_maker", None)
     # 重挂止损/止盈（按新数量）
