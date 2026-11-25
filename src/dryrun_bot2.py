@@ -4172,6 +4172,15 @@ def _parse_quote_update(txt):
     if not qm:
         return None
     b = body.strip()
+    # 🆕 2026-11-25（EVAA 事故）：博主正文写的是 #EVAA，但引用的是别的币（#CYS）。
+    #   必须以**正文里的币种**为准；只有正文没写币种时才退回引用里的币种。
+    _bm = re.search(r"#\s*([A-Za-z0-9]+)", b)
+    if _bm:
+        coin = _bm.group(1).upper()
+        qentry = float(qm.group(3)) if qm.group(1).upper() == coin else None
+    else:
+        coin = qm.group(1).upper()
+        qentry = float(qm.group(3))
     tps, stop = [], None
     um = _LTT_UPD.search(b)
     if um:
@@ -4179,8 +4188,8 @@ def _parse_quote_update(txt):
         tps = [float(x) for x in re.findall(r"[\d]+(?:\.[\d]+)?", tp_part)]
         stop = float(um.group(2))
     cost = ("成本損" in b) or ("成本损" in b) or ("保本" in b)
-    return {"coin": qm.group(1).upper(), "dir": "LONG" if qm.group(2) == "多" else "SHORT",
-            "qentry": float(qm.group(3)), "tps": tps, "stop": stop, "cost": cost,
+    return {"coin": coin, "dir": "LONG" if qm.group(2) == "多" else "SHORT",
+            "qentry": qentry, "tps": tps, "stop": stop, "cost": cost,
             "body": b, "any": bool(re.search(r"止盈|止損|止损|拿下|觸發|触发|翻倍|進場|盈利", b))}
 
 

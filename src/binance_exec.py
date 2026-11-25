@@ -229,8 +229,10 @@ def order_status(symbol, order_id):
         return None, str(e)
 
 
-def set_leverage(symbol, lev=LEV):
-    return _req("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": lev}, signed=True)
+def set_leverage(symbol, lev=None):
+    if lev is None:
+        lev = LEV
+    return _req("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(lev)}, signed=True)
 
 
 # ============================ 下单原语 ============================
@@ -247,8 +249,10 @@ def _ps(dir_):
     return dir_.upper() if is_hedge() else "BOTH"
 
 
-def market_open(symbol, dir_, notional_usdt, lev=LEV):
+def market_open(symbol, dir_, notional_usdt, lev=None):
     """市价开仓。notional_usdt = 保证金 × 杠杆"""
+    if lev is None:
+        lev = LEV
     px = mark_price(symbol)
     qty = fmt_qty(symbol, notional_usdt / px)
     p = {"symbol": symbol, "side": _side_for(dir_), "type": "MARKET",
@@ -262,8 +266,10 @@ def market_open(symbol, dir_, notional_usdt, lev=LEV):
     return r
 
 
-def limit_open(symbol, dir_, price, notional_usdt, lev=LEV):
+def limit_open(symbol, dir_, price, notional_usdt, lev=None):
     """限价开仓（用于「不追高/不追空」的两笔挂单）"""
+    if lev is None:
+        lev = LEV
     qty = fmt_qty(symbol, notional_usdt / price)
     p = {"symbol": symbol, "side": _side_for(dir_), "type": "LIMIT",
          "timeInForce": "GTC", "price": fmt_price(symbol, price),
@@ -442,7 +448,7 @@ def split_tp_qty(symbol, total_qty, tiers):
 
 def tp_weights(n):
     """用户 2026-11-12 定的止盈分档权重：1档=100%、2档=50/50、3档=2/5、2/5、1/5。"""
-    return [1.0] if n <= 1 else ([0.5, 0.5] if n == 2 else [2.0 / 5, 2.0 / 5, 1.0 / 5])
+    return [1.0] if n <= 1 else ([0.5, 0.5] if n == 2 else [1.0 / 3, 1.0 / 3, 1.0 / 3])
 
 
 def split_tp_qty_w(symbol, total_qty, tiers):
@@ -513,7 +519,9 @@ def _exec_state(plan, verify=None):
     return plan["exec"]
 
 
-def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=LEV):
+def open_full_position(symbol, dir_, entry_price, stop, tps, margin=300.0, lev=None):
+    if lev is None:
+        lev = LEV
     """
     按用户既有规则开一整笔：
       entry_price 为 None -> 纯市价；有值则按「不追高/不追空」规则决定市价 or 两笔限价
