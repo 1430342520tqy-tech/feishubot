@@ -840,7 +840,7 @@ def watch_entries():
 
             if filled_qty > 0 and not any_live:
                 # ===== 成交完成 → 挂止盈 + 止损 =====
-                _tps = [t for t in (w.get("tps") or [])]
+                _tps = [dict(t) if isinstance(t, dict) else {"price": float(t)} for t in (w.get("tps") or [])]
                 try:      # 数量按实际成交量、按用户权重（2/5、2/5、1/5）重算
                     _parts = bexec.split_tp_qty_w(w["sym"], filled_qty, _tps)
                     for t, _q in zip(_tps, _parts):
@@ -4350,7 +4350,7 @@ def _card_apply(coin, tr, new_stop):
         w = ENTRY_WATCH.get(coin)
         if w:
             w["stop"] = stop
-            w["tps"] = tr.get("tps") or w.get("tps")
+            w["tps"] = ([{"price": float(t)} for t in (tr.get("tps") or [])] or w.get("tps"))
         log("   ↳ [卡片] %s 限价单未成交 → **保留原限价单**，只记录止损 %.8g，成交后再处理" % (coin, stop))
         notify("【卡片·已收到】%s 止损=%.8g ｜ 止盈=%s\n入场限价单**继续保留**（不撤单），成交后再按规则处理。"
                % (coin, stop, "、".join("%.8g" % t for t in (tr.get("tps") or [])) or "未读到"))
